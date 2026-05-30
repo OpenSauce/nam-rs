@@ -32,7 +32,6 @@ fn load_samples(name: &str) -> Vec<f32> {
 }
 
 #[test]
-#[ignore = "needs reference fixtures + implemented forward pass; see tests/fixtures/README.md"]
 fn matches_python_reference_wavenet() {
     let json = std::fs::read_to_string(fixture("reference.nam")).expect("reference.nam");
     let model = NamModel::from_json_str(&json).expect("parse reference model");

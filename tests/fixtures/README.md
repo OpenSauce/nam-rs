@@ -1,38 +1,43 @@
 # Parity & RT-safety fixtures
 
-These files are the ground truth that pins nam-rs to the reference NAM
-implementation. They are **generated from the canonical Python NAM**, not
-hand-written, so that `tests/parity.rs` proves bit-level agreement.
+These files pin nam-rs to the reference NAM WaveNet forward pass.
 
-Expected files (not yet committed):
+| File                   | What it is                                                  |
+| ---------------------- | ----------------------------------------------------------- |
+| `reference.nam`        | A real exported WaveNet model (NAM Core `example_models/wavenet.nam`, MIT). |
+| `input.json`           | JSON array of input samples (mono).                         |
+| `expected_output.json` | JSON array: the reference output for `input.json`.          |
 
-| File                   | What it is                                              |
-| ---------------------- | ------------------------------------------------------- |
-| `reference.nam`        | A real exported WaveNet model file.                     |
-| `input.json`           | JSON array of input samples (mono, model sample rate).  |
-| `expected_output.json` | JSON array: Python NAM's output for `input.json`.       |
+`tests/parity.rs` asserts nam-rs reproduces `expected_output.json` from
+`input.json` within `1e-5`. `tests/rt_safety.rs` uses `reference.nam` only.
 
 ## Regenerating
 
 ```bash
-pip install neural-amp-modeler numpy
-python tests/fixtures/gen_fixtures.py path/to/model.nam
+python3 tests/fixtures/gen_fixtures.py        # uses the committed reference.nam
 ```
 
-`gen_fixtures.py` should:
+`gen_fixtures.py` needs only **numpy**. It implements the WaveNet forward pass
+directly from the reference weight layout + math (a faithful port of NeuralAudio
+`WaveNet.h` and NAM's `nam/models/wavenet/*.py`), then:
 
-1. Load `model.nam` with `nam` and copy it to `reference.nam`.
-2. Generate a deterministic test signal (e.g. a fixed-seed noise burst + a few
-   sweeps), long enough to cover the model's full receptive field, and write it to
-   `input.json`.
-3. Run the Python model on that signal and write the result to
-   `expected_output.json`.
+1. Generates a deterministic test signal (fixed seed: noise burst + two sweeps),
+   2048 samples — well past the model's receptive field — and writes `input.json`.
+2. Runs the forward pass and writes `expected_output.json` (computed in `float32`
+   to match NAM Core's inference precision).
 
-Keep the signal short (a few thousand samples) so the fixtures stay small but long
-enough to exceed the longest dilation's receptive field.
+## Why a numpy reference instead of `pip install neural-amp-modeler`
 
-## Why generated, not authored
+The canonical generator runs the Python NAM package, which pulls in torch. Torch
+only ships wheels for the Python versions it supports and was not available in the
+environment these fixtures were generated in, so `gen_fixtures.py` reimplements the
+forward pass from the published references instead. Two things keep this honest:
 
-The whole point of the parity test is that we did **not** invent the expected
-numbers — they come from the implementation we are claiming equivalence to. See the
-crate-level attribution in `src/lib.rs` and `NOTICE`.
+- The weight count it derives from `config` matches the model file exactly — a
+  structural check that the `export_weights` layout is right.
+- The same algorithm is verified independently against hand-computed values in the
+  per-component Rust unit tests (`src/wavenet/{conv,layer,array}.rs`).
+
+If you have torch, regenerate from the canonical implementation and overwrite
+`expected_output.json`; the numbers should agree to `1e-5`. Either way the expected
+numbers come from *running* a reference, never from hand-authoring.

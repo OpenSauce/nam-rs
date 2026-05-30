@@ -9,6 +9,8 @@ pub enum Error {
     Io(std::io::Error),
     /// The model's `architecture` field is not one this crate can run.
     UnsupportedArchitecture(String),
+    /// A layer's `activation` field names a function this crate does not implement.
+    UnsupportedActivation(String),
     /// The flat `weights` array did not contain the number of values the
     /// `config` implies (corrupt file, or a config/weights mismatch).
     WeightCountMismatch { expected: usize, found: usize },
@@ -21,6 +23,9 @@ impl fmt::Display for Error {
             Self::Io(e) => write!(f, "failed to read .nam file: {e}"),
             Self::UnsupportedArchitecture(a) => {
                 write!(f, "unsupported model architecture: {a:?}")
+            }
+            Self::UnsupportedActivation(a) => {
+                write!(f, "unsupported activation function: {a:?}")
             }
             Self::WeightCountMismatch { expected, found } => write!(
                 f,

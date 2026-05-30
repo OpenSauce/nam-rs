@@ -16,6 +16,35 @@
 //!    allocations, locks, or system calls. All scratch buffers are pre-allocated at
 //!    construction. This is enforced by `tests/rt_safety.rs`.
 //!
+//! ## Example
+//!
+//! ```
+//! use nam_rs::{NamModel, WaveNet};
+//!
+//! // A `.nam` file is JSON; load it from disk with `std::fs::read_to_string`.
+//! // Here we use a tiny in-line model for illustration.
+//! let json = r#"{
+//!     "version": "0.5.4", "architecture": "WaveNet",
+//!     "config": {
+//!         "layers": [{
+//!             "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+//!             "kernel_size": 1, "dilations": [1], "activation": "ReLU",
+//!             "gated": false, "head_bias": false
+//!         }],
+//!         "head": null, "head_scale": 1.0
+//!     },
+//!     "weights": [1.0, 2.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0]
+//! }"#;
+//!
+//! let model = NamModel::from_json_str(json)?;
+//! let mut wavenet = WaveNet::new(&model)?;          // builds + allocates here
+//!
+//! // On the audio thread: process in place, no allocation.
+//! let mut buffer = [0.1_f32, 0.2, 0.3, 0.4];
+//! wavenet.process_buffer(&mut buffer);
+//! # Ok::<(), nam_rs::Error>(())
+//! ```
+//!
 //! ## Attribution
 //!
 //! This is a derivative work. The algorithm and weight layout are ported from the

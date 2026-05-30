@@ -1,0 +1,22 @@
+[package]
+name = "nam-rs"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Pure-Rust, real-time-safe inference for Neural Amp Modeler (NAM) .nam models"
+repository = "https://github.com/OpenSauce/nam-rs"
+readme = "README.md"
+keywords = ["audio", "dsp", "neural-amp-modeler", "nam", "wavenet"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Used by tests/rt_safety.rs to prove the hot path performs no heap allocations.
+assert_no_alloc = "1.1"
+
+[profile.release]
+lto = true

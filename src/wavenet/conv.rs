@@ -107,6 +107,33 @@ mod tests {
             .collect()
     }
 
+    /// Expected values taken verbatim from NeuralAmpModelerCore's
+    /// `tools/test/test_conv1d.cpp` (MIT) — an oracle independent of our numpy
+    /// fixture generator.
+    #[test]
+    fn matches_namcore_conv1d_vectors() {
+        // test_process_basic: weights {1,2}, input [1,2,3,4] -> [2,5,8,11].
+        let mut basic = Conv1d::new(1, 1, 2, 1, vec![1.0, 2.0], None);
+        assert_eq!(
+            run(&mut basic, &[&[1.0], &[2.0], &[3.0], &[4.0]]),
+            vec![vec![2.0], vec![5.0], vec![8.0], vec![11.0]]
+        );
+
+        // test_process_with_bias: weights {1,0}, bias 5, input [2,3] -> [5,7].
+        let mut biased = Conv1d::new(1, 1, 2, 1, vec![1.0, 0.0], Some(vec![5.0]));
+        assert_eq!(
+            run(&mut biased, &[&[2.0], &[3.0]]),
+            vec![vec![5.0], vec![7.0]]
+        );
+
+        // test_process_dilation: weights {1,2}, dilation 2, [1,2,3,4] -> [2,4,7,10].
+        let mut dil = Conv1d::new(1, 1, 2, 2, vec![1.0, 2.0], None);
+        assert_eq!(
+            run(&mut dil, &[&[1.0], &[2.0], &[3.0], &[4.0]]),
+            vec![vec![2.0], vec![4.0], vec![7.0], vec![10.0]]
+        );
+    }
+
     #[test]
     fn kernel2_dilation1_single_channel() {
         // out[t] = a*x[t-1] + b*x[t] + c, history starts at silence.

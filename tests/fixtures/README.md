@@ -1,38 +1,62 @@
 # Parity & RT-safety fixtures
 
-These files are the ground truth that pins nam-rs to the reference NAM
-implementation. They are **generated from the canonical Python NAM**, not
-hand-written, so that `tests/parity.rs` proves bit-level agreement.
+These files pin nam-rs to the reference NAM WaveNet forward pass.
 
-Expected files (not yet committed):
+| File                   | What it is                                                  |
+| ---------------------- | ----------------------------------------------------------- |
+| `reference.nam`        | A real exported WaveNet model (NAM Core `example_models/wavenet.nam`, MIT). |
+| `input.json`           | JSON array of input samples (mono).                         |
+| `expected_output.json` | The **canonical** `neural-amp-modeler` (torch) output for `input.json`. |
 
-| File                   | What it is                                              |
-| ---------------------- | ------------------------------------------------------- |
-| `reference.nam`        | A real exported WaveNet model file.                     |
-| `input.json`           | JSON array of input samples (mono, model sample rate).  |
-| `expected_output.json` | JSON array: Python NAM's output for `input.json`.       |
+`tests/parity.rs` asserts nam-rs reproduces `expected_output.json` from
+`input.json` within `1e-5`, **skipping the first `receptive_field()` samples** (the
+warmup transient — see "Warmup convention" below). `tests/rt_safety.rs` uses
+`reference.nam` only.
 
 ## Regenerating
 
 ```bash
-pip install neural-amp-modeler numpy
-python tests/fixtures/gen_fixtures.py path/to/model.nam
+# canonical (recommended): needs a torch-capable Python with `nam` installed
+python -m venv venv && venv/bin/pip install neural-amp-modeler
+venv/bin/python tests/fixtures/gen_fixtures.py
+
+# torch-free fallback (any python3 with numpy)
+python3 tests/fixtures/gen_fixtures.py
 ```
 
-`gen_fixtures.py` should:
+`gen_fixtures.py` generates a deterministic test signal (fixed seed: noise burst +
+two sweeps, 2048 samples, past the model's receptive field), runs the forward pass,
+and writes `input.json` / `expected_output.json` (float32, matching NAM Core's
+inference precision).
 
-1. Load `model.nam` with `nam` and copy it to `reference.nam`.
-2. Generate a deterministic test signal (e.g. a fixed-seed noise burst + a few
-   sweeps), long enough to cover the model's full receptive field, and write it to
-   `input.json`.
-3. Run the Python model on that signal and write the result to
-   `expected_output.json`.
+`forward()` prefers the **canonical** path — the real `neural-amp-modeler` package
+(`nam.models.wavenet._WaveNet`) — and falls back to a dependency-light **numpy**
+reimplementation when torch/`nam` isn't importable. The committed
+`expected_output.json` was produced by the canonical torch path. In the **steady
+state** the two agree to ~`3e-7`; they diverge only over the warmup (see below), so
+either generator yields a fixture the trimmed parity test accepts.
 
-Keep the signal short (a few thousand samples) so the fixtures stay small but long
-enough to exceed the longest dilation's receptive field.
+## Warmup convention
 
-## Why generated, not authored
+The two reference implementations disagree over the first `receptive_field` samples,
+by construction:
 
-The whole point of the parity test is that we did **not** invent the expected
-numbers — they come from the implementation we are claiming equivalence to. See the
-crate-level attribution in `src/lib.rs` and `NOTICE`.
+- torch's `_WaveNet.forward` (a training graph) pre-pads the whole input with zeros
+  and propagates each layer's bias/activation through the stack.
+- A streaming engine — this crate, and NAM Core / NeuralAudio — starts every layer
+  from a zero-filled history buffer instead.
+
+These agree once the receptive field fills, but differ over the startup transient
+(on the committed model, ~`0.023` max over the first ~22 samples, ~0.5 ms at 48 kHz).
+`tests/parity.rs` therefore compares only the steady state (`signal[rf..]`), where
+nam-rs matches canonical torch NAM to ~`1.5e-7`. nam-rs deliberately follows the
+streaming convention because a real-time `process_buffer` cannot pre-pad an unbounded
+stream; the numpy fallback follows it too.
+
+## Layering of validation
+
+- End-to-end: nam-rs ↔ canonical torch NAM, ≤`1e-5` (`tests/parity.rs`).
+- Independent unit oracle: nam-rs `Conv1d` ↔ NAM Core's hand-derived
+  `test_conv1d.cpp` values (`src/wavenet/conv.rs`).
+- Structural: the weight count `WaveNet::new` derives from `config` matches every
+  real model checked (incl. 13,802-weight standard models).

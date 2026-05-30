@@ -18,7 +18,6 @@ use nam_rs::{NamModel, WaveNet};
 static ALLOC: AllocDisabler = AllocDisabler;
 
 #[test]
-#[ignore = "enable once WaveNet::process_buffer is implemented"]
 fn process_buffer_does_not_allocate() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference.nam");

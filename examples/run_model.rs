@@ -16,8 +16,7 @@ fn main() {
         .expect("usage: run_model <model.nam> [num_samples]");
     let n: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4096);
 
-    let json = std::fs::read_to_string(&path).expect("read model file");
-    let model = NamModel::from_json_str(&json).expect("parse .nam");
+    let model = NamModel::from_file(&path).expect("load .nam");
     println!(
         "loaded {path}: arch={} version={} sample_rate={}",
         model.architecture,

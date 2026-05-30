@@ -19,11 +19,14 @@ the steady state. float32 throughout, matching NAM Core's inference precision.
 Usage:
     # canonical (recommended): a torch-capable interpreter with `nam` installed
     python -m venv venv && venv/bin/pip install neural-amp-modeler
-    venv/bin/python tests/fixtures/gen_fixtures.py [path/to/model.nam]
+    venv/bin/python tests/fixtures/gen_fixtures.py [path/to/model.nam] [out_prefix] [samples]
     # or torch-free numpy fallback (any python with numpy)
-    python3 tests/fixtures/gen_fixtures.py [path/to/model.nam]
+    python3 tests/fixtures/gen_fixtures.py [path/to/model.nam] [out_prefix] [samples]
 
-Defaults to the committed tests/fixtures/reference.nam.
+Defaults to the committed tests/fixtures/reference.nam, the "" (empty) out_prefix
+-> input.json / expected_output.json, and 2048 samples. The standard model uses
+``reference_standard`` / ``_standard`` / a longer signal (its receptive field is
+larger than 2048); see ``tests/fixtures/README.md``.
 """
 
 import json
@@ -210,7 +213,12 @@ def forward(model, signal):
 
 
 def make_signal(n=2048):
-    """Deterministic: a noise burst plus two sine sweeps, well past the RF."""
+    """Deterministic: a noise burst plus two sine sweeps, well past the RF.
+
+    ``n`` must exceed the model's receptive field so the parity test has steady
+    state to compare; standard models (RF ~4093) need a longer signal than the
+    minimal one.
+    """
     rng = np.random.default_rng(20240530)
     t = np.arange(n, dtype=F32)
     noise = rng.standard_normal(n).astype(F32) * F32(0.25)
@@ -222,20 +230,24 @@ def make_signal(n=2048):
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "reference.nam")
+    prefix = sys.argv[2] if len(sys.argv) > 2 else ""
+    n = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
     model = json.load(open(path))
-    signal = make_signal()
+    signal = make_signal(n)
     out = forward(model, signal)
 
-    with open(os.path.join(HERE, "input.json"), "w") as f:
+    in_path = os.path.join(HERE, f"input{prefix}.json")
+    out_path = os.path.join(HERE, f"expected_output{prefix}.json")
+    with open(in_path, "w") as f:
         json.dump([float(x) for x in signal], f)
-    with open(os.path.join(HERE, "expected_output.json"), "w") as f:
+    with open(out_path, "w") as f:
         json.dump([float(x) for x in out], f)
 
     print(f"model: {path}")
     print(f"samples: {len(signal)}")
     print(f"input  range: [{signal.min():.6f}, {signal.max():.6f}]")
     print(f"output range: [{out.min():.6f}, {out.max():.6f}]")
-    print("wrote input.json, expected_output.json")
+    print(f"wrote {os.path.basename(in_path)}, {os.path.basename(out_path)}")
 
 
 if __name__ == "__main__":

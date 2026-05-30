@@ -9,7 +9,9 @@ These files pin nam-rs to the reference NAM WaveNet forward pass.
 | `expected_output.json` | The **canonical** `neural-amp-modeler` (torch) output for `input.json`. |
 
 `tests/parity.rs` asserts nam-rs reproduces `expected_output.json` from
-`input.json` within `1e-5`. `tests/rt_safety.rs` uses `reference.nam` only.
+`input.json` within `1e-5`, **skipping the first `receptive_field()` samples** (the
+warmup transient — see "Warmup convention" below). `tests/rt_safety.rs` uses
+`reference.nam` only.
 
 ## Regenerating
 
@@ -29,9 +31,27 @@ inference precision).
 
 `forward()` prefers the **canonical** path — the real `neural-amp-modeler` package
 (`nam.models.wavenet._WaveNet`) — and falls back to a dependency-light **numpy**
-reimplementation when torch/`nam` isn't importable. The two were verified
-equivalent to ~`3e-7` on the committed model, so the fixture is identical either
-way. The committed `expected_output.json` was produced by the canonical torch path.
+reimplementation when torch/`nam` isn't importable. The committed
+`expected_output.json` was produced by the canonical torch path. In the **steady
+state** the two agree to ~`3e-7`; they diverge only over the warmup (see below), so
+either generator yields a fixture the trimmed parity test accepts.
+
+## Warmup convention
+
+The two reference implementations disagree over the first `receptive_field` samples,
+by construction:
+
+- torch's `_WaveNet.forward` (a training graph) pre-pads the whole input with zeros
+  and propagates each layer's bias/activation through the stack.
+- A streaming engine — this crate, and NAM Core / NeuralAudio — starts every layer
+  from a zero-filled history buffer instead.
+
+These agree once the receptive field fills, but differ over the startup transient
+(on the committed model, ~`0.023` max over the first ~22 samples, ~0.5 ms at 48 kHz).
+`tests/parity.rs` therefore compares only the steady state (`signal[rf..]`), where
+nam-rs matches canonical torch NAM to ~`1.5e-7`. nam-rs deliberately follows the
+streaming convention because a real-time `process_buffer` cannot pre-pad an unbounded
+stream; the numpy fallback follows it too.
 
 ## Layering of validation
 

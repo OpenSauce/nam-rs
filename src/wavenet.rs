@@ -26,6 +26,9 @@ const ARCHITECTURE: &str = "WaveNet";
 pub struct WaveNet {
     arrays: Vec<LayerArray>,
     head_scale: f32,
+    /// Samples of input history the deepest dilated tap reaches back over; equals
+    /// the model's warmup length / processing latency in samples.
+    receptive_field: usize,
     /// Channel width of the first array (its incoming head is silence this wide).
     channels0: usize,
     /// Head signal carried between arrays (two buffers, ping-ponged).
@@ -71,12 +74,24 @@ impl WaveNet {
         Ok(Self {
             arrays,
             head_scale,
+            receptive_field: receptive_field(cfg),
             channels0,
             head_a: vec![0.0; head_w],
             head_b: vec![0.0; head_w],
             sig_a: vec![0.0; sig_w],
             sig_b: vec![0.0; sig_w],
         })
+    }
+
+    /// Receptive field in samples: how far back the deepest dilated tap reaches.
+    ///
+    /// This is the model's warmup length and its processing latency. The first
+    /// `receptive_field()` output samples of a fresh (or freshly [`reset`](Self::reset))
+    /// model are a startup transient computed against zero-filled history, so they
+    /// reflect the streaming zero-init convention (matching NAM Core / NeuralAudio)
+    /// rather than a training-time forward pass that pre-pads the whole input.
+    pub fn receptive_field(&self) -> usize {
+        self.receptive_field
     }
 
     /// Process a buffer of mono samples in place.
@@ -146,6 +161,19 @@ impl WaveNet {
         self.sig_a.fill(0.0);
         self.sig_b.fill(0.0);
     }
+}
+
+/// Receptive field implied by `config`: `1 + Σ (kernel_size - 1) · dilation` over
+/// every dilated layer in every array. The stacked dilated convs compose additively,
+/// so this is the number of past input samples the final output depends on.
+fn receptive_field(cfg: &WaveNetConfig) -> usize {
+    let mut rf = 1;
+    for la in &cfg.layers {
+        for &d in &la.dilations {
+            rf += (la.kernel_size - 1) * d;
+        }
+    }
+    rf
 }
 
 /// Number of `f32`s `config` implies in the flat weight blob, including the final
@@ -272,6 +300,33 @@ mod tests {
         let mut buf = [0.5_f32];
         wn.process_buffer(&mut buf);
         assert!((buf[0] - 10.0).abs() < 1e-5, "got {}", buf[0]);
+    }
+
+    #[test]
+    fn receptive_field_sums_dilated_taps() {
+        // 1 + Σ(k-1)·d. Mirrors the reference model: kernel 3, dilations [1,2] then [8].
+        let mk = |dilations: Vec<usize>| LayerArrayConfig {
+            input_size: 1,
+            condition_size: 1,
+            channels: 1,
+            head_size: 1,
+            kernel_size: 3,
+            dilations,
+            activation: "Tanh".into(),
+            gated: false,
+            head_bias: false,
+        };
+        let cfg = WaveNetConfig {
+            layers: vec![mk(vec![1, 2]), mk(vec![8])],
+            head: None,
+            head_scale: 1.0,
+        };
+        // (3-1)*1 + (3-1)*2 + (3-1)*8 = 2 + 4 + 16 = 22, + 1 = 23.
+        assert_eq!(receptive_field(&cfg), 23);
+
+        // TINY (kernel 1, dilation 1) reaches back over no past samples: rf = 1.
+        let model = NamModel::from_json_str(TINY).unwrap();
+        assert_eq!(WaveNet::new(&model).unwrap().receptive_field(), 1);
     }
 
     #[test]

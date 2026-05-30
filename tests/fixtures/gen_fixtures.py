@@ -10,10 +10,11 @@ forward pass (``numpy_forward``), ported from:
   - NeuralAudio (Mike Oliphant, MIT) -- ``NeuralAudio/WaveNet.h``.
   - neural-amp-modeler (Steven Atkinson, MIT) -- ``nam/models/wavenet/*.py``.
 
-``forward`` prefers the canonical path and falls back to numpy. The two have been
-verified equivalent to ~3e-7 on the committed model, so the fixture is identical
-either way (float32, matching NAM Core's inference precision). The Rust crate must
-reproduce this output within 1e-5 (``tests/parity.rs``).
+``forward`` prefers the canonical path and falls back to numpy. The two agree to
+~3e-7 in the steady state but differ over the receptive-field warmup (torch's
+training forward pre-pads + propagates bias; a streaming engine zero-inits each
+layer's history). ``tests/parity.rs`` skips that warmup and asserts ~1.5e-7 over
+the steady state. float32 throughout, matching NAM Core's inference precision.
 
 Usage:
     # canonical (recommended): a torch-capable interpreter with `nam` installed

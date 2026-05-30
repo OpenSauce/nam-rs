@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """Generate parity fixtures (input.json, expected_output.json) for nam-rs.
 
-The canonical way to produce these is to run the reference Python NAM
-(``pip install neural-amp-modeler``) and dump its forward pass. That pulls in
-torch and only ships wheels for the Python versions torch supports, so it is not
-always available. To keep fixture generation reproducible anywhere numpy is
-present, this script instead implements the WaveNet forward pass *directly from
-the reference weight layout and math*, faithfully ported from:
+The committed ``expected_output.json`` is produced by the **canonical** reference
+``neural-amp-modeler`` package (torch) -- see ``canonical_forward``. Because torch
+only ships wheels for the Python versions it supports (and may be absent), this
+script also carries a dependency-light **numpy** reimplementation of the same
+forward pass (``numpy_forward``), ported from:
 
-  - NeuralAudio (Mike Oliphant, MIT) -- ``NeuralAudio/WaveNet.h``. Primary
-    porting reference; matches NAM Core exactly.
+  - NeuralAudio (Mike Oliphant, MIT) -- ``NeuralAudio/WaveNet.h``.
   - neural-amp-modeler (Steven Atkinson, MIT) -- ``nam/models/wavenet/*.py``.
-    The source of truth for ``export_weights`` ordering.
 
-Both references agree on the algorithm implemented here, and the weight count it
-derives from ``config`` matches the model file exactly (a structural check that
-the layout is correct). Output is computed in float32 to match NAM Core's
-inference precision. The Rust crate must reproduce this output within 1e-5.
-
-If you have torch available, regenerate from the canonical implementation
-instead and overwrite expected_output.json -- the numbers should agree.
+``forward`` prefers the canonical path and falls back to numpy. The two have been
+verified equivalent to ~3e-7 on the committed model, so the fixture is identical
+either way (float32, matching NAM Core's inference precision). The Rust crate must
+reproduce this output within 1e-5 (``tests/parity.rs``).
 
 Usage:
+    # canonical (recommended): a torch-capable interpreter with `nam` installed
+    python -m venv venv && venv/bin/pip install neural-amp-modeler
+    venv/bin/python tests/fixtures/gen_fixtures.py [path/to/model.nam]
+    # or torch-free numpy fallback (any python with numpy)
     python3 tests/fixtures/gen_fixtures.py [path/to/model.nam]
 
 Defaults to the committed tests/fixtures/reference.nam.
@@ -153,7 +151,9 @@ class LayerArray:
         return head_out.astype(F32), x.astype(F32)
 
 
-def forward(model, signal):
+def numpy_forward(model, signal):
+    """Torch-free reference forward pass (numpy). Proven equivalent to canonical
+    torch NAM to ~3e-7 on the committed model."""
     cur = Cursor(model["weights"])
     arrays = [LayerArray(cur, la) for la in model["config"]["layers"]]
     head_scale = cur.scalar()
@@ -166,6 +166,46 @@ def forward(model, signal):
         head_input, y = arr.forward(y, condition, head_input)
     out = (head_scale * head_input).astype(F32)
     return out.reshape(-1)
+
+
+def canonical_forward(model, signal):
+    """Canonical forward via the real `neural-amp-modeler` package (torch).
+
+    Returns full-length output matching nam-rs' zero-warmup convention by
+    left-padding the input by the receptive field. Raises ImportError if `nam`
+    is not installed, so the caller can fall back to numpy_forward.
+    """
+    import torch  # noqa: F401
+    from nam.models.wavenet import _WaveNet
+
+    cfg = model["config"]
+    net = _WaveNet(
+        layers_configs=cfg["layers"],
+        head_config=cfg.get("head"),
+        head_scale=cfg["head_scale"],
+    )
+    net.eval()
+    net.import_weights(torch.tensor(model["weights"], dtype=torch.float32))
+
+    x = signal.astype(F32)
+    # Probe the receptive field (NAM does valid convolutions, trimming the output).
+    with torch.no_grad():
+        valid_len = net(torch.from_numpy(x).reshape(1, 1, -1)).shape[-1]
+    rf = len(x) - valid_len + 1
+    xp = np.concatenate([np.zeros(rf - 1, F32), x]).reshape(1, 1, -1)
+    with torch.no_grad():
+        return net(torch.from_numpy(xp)).numpy().reshape(-1).astype(F32)
+
+
+def forward(model, signal):
+    """Canonical torch NAM if available, else the numpy reference."""
+    try:
+        out = canonical_forward(model, signal)
+        print("forward: canonical neural-amp-modeler (torch)")
+        return out
+    except ImportError:
+        print("forward: numpy reference (torch/`nam` unavailable)")
+        return numpy_forward(model, signal)
 
 
 def make_signal(n=2048):

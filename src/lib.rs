@@ -21,7 +21,7 @@
 //! ```
 //! use nam_rs::{NamModel, WaveNet};
 //!
-//! // A `.nam` file is JSON; load it from disk with `std::fs::read_to_string`.
+//! // From disk you'd use `NamModel::from_file("model.nam")?`.
 //! // Here we use a tiny in-line model for illustration.
 //! let json = r#"{
 //!     "version": "0.5.4", "architecture": "WaveNet",

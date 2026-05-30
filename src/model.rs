@@ -37,7 +37,16 @@ pub struct NamModel {
 }
 
 impl NamModel {
-    /// Parse a `.nam` model from a JSON string.
+    /// Read and parse a `.nam` model from a file on disk.
+    ///
+    /// Convenience over [`std::fs::read_to_string`] + [`Self::from_json_str`].
+    /// Returns [`Error::Io`] if the file can't be read, or [`Error::Json`] if its
+    /// contents aren't valid `.nam` JSON.
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
+        Self::from_json_str(&std::fs::read_to_string(path)?)
+    }
+
+    /// Parse a `.nam` model from a JSON string already in memory.
     pub fn from_json_str(json: &str) -> Result<Self, Error> {
         Ok(serde_json::from_str(json)?)
     }

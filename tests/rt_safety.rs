@@ -6,9 +6,6 @@
 //!
 //! `WaveNet::new` is allowed to allocate (it runs off the audio thread), so it sits
 //! outside the guard.
-//!
-//! `#[ignore]`d until the forward pass is implemented — turning it on is the RED
-//! step that forces the implementation to pre-allocate every scratch buffer.
 
 use assert_no_alloc::*;
 use nam_rs::{NamModel, WaveNet};

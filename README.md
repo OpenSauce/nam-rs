@@ -6,9 +6,8 @@ Pure-Rust, real-time-safe inference for [Neural Amp Modeler](https://www.neurala
 sample-by-sample with **no heap allocation on the audio thread** — suitable for use
 inside a JACK callback, a VST3/CLAP `process()`, or any real-time audio graph.
 
-> Status: **early scaffolding.** The `.nam` parser is implemented and tested. The
-> WaveNet forward pass is being built test-first against the parity and RT-safety
-> harnesses (see below). LSTM support is future work.
+> Status: **WaveNet inference is implemented and tested** — parser, forward pass,
+> parity, and RT-safety harnesses all green. LSTM support is future work.
 
 ## Design contract
 
@@ -19,26 +18,40 @@ inside a JACK callback, a VST3/CLAP `process()`, or any real-time audio graph.
    locks, or syscalls; all scratch buffers are pre-allocated in `WaveNet::new`.
    Enforced by `tests/rt_safety.rs` via `assert_no_alloc`.
 
+## Install
+
+```bash
+cargo add nam-rs
+```
+
 ## Usage
 
 ```rust
 use nam_rs::{NamModel, WaveNet};
 
-// Off the audio thread: parse + allocate.
-let json = std::fs::read_to_string("twin_reverb.nam")?;
-let model = NamModel::from_json_str(&json)?;
+// Off the audio thread: load + allocate.
+let model = NamModel::from_file("twin_reverb.nam")?;
 let mut amp = WaveNet::new(&model)?;
 
-// On the audio thread: in-place, allocation-free.
+// On the audio thread: in-place, allocation-free. Call once per audio block;
+// state carries across calls, so block-wise output matches one whole-buffer call.
 amp.process_buffer(&mut audio_buffer);
 ```
+
+The first `amp.receptive_field()` output samples are a startup transient (the dilated
+stack filling against zero-history) — the model's inherent latency, the same
+convention NAM Core / NeuralAudio use. Call `WaveNet::reset` to return to silence.
 
 ## Development
 
 ```bash
-cargo test                # parser tests (parity/rt-safety are #[ignore] pending fixtures)
-cargo test -- --ignored   # once tests/fixtures are generated — see tests/fixtures/README.md
+cargo test                                  # parser, parity, and RT-safety tests
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 ```
+
+Parity fixtures are committed under `tests/fixtures/`; regenerate them from Python NAM
+with `tests/fixtures/gen_fixtures.py` (see `tests/fixtures/README.md`).
 
 ## Attribution & license
 

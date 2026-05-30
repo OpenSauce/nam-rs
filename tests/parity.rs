@@ -33,12 +33,32 @@ fn load_samples(name: &str) -> Vec<f32> {
 
 #[test]
 fn matches_python_reference_wavenet() {
-    let json = std::fs::read_to_string(fixture("reference.nam")).expect("reference.nam");
+    assert_parity("reference.nam", "input.json", "expected_output.json");
+}
+
+/// Realistic standard-architecture model (NAM Core `wavenet_a1_standard.nam`, MIT):
+/// two layer-arrays, 16+8 channels, dilations 1..512, 13,802 weights — the same
+/// shape real-world amp captures use. Guards the forward pass at production channel
+/// sizes, not just the 131-weight minimal model.
+#[test]
+fn matches_python_reference_wavenet_standard() {
+    assert_parity(
+        "reference_standard.nam",
+        "input_standard.json",
+        "expected_output_standard.json",
+    );
+}
+
+/// Load `model_file`, run `input_file` through it, and assert steady-state parity
+/// against `expected_file` within [`TOLERANCE`].
+fn assert_parity(model_file: &str, input_file: &str, expected_file: &str) {
+    let json = std::fs::read_to_string(fixture(model_file))
+        .unwrap_or_else(|e| panic!("missing fixture {model_file}: {e}"));
     let model = NamModel::from_json_str(&json).expect("parse reference model");
 
     let mut wn = WaveNet::new(&model).expect("build WaveNet");
-    let mut signal = load_samples("input.json");
-    let expected = load_samples("expected_output.json");
+    let mut signal = load_samples(input_file);
+    let expected = load_samples(expected_file);
     assert_eq!(signal.len(), expected.len(), "fixture length mismatch");
 
     wn.process_buffer(&mut signal);

@@ -2,32 +2,39 @@
 
 These files pin nam-rs to the reference NAM WaveNet forward pass.
 
-| File                   | What it is                                                  |
-| ---------------------- | ----------------------------------------------------------- |
-| `reference.nam`        | A real exported WaveNet model (NAM Core `example_models/wavenet.nam`, MIT). |
-| `input.json`           | JSON array of input samples (mono).                         |
-| `expected_output.json` | The **canonical** `neural-amp-modeler` (torch) output for `input.json`. |
+| File                            | What it is                                                  |
+| ------------------------------- | ----------------------------------------------------------- |
+| `reference.nam`                 | A real exported WaveNet model (NAM Core `example_models/wavenet.nam`, MIT, 131 weights). |
+| `input.json`                    | JSON array of input samples (mono), 2048 samples.           |
+| `expected_output.json`          | The **canonical** `neural-amp-modeler` (torch) output for `input.json`. |
+| `reference_standard.nam`        | The realistic standard model (NAM Core `example_models/wavenet_a1_standard.nam`, MIT, 13,802 weights — 16+8 channels, dilations 1..512). |
+| `input_standard.json`           | Input for the standard model, 8192 samples (its receptive field ~4093 exceeds 2048). |
+| `expected_output_standard.json` | Canonical torch output for `input_standard.json`.           |
 
-`tests/parity.rs` asserts nam-rs reproduces `expected_output.json` from
-`input.json` within `1e-5`, **skipping the first `receptive_field()` samples** (the
-warmup transient — see "Warmup convention" below). `tests/rt_safety.rs` uses
-`reference.nam` only.
+`tests/parity.rs` asserts nam-rs reproduces each `expected_output*.json` from the
+matching `input*.json` within `1e-5`, **skipping the first `receptive_field()`
+samples** (the warmup transient — see "Warmup convention" below). The two cases
+guard both the minimal model and production channel sizes. `tests/rt_safety.rs`
+uses `reference.nam` only.
 
 ## Regenerating
 
 ```bash
-# canonical (recommended): needs a torch-capable Python with `nam` installed
-python -m venv venv && venv/bin/pip install neural-amp-modeler
-venv/bin/python tests/fixtures/gen_fixtures.py
+# canonical (recommended): needs a torch-capable Python with `nam` installed.
+# The default python3 may lack torch wheels; python3.10 here does support torch.
+python3.10 -m venv venv && venv/bin/pip install neural-amp-modeler
+venv/bin/python tests/fixtures/gen_fixtures.py                                                   # minimal
+venv/bin/python tests/fixtures/gen_fixtures.py tests/fixtures/reference_standard.nam _standard 8192
 
-# torch-free fallback (any python3 with numpy)
+# torch-free fallback (any python3 with numpy) — same arguments
 python3 tests/fixtures/gen_fixtures.py
 ```
 
-`gen_fixtures.py` generates a deterministic test signal (fixed seed: noise burst +
-two sweeps, 2048 samples, past the model's receptive field), runs the forward pass,
-and writes `input.json` / `expected_output.json` (float32, matching NAM Core's
-inference precision).
+`gen_fixtures.py [model] [out_prefix] [samples]` generates a deterministic test
+signal (fixed seed: noise burst + two sweeps, past the model's receptive field),
+runs the forward pass, and writes `input{prefix}.json` / `expected_output{prefix}.json`
+(float32, matching NAM Core's inference precision). It defaults to `reference.nam`,
+an empty prefix, and 2048 samples.
 
 `forward()` prefers the **canonical** path — the real `neural-amp-modeler` package
 (`nam.models.wavenet._WaveNet`) — and falls back to a dependency-light **numpy**

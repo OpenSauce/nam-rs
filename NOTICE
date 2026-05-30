@@ -34,6 +34,21 @@ License: MIT
     SOFTWARE.
 
 ================================================================================
+Bundled model fixtures (tests/fixtures/*.nam)
+
+These are real exported WaveNet models redistributed from NeuralAmpModelerCore
+(MIT, Copyright (c) 2019-2025 Steven Atkinson) for parity testing:
+
+    tests/fixtures/reference.nam
+        from NeuralAmpModelerCore/example_models/wavenet.nam (v0.5.4, 131 weights)
+    tests/fixtures/reference_standard.nam
+        from NeuralAmpModelerCore/example_models/wavenet_a1_standard.nam
+        (v0.5.0, 13,802 weights — standard 16+8-channel architecture)
+
+Redistributed under the MIT terms above. No third-party (GPL / TONE3000-T3K)
+model files are committed to this repository.
+
+================================================================================
 waveny               —  https://github.com/nlpodyssey/waveny
 License: Apache License 2.0
 

@@ -35,7 +35,7 @@ impl Lstm {
             }
         };
 
-        let expected = expected_weight_count(cfg);
+        let expected = expected_weight_count(cfg)?;
         if expected != model.weights.len() {
             return Err(Error::WeightCountMismatch {
                 expected,
@@ -109,17 +109,24 @@ impl Lstm {
 }
 
 /// Number of `f32`s the LSTM `config` implies in the flat weight blob.
-fn expected_weight_count(cfg: &LstmConfig) -> usize {
+///
+/// Uses checked arithmetic: an absurd or adversarial config whose dimensions overflow
+/// `usize` returns [`Error::ConfigTooLarge`] rather than panicking (debug) or wrapping
+/// to a wrong, small count (release).
+fn expected_weight_count(cfg: &LstmConfig) -> Result<usize, Error> {
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(Error::ConfigTooLarge);
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
+
     let h = cfg.hidden_size;
-    let mut total = 0;
+    let mut total = 0usize;
     for layer in 0..cfg.num_layers {
         let in_dim = if layer == 0 { cfg.input_size } else { h };
-        total += 4 * h * (in_dim + h); // combined W
-        total += 4 * h; // bias
-        total += h; // h0
-        total += h; // c0
+        total = add(total, mul(mul(4, h)?, add(in_dim, h)?)?)?; // combined W
+        total = add(total, mul(4, h)?)?; // bias
+        total = add(total, h)?; // h0
+        total = add(total, h)?; // c0
     }
-    total + h + 1 // head weight + bias
+    add(add(total, h)?, 1) // head weight + bias
 }
 
 #[cfg(test)]
@@ -155,6 +162,18 @@ mod tests {
         assert!(matches!(
             Lstm::new(&model),
             Err(crate::Error::WeightCountMismatch { .. })
+        ));
+    }
+
+    /// A structurally valid config whose dimensions overflow `usize` must return
+    /// `ConfigTooLarge`, not panic (debug) or wrap to a wrong count (release).
+    #[test]
+    fn absurd_dimensions_error_instead_of_overflowing() {
+        let json = TINY_LSTM.replace("\"hidden_size\": 1", "\"hidden_size\": 4294967296");
+        let model = NamModel::from_json_str(&json).unwrap();
+        assert!(matches!(
+            Lstm::new(&model),
+            Err(crate::Error::ConfigTooLarge)
         ));
     }
 

@@ -23,4 +23,10 @@ pub enum Error {
     /// `config` implies (corrupt file, or a config/weights mismatch).
     #[error("weight count mismatch: config implies {expected} weights, file has {found}")]
     WeightCountMismatch { expected: usize, found: usize },
+
+    /// The `config`'s declared dimensions are so large that the implied weight
+    /// count overflows `usize`, so the model cannot be built. Indicates a corrupt
+    /// or adversarial file rather than a real capture.
+    #[error("model config dimensions are too large to be valid")]
+    ConfigTooLarge,
 }

@@ -58,7 +58,7 @@ impl WaveNet {
             }
         };
 
-        let expected = expected_weight_count(cfg);
+        let expected = expected_weight_count(cfg)?;
         if expected != model.weights.len() {
             return Err(Error::WeightCountMismatch {
                 expected,
@@ -252,27 +252,44 @@ fn receptive_field(cfg: &WaveNetConfig) -> usize {
 
 /// Number of `f32`s `config` implies in the flat weight blob, including the final
 /// `head_scale`.
-fn expected_weight_count(cfg: &WaveNetConfig) -> usize {
-    let mut total = 0;
+///
+/// Uses checked arithmetic: an absurd or adversarial config whose dimensions overflow
+/// `usize` returns [`Error::ConfigTooLarge`] rather than panicking (debug) or wrapping
+/// to a wrong, small count (release).
+fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(Error::ConfigTooLarge);
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
+
+    let mut total = 0usize;
     for la in &cfg.layers {
         let mid = if la.gated {
-            2 * la.channels
+            mul(2, la.channels)?
         } else {
             la.channels
         };
-        total += la.channels * la.input_size; // rechannel (no bias)
-        let per_layer = mid * la.channels * la.kernel_size // conv weights
-            + mid                                          // conv bias
-            + mid * la.condition_size                      // input mixer (no bias)
-            + la.channels * la.channels                    // 1x1 weights
-            + la.channels; // 1x1 bias
-        total += la.dilations.len() * per_layer;
-        total += la.head_size * la.channels; // head rechannel weights
+        total = add(total, mul(la.channels, la.input_size)?)?; // rechannel (no bias)
+
+        let per_layer = add(
+            add(
+                add(
+                    add(
+                        mul(mul(mid, la.channels)?, la.kernel_size)?, // conv weights
+                        mid,                                          // conv bias
+                    )?,
+                    mul(mid, la.condition_size)?, // input mixer (no bias)
+                )?,
+                mul(la.channels, la.channels)?, // 1x1 weights
+            )?,
+            la.channels, // 1x1 bias
+        )?;
+        total = add(total, mul(la.dilations.len(), per_layer)?)?;
+
+        total = add(total, mul(la.head_size, la.channels)?)?; // head rechannel weights
         if la.head_bias {
-            total += la.head_size;
+            total = add(total, la.head_size)?;
         }
     }
-    total + 1 // head_scale
+    add(total, 1) // head_scale
 }
 
 fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Error> {
@@ -409,6 +426,15 @@ mod tests {
             }
             other => panic!("expected WeightCountMismatch, got {other:?}"),
         }
+    }
+
+    /// A structurally valid config whose dimensions overflow `usize` must return
+    /// `ConfigTooLarge`, not panic (debug) or wrap to a wrong count (release).
+    #[test]
+    fn absurd_dimensions_error_instead_of_overflowing() {
+        let json = TINY.replace("\"channels\": 1", "\"channels\": 4294967296");
+        let model = NamModel::from_json_str(&json).unwrap();
+        assert!(matches!(WaveNet::new(&model), Err(Error::ConfigTooLarge)));
     }
 
     #[test]

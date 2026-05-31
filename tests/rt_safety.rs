@@ -8,7 +8,7 @@
 //! outside the guard.
 
 use assert_no_alloc::*;
-use nam_rs::{NamModel, WaveNet};
+use nam_rs::{Lstm, NamModel, WaveNet};
 
 #[cfg(debug_assertions)]
 #[global_allocator]
@@ -28,5 +28,20 @@ fn process_buffer_does_not_allocate() {
     wn.process_buffer(&mut buffer);
     assert_no_alloc(|| {
         wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
+fn lstm_process_buffer_does_not_allocate() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference_lstm.nam");
+    let json = std::fs::read_to_string(path).expect("reference_lstm.nam");
+    let model = NamModel::from_json_str(&json).expect("parse model");
+    let mut net = Lstm::new(&model).expect("build Lstm");
+    let mut buffer = vec![0.0_f32; 512];
+
+    net.process_buffer(&mut buffer); // warm up off-guard
+    assert_no_alloc(|| {
+        net.process_buffer(&mut buffer);
     });
 }

@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use nam_rs::{NamModel, WaveNet};
+use nam_rs::{Model, NamModel, WaveNet};
 
 /// Max absolute per-sample deviation allowed from the reference output.
 /// NAM Core runs in `f32`; this matches the tolerance NeuralAudio uses for parity.
@@ -46,6 +46,49 @@ fn matches_python_reference_wavenet_standard() {
         "reference_standard.nam",
         "input_standard.json",
         "expected_output_standard.json",
+    );
+}
+
+#[test]
+fn matches_python_reference_lstm() {
+    assert_parity_full_lstm(
+        "reference_lstm.nam",
+        "input_lstm.json",
+        "expected_output_lstm.json",
+    );
+}
+
+#[test]
+fn matches_python_reference_lstm_standard() {
+    assert_parity_full_lstm(
+        "reference_lstm_standard.nam",
+        "input_lstm_standard.json",
+        "expected_output_lstm_standard.json",
+    );
+}
+
+/// LSTM parity: full-length compare (receptive field is 1, no warmup transient).
+fn assert_parity_full_lstm(model_file: &str, input_file: &str, expected_file: &str) {
+    let json = std::fs::read_to_string(fixture(model_file))
+        .unwrap_or_else(|e| panic!("missing fixture {model_file}: {e}"));
+    let model = NamModel::from_json_str(&json).expect("parse LSTM model");
+    let mut net = Model::from_nam(&model).expect("build Model");
+
+    let mut signal = load_samples(input_file);
+    let expected = load_samples(expected_file);
+    assert_eq!(signal.len(), expected.len(), "fixture length mismatch");
+
+    net.process_buffer(&mut signal);
+
+    let max_err = signal
+        .iter()
+        .zip(&expected)
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0_f32, f32::max);
+
+    assert!(
+        max_err <= TOLERANCE,
+        "max per-sample error {max_err} exceeds tolerance {TOLERANCE}"
     );
 }
 

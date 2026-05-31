@@ -4,15 +4,11 @@
 //! order, row-major, gate order **i, f, g, o** (PyTorch). The exporter pre-sums
 //! `bias_ih + bias_hh`, so there is a single bias vector of length `4H`.
 
-// used by the Lstm runtime added in a later task
-#[allow(dead_code)]
 #[inline]
 fn sigmoid(z: f32) -> f32 {
     1.0 / (1.0 + (-z).exp())
 }
 
-// used by the Lstm runtime added in a later task
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct LstmCell {
     hidden_size: usize,
@@ -31,8 +27,6 @@ pub(crate) struct LstmCell {
     gates: Vec<f32>, // 4H
 }
 
-// used by the Lstm runtime added in a later task
-#[allow(dead_code)]
 impl LstmCell {
     pub(crate) fn new(
         input_size: usize,
@@ -99,8 +93,6 @@ impl LstmCell {
         self.c.copy_from_slice(&self.c0);
     }
 
-    // used by the Lstm runtime added in a later task
-    #[allow(dead_code)]
     pub(crate) fn hidden_size(&self) -> usize {
         self.hidden_size
     }

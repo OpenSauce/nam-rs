@@ -72,6 +72,13 @@ fn rejects_malformed_json() {
     assert!(NamModel::from_json_str("{ not json").is_err());
 }
 
+#[test]
+fn rejects_wrong_typed_config_field() {
+    // A config field with the wrong JSON type must fail to parse, not panic.
+    let json = MINIMAL_WAVENET.replace("\"channels\": 2", "\"channels\": \"lots\"");
+    assert!(NamModel::from_json_str(&json).is_err());
+}
+
 /// A WaveNet file carrying NAM's metadata block (keys taken from a real .nam).
 const WITH_METADATA: &str = r#"{
     "version": "0.5.4",

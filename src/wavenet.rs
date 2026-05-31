@@ -72,6 +72,14 @@ impl WaveNet {
             arrays.push(build_array(&mut r, la)?);
         }
         let head_scale = r.take(1)[0];
+        // The up-front check guarantees `expected == weights.len()`; this asserts the
+        // other half of the invariant — that building consumed exactly `expected`, so
+        // `expected_weight_count` and the `build_array` consumption order agree.
+        debug_assert_eq!(
+            r.remaining(),
+            0,
+            "build_array consumed fewer weights than expected_weight_count claimed"
+        );
 
         let max_ch = arrays.iter().map(LayerArray::channels).max().unwrap_or(1);
         let max_head = arrays.iter().map(LayerArray::head_size).max().unwrap_or(1);
@@ -435,6 +443,68 @@ mod tests {
         let json = TINY.replace("\"channels\": 1", "\"channels\": 4294967296");
         let model = NamModel::from_json_str(&json).unwrap();
         assert!(matches!(WaveNet::new(&model), Err(Error::ConfigTooLarge)));
+    }
+
+    /// Pins the weight-count invariant `take` relies on: `expected_weight_count` must
+    /// equal exactly what `build_array` (+ head_scale) consumes, across config shapes.
+    /// Building with that many weights succeeds (and the `debug_assert` in `new` fires
+    /// if consumption drifts below it); one fewer / one more is a count mismatch.
+    #[test]
+    fn weight_count_matches_consumption_across_shapes() {
+        #[allow(clippy::too_many_arguments)]
+        let mk = |input_size,
+                  channels,
+                  head_size,
+                  kernel_size,
+                  dilations: Vec<usize>,
+                  gated,
+                  head_bias| LayerArrayConfig {
+            input_size,
+            condition_size: 1,
+            channels,
+            head_size,
+            kernel_size,
+            dilations,
+            activation: "Tanh".into(),
+            gated,
+            head_bias,
+        };
+        let layer_sets = vec![
+            vec![mk(1, 1, 1, 1, vec![1], false, false)],
+            vec![mk(1, 2, 1, 3, vec![1, 2], false, false)],
+            vec![mk(1, 4, 2, 3, vec![1, 2, 4], true, false)], // gated
+            vec![mk(1, 3, 1, 3, vec![1], false, true)],       // head_bias
+            // two arrays: the second takes the first's channels as its input_size.
+            vec![
+                mk(1, 4, 1, 3, vec![1, 2], false, false),
+                mk(4, 2, 1, 3, vec![1], true, true),
+            ],
+        ];
+        for layers in layer_sets {
+            let cfg = WaveNetConfig {
+                layers,
+                head: None,
+                head_scale: 1.0,
+            };
+            let n = expected_weight_count(&cfg).unwrap();
+            let mk_model = |count: usize| NamModel {
+                version: "0".into(),
+                architecture: "WaveNet".into(),
+                config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+                weights: vec![0.0; count],
+                sample_rate: None,
+                metadata: None,
+            };
+            assert!(WaveNet::new(&mk_model(n)).is_ok(), "exact count n={n}");
+            assert!(matches!(
+                WaveNet::new(&mk_model(n - 1)),
+                Err(Error::WeightCountMismatch { .. })
+            ));
+            assert!(matches!(
+                WaveNet::new(&mk_model(n + 1)),
+                Err(Error::WeightCountMismatch { .. })
+            ));
+        }
     }
 
     #[test]

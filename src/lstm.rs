@@ -56,6 +56,14 @@ impl Lstm {
         }
         let head_w = r.take(h);
         let head_b = r.take(1)[0];
+        // Up-front check guarantees `expected == weights.len()`; assert the other half
+        // of the invariant — that building consumed exactly `expected`, so the count
+        // formula and the consumption order have not drifted apart.
+        debug_assert_eq!(
+            r.remaining(),
+            0,
+            "Lstm::new consumed fewer weights than expected_weight_count claimed"
+        );
 
         Ok(Self {
             cells,
@@ -175,6 +183,37 @@ mod tests {
             Lstm::new(&model),
             Err(crate::Error::ConfigTooLarge)
         ));
+    }
+
+    /// Pins the weight-count invariant: `expected_weight_count` must equal exactly
+    /// what `Lstm::new` consumes, across (input_size, hidden_size, num_layers) shapes.
+    #[test]
+    fn weight_count_matches_consumption_across_shapes() {
+        for (input_size, hidden_size, num_layers) in [(1, 1, 1), (1, 8, 1), (1, 4, 2), (2, 3, 3)] {
+            let cfg = LstmConfig {
+                input_size,
+                hidden_size,
+                num_layers,
+            };
+            let n = expected_weight_count(&cfg).unwrap();
+            let mk_model = |count: usize| NamModel {
+                version: "0".into(),
+                architecture: "LSTM".into(),
+                config: ModelConfig::Lstm(cfg.clone()),
+                weights: vec![0.0; count],
+                sample_rate: None,
+                metadata: None,
+            };
+            assert!(Lstm::new(&mk_model(n)).is_ok(), "exact count n={n}");
+            assert!(matches!(
+                Lstm::new(&mk_model(n - 1)),
+                Err(crate::Error::WeightCountMismatch { .. })
+            ));
+            assert!(matches!(
+                Lstm::new(&mk_model(n + 1)),
+                Err(crate::Error::WeightCountMismatch { .. })
+            ));
+        }
     }
 
     #[test]

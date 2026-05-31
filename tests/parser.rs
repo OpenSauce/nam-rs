@@ -110,6 +110,16 @@ fn parses_loudness_and_calibration_metadata() {
 }
 
 #[test]
+fn metadata_typed_parses_all_fields_in_one_call() {
+    let m = NamModel::from_json_str(WITH_METADATA).expect("parse");
+    let md = m.metadata_typed();
+    let approx = |got: Option<f32>, want: f32| (got.expect("present") - want).abs() < 1e-4;
+    assert!(approx(md.loudness, -20.02));
+    assert!(approx(md.input_level_dbu, 18.3));
+    assert!(approx(md.output_level_dbu, 12.3));
+}
+
+#[test]
 fn metadata_absent_yields_none() {
     // MINIMAL_WAVENET has no metadata block at all.
     let m = NamModel::from_json_str(MINIMAL_WAVENET).expect("parse");

@@ -18,6 +18,13 @@
 //! your host first. A mismatched rate produces silently wrong output, because the
 //! model's dilations and recurrence are defined in samples, not seconds.
 //!
+//! **Processing boundary.** `nam-rs` runs only the model's forward pass (plus its
+//! `head_scale`). The reference NAM plugin additionally applies a DC blocker
+//! (high-pass) and, optionally, loudness normalization on the output — those are the
+//! host's responsibility, not the model's, so they live in your audio graph, not here.
+//! The calibration accessors ([`NamModel::loudness`] etc.) give you the numbers to do
+//! that gain-staging yourself.
+//!
 //! ## Design contract
 //!
 //! 1. **Parity with the reference.** The forward pass must produce output equal

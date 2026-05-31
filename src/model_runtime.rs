@@ -52,7 +52,31 @@ impl Model {
             Model::Lstm(l) => l.reset(),
         }
     }
+
+    /// The model's processing latency in samples.
+    ///
+    /// For WaveNet this is the receptive field: the first this-many output samples
+    /// of a fresh (or freshly [`reset`](Self::reset)) model are a startup transient
+    /// computed against zero history. A host can report it as plugin latency and/or
+    /// discard that many leading samples. LSTM has no warmup, so this is `0`.
+    pub fn receptive_field(&self) -> usize {
+        match self {
+            Model::WaveNet(w) => w.receptive_field(),
+            Model::Lstm(_) => 0,
+        }
+    }
 }
+
+// Compile-time guarantee that the runtime types stay `Send + Sync`: a real-time
+// consumer builds the model off the audio thread and moves it onto the audio thread.
+// If a future field drops either auto-trait (e.g. an `Rc` or `Cell` creeps in), this
+// fails to compile instead of breaking downstream code.
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<Model>;
+    let _ = assert_send_sync::<WaveNet>;
+    let _ = assert_send_sync::<Lstm>;
+};
 
 #[cfg(test)]
 mod tests {
@@ -82,6 +106,15 @@ mod tests {
         let mut buf = [0.5_f32];
         model.process_buffer(&mut buf);
         assert!((buf[0] - 10.0).abs() < 1e-5, "got {}", buf[0]);
+    }
+
+    #[test]
+    fn receptive_field_zero_for_lstm_warmup_for_wavenet() {
+        // TINY_WAVENET: kernel 1, dilation 1 -> rf = 1. LSTM has no warmup -> 0.
+        let wn = Model::from_nam(&NamModel::from_json_str(TINY_WAVENET).unwrap()).unwrap();
+        assert_eq!(wn.receptive_field(), 1);
+        let lstm = Model::from_nam(&NamModel::from_json_str(TINY_LSTM).unwrap()).unwrap();
+        assert_eq!(lstm.receptive_field(), 0);
     }
 
     #[test]

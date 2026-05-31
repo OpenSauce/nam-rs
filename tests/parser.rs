@@ -1,6 +1,6 @@
 //! Tests for `.nam` file parsing (the on-disk format → [`NamModel`]).
 
-use nam_rs::{NamModel, DEFAULT_SAMPLE_RATE};
+use nam_rs::{ModelConfig, NamModel, DEFAULT_SAMPLE_RATE};
 
 /// A minimal but structurally-valid WaveNet `.nam`, with `sample_rate` omitted.
 const MINIMAL_WAVENET: &str = r#"{
@@ -32,9 +32,13 @@ fn parses_minimal_wavenet_config() {
 
     assert_eq!(model.version, "0.5.4");
     assert_eq!(model.architecture, "WaveNet");
-    assert_eq!(model.config.layers.len(), 1);
-
-    let layer = &model.config.layers[0];
+    let cfg = match &model.config {
+        ModelConfig::WaveNet(c) => c,
+        other => panic!("expected WaveNet config, got {other:?}"),
+    };
+    let layers = &cfg.layers;
+    assert_eq!(layers.len(), 1);
+    let layer = &layers[0];
     assert_eq!(layer.channels, 2);
     assert_eq!(layer.kernel_size, 3);
     assert_eq!(layer.dilations, vec![1, 2]);
@@ -42,7 +46,7 @@ fn parses_minimal_wavenet_config() {
     assert!(!layer.gated);
     assert!(!layer.head_bias);
 
-    assert!((model.config.head_scale - 0.5).abs() < 1e-9);
+    assert!((cfg.head_scale - 0.5).abs() < 1e-9);
     assert_eq!(model.weights, vec![0.1_f32, -0.2, 0.3]);
 }
 
@@ -118,4 +122,46 @@ fn unrelated_metadata_keys_are_ignored() {
     assert_eq!(m.input_level_dbu(), None);
     assert_eq!(m.output_level_dbu(), None);
     // unrelated keys ("name", "gear_type") must not error.
+}
+
+const MINIMAL_LSTM: &str = r#"{
+    "version": "0.5.4",
+    "architecture": "LSTM",
+    "config": { "input_size": 1, "hidden_size": 8, "num_layers": 1 },
+    "weights": [0.0],
+    "sample_rate": 44100.0
+}"#;
+
+#[test]
+fn parses_lstm_config() {
+    let m = NamModel::from_json_str(MINIMAL_LSTM).expect("parse LSTM");
+    assert_eq!(m.architecture, "LSTM");
+    match &m.config {
+        ModelConfig::Lstm(c) => {
+            assert_eq!(c.input_size, 1);
+            assert_eq!(c.hidden_size, 8);
+            assert_eq!(c.num_layers, 1);
+        }
+        other => panic!("expected Lstm config, got {other:?}"),
+    }
+    assert_eq!(m.sample_rate(), 44100.0);
+}
+
+#[test]
+fn wavenet_config_still_parses_through_enum() {
+    let m = NamModel::from_json_str(MINIMAL_WAVENET).expect("parse");
+    match &m.config {
+        ModelConfig::WaveNet(c) => assert_eq!(c.layers.len(), 1),
+        other => panic!("expected WaveNet config, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_architecture_fails_to_parse() {
+    let json = MINIMAL_WAVENET.replace("\"WaveNet\"", "\"Transformer\"");
+    let err = NamModel::from_json_str(&json).unwrap_err();
+    assert!(
+        format!("{err}").contains("Transformer"),
+        "error should name the bad architecture: {err}"
+    );
 }

@@ -23,10 +23,14 @@ fn main() -> Result<(), nam_rs::Error> {
     // --- Setup (off the audio thread): parsing and `WaveNet::new` allocate. ---
     let model = NamModel::from_file(&path)?;
     let mut amp = WaveNet::new(&model)?;
+    let layer_arrays = match &model.config {
+        nam_rs::ModelConfig::WaveNet(c) => c.layers.len(),
+        nam_rs::ModelConfig::Lstm(_) => 0,
+    };
     println!(
         "loaded {path}: {} layer-arrays, receptive field {} samples \
          (~{:.1} ms at {} Hz) — the startup transient before output settles",
-        model.config.layers.len(),
+        layer_arrays,
         amp.receptive_field(),
         amp.receptive_field() as f64 / model.sample_rate() * 1000.0,
         model.sample_rate(),

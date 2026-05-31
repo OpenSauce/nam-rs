@@ -69,5 +69,8 @@ mod reader;
 mod wavenet;
 
 pub use error::Error;
-pub use model::{LayerArrayConfig, Metadata, NamModel, WaveNetConfig, DEFAULT_SAMPLE_RATE};
+pub use model::{
+    LayerArrayConfig, LstmConfig, Metadata, ModelConfig, NamModel, WaveNetConfig,
+    DEFAULT_SAMPLE_RATE,
+};
 pub use wavenet::WaveNet;

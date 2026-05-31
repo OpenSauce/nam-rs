@@ -18,10 +18,10 @@ fn main() {
 
     let model = NamModel::from_file(&path).expect("load .nam");
     println!(
-        "loaded {path}: arch={} version={} sample_rate={}",
+        "loaded {path}: arch={} version={} expected_sample_rate={}",
         model.architecture,
         model.version,
-        model.sample_rate()
+        model.expected_sample_rate()
     );
 
     let mut amp = Model::from_nam(&model).expect("build model");

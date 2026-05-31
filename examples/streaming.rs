@@ -23,7 +23,19 @@ fn main() -> Result<(), nam_rs::Error> {
     // --- Setup (off the audio thread): parsing and `Model::from_nam` allocate. ---
     let model = NamModel::from_file(&path)?;
     let mut amp = Model::from_nam(&model)?;
-    let sr = model.sample_rate();
+
+    // The sample rate the model was captured at. nam-rs does *not* resample, so a
+    // real host must feed audio at this rate — compare it against the host's rate
+    // (which JACK/VST3/CLAP hand you in their setup callback) and resample, or
+    // refuse to load, if they differ. We stand in for the host with a constant.
+    let sr = model.expected_sample_rate();
+    const HOST_SAMPLE_RATE: f64 = 48_000.0;
+    if sr != HOST_SAMPLE_RATE {
+        eprintln!(
+            "warning: host runs at {HOST_SAMPLE_RATE} Hz but the model expects {sr} Hz — \
+             a real host would resample the I/O to {sr} Hz here, or the output is wrong"
+        );
+    }
     // Describe the model in architecture-appropriate terms: WaveNet has a
     // receptive-field warmup, LSTM is recurrent (no warmup transient).
     let summary = match &amp {

@@ -20,7 +20,6 @@ pub struct Lstm {
     /// Head: `Linear(H, 1)` — weight length `H`, scalar bias.
     head_w: Vec<f32>,
     head_b: f32,
-    sample_rate: f64,
     /// Carry buffers for the inter-layer hidden signal (ping-ponged), width `H`.
     buf_a: Vec<f32>,
     buf_b: Vec<f32>,
@@ -62,7 +61,6 @@ impl Lstm {
             cells,
             head_w,
             head_b,
-            sample_rate: model.sample_rate(),
             buf_a: vec![0.0; h.max(1)],
             buf_b: vec![0.0; h.max(1)],
         })
@@ -98,11 +96,6 @@ impl Lstm {
             y += self.head_w[j] * self.buf_a[j];
         }
         y
-    }
-
-    /// The model's sample rate (from the source `.nam`, or the NAM default).
-    pub fn sample_rate(&self) -> f64 {
-        self.sample_rate
     }
 
     /// Reset all recurrent state to the exported initial hidden/cell vectors.

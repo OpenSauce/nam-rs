@@ -12,6 +12,12 @@
 //! architecture-agnostic [`Model`] enum, which dispatches on the `.nam`'s declared
 //! architecture so you never have to branch on it yourself.
 //!
+//! **Sample rate.** A `.nam` is captured at a specific rate
+//! ([`NamModel::expected_sample_rate`], 48 kHz when the file does not say). `nam-rs`
+//! does *not* resample — you must feed the model audio at that rate, or resample in
+//! your host first. A mismatched rate produces silently wrong output, because the
+//! model's dilations and recurrence are defined in samples, not seconds.
+//!
 //! ## Design contract
 //!
 //! 1. **Parity with the reference.** The forward pass must produce output equal

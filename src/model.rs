@@ -148,14 +148,16 @@ impl NamModel {
         self.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE)
     }
 
-    /// Parse the calibration subset of `metadata`. Returns defaults (all `None`)
-    /// when there is no metadata block.
+    /// The typed [`Metadata`] (loudness + calibration levels), parsed from the raw
+    /// `metadata` block in one shot. Returns defaults (all `None`) when there is no
+    /// metadata block or it lacks these keys; unknown keys are ignored.
     ///
-    /// Private helper: clones and re-parses the raw `metadata` JSON on each call.
-    /// That's fine for these cold-path (load-time) accessors. A caller that wants all
-    /// fields from one parse can deserialize the public [`Metadata`] from
-    /// [`Self::metadata`] directly.
-    fn metadata_typed(&self) -> Metadata {
+    /// Prefer this over the single-field accessors ([`Self::loudness`], etc.) when you
+    /// want several fields: each single-field accessor re-clones and re-parses the raw
+    /// JSON, whereas this parses once. (All are cold-path / load-time, so neither is on
+    /// the audio thread.)
+    #[must_use]
+    pub fn metadata_typed(&self) -> Metadata {
         match &self.metadata {
             Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
             None => Metadata::default(),

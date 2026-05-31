@@ -57,6 +57,12 @@ resample: feed the model audio at that rate, or resample in your host first. A
 mismatched rate produces silently wrong output, since the model's dilations and
 recurrence are defined in samples, not seconds.
 
+**Processing boundary.** `nam-rs` runs only the model's forward pass. The reference
+NAM plugin additionally applies a DC blocker (high-pass) and, optionally, loudness
+normalization on the output — those belong to the host's audio graph, not the model.
+The calibration accessors (`NamModel::loudness()` etc.) give you the numbers for that
+gain-staging.
+
 ## Development
 
 ```bash

@@ -36,18 +36,17 @@ fn main() -> Result<(), nam_rs::Error> {
              a real host would resample the I/O to {sr} Hz here, or the output is wrong"
         );
     }
-    // Describe the model in architecture-appropriate terms: WaveNet has a
-    // receptive-field warmup, LSTM is recurrent (no warmup transient).
-    let summary = match &amp {
-        Model::WaveNet(w) => {
-            let rf = w.receptive_field();
-            format!(
-                "WaveNet, receptive field {rf} samples (~{:.1} ms at {sr} Hz) — the \
-                 startup transient before output settles",
-                rf as f64 / sr * 1000.0,
-            )
-        }
-        _ => "LSTM (recurrent) — no warmup transient".to_owned(),
+    // Latency in samples, straight off the `Model` — no need to match the
+    // architecture. WaveNet reports its receptive-field warmup; LSTM reports 0.
+    let rf = amp.receptive_field();
+    let summary = if rf > 0 {
+        format!(
+            "receptive field {rf} samples (~{:.1} ms at {sr} Hz) — the startup \
+             transient before output settles",
+            rf as f64 / sr * 1000.0,
+        )
+    } else {
+        "recurrent — no warmup transient".to_owned()
     };
     println!("loaded {path}: {summary}");
 

@@ -51,6 +51,12 @@ transient (the dilated stack filling against zero-history) — the model's inher
 latency, the same convention NAM Core / NeuralAudio use. LSTM models have no such
 warmup. Call `Model::reset` to return to silence.
 
+**Sample rate.** A `.nam` expects audio at the rate it was captured
+(`NamModel::expected_sample_rate()`, 48 kHz if the file omits it). `nam-rs` does not
+resample: feed the model audio at that rate, or resample in your host first. A
+mismatched rate produces silently wrong output, since the model's dilations and
+recurrence are defined in samples, not seconds.
+
 ## Development
 
 ```bash

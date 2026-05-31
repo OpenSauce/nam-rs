@@ -45,14 +45,6 @@ impl Model {
         }
     }
 
-    /// The model's sample rate.
-    pub fn sample_rate(&self) -> f64 {
-        match self {
-            Model::WaveNet(w) => w.sample_rate(),
-            Model::Lstm(l) => l.sample_rate(),
-        }
-    }
-
     /// Reset all internal state to the model's initial conditions.
     pub fn reset(&mut self) {
         match self {

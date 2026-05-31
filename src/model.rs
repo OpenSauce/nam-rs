@@ -30,7 +30,7 @@ pub struct NamModel {
     /// Flat weight blob. The final element is `head_scale` (see NAM
     /// `export_weights`). Stored as `f32` to match NAM Core's inference precision.
     pub weights: Vec<f32>,
-    /// Training sample rate. Absent in older files; see [`Self::sample_rate`].
+    /// Training sample rate. Absent in older files; see [`Self::expected_sample_rate`].
     pub sample_rate: Option<f64>,
     /// Opaque training/gear metadata. Not used for inference.
     pub metadata: Option<serde_json::Value>,
@@ -133,10 +133,18 @@ impl NamModel {
         Ok(serde_json::from_str(json)?)
     }
 
-    /// The model's sample rate, falling back to [`DEFAULT_SAMPLE_RATE`] when the
-    /// file does not specify one.
+    /// The sample rate, in Hz, the model expects its input to be at — falling back
+    /// to [`DEFAULT_SAMPLE_RATE`] when the file does not specify one.
+    ///
+    /// **You must feed the model audio at this rate.** `nam-rs` runs the forward pass
+    /// at whatever rate you hand it and does *not* resample. A model captured at one
+    /// rate fed audio at another produces silently wrong output: its dilations and
+    /// recurrence are defined in samples, not seconds. If your host runs at a
+    /// different rate, resample to this rate before [`crate::Model::process_buffer`]
+    /// and back afterwards — resampling is the caller's responsibility. Mirrors NAM
+    /// Core's `GetExpectedSampleRate()`.
     #[must_use]
-    pub fn sample_rate(&self) -> f64 {
+    pub fn expected_sample_rate(&self) -> f64 {
         self.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE)
     }
 

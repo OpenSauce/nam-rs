@@ -30,8 +30,6 @@ pub struct WaveNet {
     receptive_field: usize,
     /// Channel width of the first array (its incoming head is silence this wide).
     channels0: usize,
-    /// Training/inference sample rate, copied from the source `NamModel`.
-    sample_rate: f64,
     /// Head signal carried between arrays (two buffers, ping-ponged).
     head_a: Vec<f32>,
     head_b: Vec<f32>,
@@ -86,7 +84,6 @@ impl WaveNet {
             head_scale,
             receptive_field: receptive_field(cfg),
             channels0,
-            sample_rate: model.sample_rate(),
             head_a: vec![0.0; head_w],
             head_b: vec![0.0; head_w],
             sig_a: vec![0.0; sig_w],
@@ -108,11 +105,6 @@ impl WaveNet {
     /// rather than a training-time forward pass that pre-pads the whole input.
     pub fn receptive_field(&self) -> usize {
         self.receptive_field
-    }
-
-    /// The model's sample rate (from the source `.nam`, or the NAM default).
-    pub fn sample_rate(&self) -> f64 {
-        self.sample_rate
     }
 
     /// Process a buffer of mono samples in place.

@@ -54,7 +54,7 @@ fn parses_minimal_wavenet_config() {
 fn sample_rate_defaults_to_48k_when_absent() {
     let model = NamModel::from_json_str(MINIMAL_WAVENET).expect("should parse");
     assert!(model.sample_rate.is_none());
-    assert!((model.sample_rate() - DEFAULT_SAMPLE_RATE).abs() < 1e-9);
+    assert!((model.expected_sample_rate() - DEFAULT_SAMPLE_RATE).abs() < 1e-9);
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn sample_rate_is_read_when_present() {
         "\"sample_rate\": 44100.0, \"weights\": [0.1, -0.2, 0.3]",
     );
     let model = NamModel::from_json_str(&json).expect("should parse");
-    assert!((model.sample_rate() - 44100.0).abs() < 1e-9);
+    assert!((model.expected_sample_rate() - 44100.0).abs() < 1e-9);
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn parses_lstm_config() {
         }
         other => panic!("expected Lstm config, got {other:?}"),
     }
-    assert_eq!(m.sample_rate(), 44100.0);
+    assert_eq!(m.expected_sample_rate(), 44100.0);
 }
 
 #[test]

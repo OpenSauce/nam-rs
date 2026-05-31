@@ -58,7 +58,7 @@ impl WaveNet {
             }
         };
 
-        let expected = expected_weight_count(cfg);
+        let expected = expected_weight_count(cfg)?;
         if expected != model.weights.len() {
             return Err(Error::WeightCountMismatch {
                 expected,
@@ -72,6 +72,14 @@ impl WaveNet {
             arrays.push(build_array(&mut r, la)?);
         }
         let head_scale = r.take(1)[0];
+        // The up-front check guarantees `expected == weights.len()`; this asserts the
+        // other half of the invariant — that building consumed exactly `expected`, so
+        // `expected_weight_count` and the `build_array` consumption order agree.
+        debug_assert_eq!(
+            r.remaining(),
+            0,
+            "build_array consumed fewer weights than expected_weight_count claimed"
+        );
 
         let max_ch = arrays.iter().map(LayerArray::channels).max().unwrap_or(1);
         let max_head = arrays.iter().map(LayerArray::head_size).max().unwrap_or(1);
@@ -252,27 +260,44 @@ fn receptive_field(cfg: &WaveNetConfig) -> usize {
 
 /// Number of `f32`s `config` implies in the flat weight blob, including the final
 /// `head_scale`.
-fn expected_weight_count(cfg: &WaveNetConfig) -> usize {
-    let mut total = 0;
+///
+/// Uses checked arithmetic: an absurd or adversarial config whose dimensions overflow
+/// `usize` returns [`Error::ConfigTooLarge`] rather than panicking (debug) or wrapping
+/// to a wrong, small count (release).
+fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(Error::ConfigTooLarge);
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
+
+    let mut total = 0usize;
     for la in &cfg.layers {
         let mid = if la.gated {
-            2 * la.channels
+            mul(2, la.channels)?
         } else {
             la.channels
         };
-        total += la.channels * la.input_size; // rechannel (no bias)
-        let per_layer = mid * la.channels * la.kernel_size // conv weights
-            + mid                                          // conv bias
-            + mid * la.condition_size                      // input mixer (no bias)
-            + la.channels * la.channels                    // 1x1 weights
-            + la.channels; // 1x1 bias
-        total += la.dilations.len() * per_layer;
-        total += la.head_size * la.channels; // head rechannel weights
+        total = add(total, mul(la.channels, la.input_size)?)?; // rechannel (no bias)
+
+        let per_layer = add(
+            add(
+                add(
+                    add(
+                        mul(mul(mid, la.channels)?, la.kernel_size)?, // conv weights
+                        mid,                                          // conv bias
+                    )?,
+                    mul(mid, la.condition_size)?, // input mixer (no bias)
+                )?,
+                mul(la.channels, la.channels)?, // 1x1 weights
+            )?,
+            la.channels, // 1x1 bias
+        )?;
+        total = add(total, mul(la.dilations.len(), per_layer)?)?;
+
+        total = add(total, mul(la.head_size, la.channels)?)?; // head rechannel weights
         if la.head_bias {
-            total += la.head_size;
+            total = add(total, la.head_size)?;
         }
     }
-    total + 1 // head_scale
+    add(total, 1) // head_scale
 }
 
 fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Error> {
@@ -408,6 +433,77 @@ mod tests {
                 assert_eq!(found, 7);
             }
             other => panic!("expected WeightCountMismatch, got {other:?}"),
+        }
+    }
+
+    /// A structurally valid config whose dimensions overflow `usize` must return
+    /// `ConfigTooLarge`, not panic (debug) or wrap to a wrong count (release).
+    #[test]
+    fn absurd_dimensions_error_instead_of_overflowing() {
+        let json = TINY.replace("\"channels\": 1", "\"channels\": 4294967296");
+        let model = NamModel::from_json_str(&json).unwrap();
+        assert!(matches!(WaveNet::new(&model), Err(Error::ConfigTooLarge)));
+    }
+
+    /// Pins the weight-count invariant `take` relies on: `expected_weight_count` must
+    /// equal exactly what `build_array` (+ head_scale) consumes, across config shapes.
+    /// Building with that many weights succeeds (and the `debug_assert` in `new` fires
+    /// if consumption drifts below it); one fewer / one more is a count mismatch.
+    #[test]
+    fn weight_count_matches_consumption_across_shapes() {
+        #[allow(clippy::too_many_arguments)]
+        let mk = |input_size,
+                  channels,
+                  head_size,
+                  kernel_size,
+                  dilations: Vec<usize>,
+                  gated,
+                  head_bias| LayerArrayConfig {
+            input_size,
+            condition_size: 1,
+            channels,
+            head_size,
+            kernel_size,
+            dilations,
+            activation: "Tanh".into(),
+            gated,
+            head_bias,
+        };
+        let layer_sets = vec![
+            vec![mk(1, 1, 1, 1, vec![1], false, false)],
+            vec![mk(1, 2, 1, 3, vec![1, 2], false, false)],
+            vec![mk(1, 4, 2, 3, vec![1, 2, 4], true, false)], // gated
+            vec![mk(1, 3, 1, 3, vec![1], false, true)],       // head_bias
+            // two arrays: the second takes the first's channels as its input_size.
+            vec![
+                mk(1, 4, 1, 3, vec![1, 2], false, false),
+                mk(4, 2, 1, 3, vec![1], true, true),
+            ],
+        ];
+        for layers in layer_sets {
+            let cfg = WaveNetConfig {
+                layers,
+                head: None,
+                head_scale: 1.0,
+            };
+            let n = expected_weight_count(&cfg).unwrap();
+            let mk_model = |count: usize| NamModel {
+                version: "0".into(),
+                architecture: "WaveNet".into(),
+                config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+                weights: vec![0.0; count],
+                sample_rate: None,
+                metadata: None,
+            };
+            assert!(WaveNet::new(&mk_model(n)).is_ok(), "exact count n={n}");
+            assert!(matches!(
+                WaveNet::new(&mk_model(n - 1)),
+                Err(Error::WeightCountMismatch { .. })
+            ));
+            assert!(matches!(
+                WaveNet::new(&mk_model(n + 1)),
+                Err(Error::WeightCountMismatch { .. })
+            ));
         }
     }
 

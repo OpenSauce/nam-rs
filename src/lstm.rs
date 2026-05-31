@@ -35,7 +35,7 @@ impl Lstm {
             }
         };
 
-        let expected = expected_weight_count(cfg);
+        let expected = expected_weight_count(cfg)?;
         if expected != model.weights.len() {
             return Err(Error::WeightCountMismatch {
                 expected,
@@ -56,6 +56,14 @@ impl Lstm {
         }
         let head_w = r.take(h);
         let head_b = r.take(1)[0];
+        // Up-front check guarantees `expected == weights.len()`; assert the other half
+        // of the invariant — that building consumed exactly `expected`, so the count
+        // formula and the consumption order have not drifted apart.
+        debug_assert_eq!(
+            r.remaining(),
+            0,
+            "Lstm::new consumed fewer weights than expected_weight_count claimed"
+        );
 
         Ok(Self {
             cells,
@@ -109,17 +117,24 @@ impl Lstm {
 }
 
 /// Number of `f32`s the LSTM `config` implies in the flat weight blob.
-fn expected_weight_count(cfg: &LstmConfig) -> usize {
+///
+/// Uses checked arithmetic: an absurd or adversarial config whose dimensions overflow
+/// `usize` returns [`Error::ConfigTooLarge`] rather than panicking (debug) or wrapping
+/// to a wrong, small count (release).
+fn expected_weight_count(cfg: &LstmConfig) -> Result<usize, Error> {
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(Error::ConfigTooLarge);
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
+
     let h = cfg.hidden_size;
-    let mut total = 0;
+    let mut total = 0usize;
     for layer in 0..cfg.num_layers {
         let in_dim = if layer == 0 { cfg.input_size } else { h };
-        total += 4 * h * (in_dim + h); // combined W
-        total += 4 * h; // bias
-        total += h; // h0
-        total += h; // c0
+        total = add(total, mul(mul(4, h)?, add(in_dim, h)?)?)?; // combined W
+        total = add(total, mul(4, h)?)?; // bias
+        total = add(total, h)?; // h0
+        total = add(total, h)?; // c0
     }
-    total + h + 1 // head weight + bias
+    add(add(total, h)?, 1) // head weight + bias
 }
 
 #[cfg(test)]
@@ -156,6 +171,49 @@ mod tests {
             Lstm::new(&model),
             Err(crate::Error::WeightCountMismatch { .. })
         ));
+    }
+
+    /// A structurally valid config whose dimensions overflow `usize` must return
+    /// `ConfigTooLarge`, not panic (debug) or wrap to a wrong count (release).
+    #[test]
+    fn absurd_dimensions_error_instead_of_overflowing() {
+        let json = TINY_LSTM.replace("\"hidden_size\": 1", "\"hidden_size\": 4294967296");
+        let model = NamModel::from_json_str(&json).unwrap();
+        assert!(matches!(
+            Lstm::new(&model),
+            Err(crate::Error::ConfigTooLarge)
+        ));
+    }
+
+    /// Pins the weight-count invariant: `expected_weight_count` must equal exactly
+    /// what `Lstm::new` consumes, across (input_size, hidden_size, num_layers) shapes.
+    #[test]
+    fn weight_count_matches_consumption_across_shapes() {
+        for (input_size, hidden_size, num_layers) in [(1, 1, 1), (1, 8, 1), (1, 4, 2), (2, 3, 3)] {
+            let cfg = LstmConfig {
+                input_size,
+                hidden_size,
+                num_layers,
+            };
+            let n = expected_weight_count(&cfg).unwrap();
+            let mk_model = |count: usize| NamModel {
+                version: "0".into(),
+                architecture: "LSTM".into(),
+                config: ModelConfig::Lstm(cfg.clone()),
+                weights: vec![0.0; count],
+                sample_rate: None,
+                metadata: None,
+            };
+            assert!(Lstm::new(&mk_model(n)).is_ok(), "exact count n={n}");
+            assert!(matches!(
+                Lstm::new(&mk_model(n - 1)),
+                Err(crate::Error::WeightCountMismatch { .. })
+            ));
+            assert!(matches!(
+                Lstm::new(&mk_model(n + 1)),
+                Err(crate::Error::WeightCountMismatch { .. })
+            ));
+        }
     }
 
     #[test]

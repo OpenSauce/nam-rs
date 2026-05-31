@@ -2,8 +2,9 @@
 //!
 //! Pure-Rust, real-time-safe inference for [Neural Amp Modeler] (NAM) `.nam` models.
 //!
-//! This crate loads a `.nam` model file and runs its neural network forward pass
-//! sample-by-sample, with no heap allocation on the audio (hot) path. It is a
+//! This crate loads a `.nam` model file and runs its neural network forward pass —
+//! a whole buffer at a time (WaveNet uses a cache-friendly block kernel), or one
+//! sample at a time — with no heap allocation on the audio (hot) path. It is a
 //! from-scratch Rust port of NAM's inference, written against the reference
 //! implementations below and validated for **bit-level parity** against them.
 //!

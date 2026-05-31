@@ -5,9 +5,10 @@
 
 Pure-Rust, real-time-safe inference for [Neural Amp Modeler](https://www.neuralampmodeler.com/) (NAM) `.nam` models.
 
-`nam-rs` loads a `.nam` model file and runs its neural-network forward pass
-sample-by-sample with **no heap allocation on the audio thread** — suitable for use
-inside a JACK callback, a VST3/CLAP `process()`, or any real-time audio graph.
+`nam-rs` loads a `.nam` model file and runs its neural-network forward pass — a whole
+buffer at a time (WaveNet uses a cache-friendly block kernel) or one sample at a time —
+with **no heap allocation on the audio thread**, suitable for use inside a JACK
+callback, a VST3/CLAP `process()`, or any real-time audio graph.
 
 > Status: **Both WaveNet and LSTM inference are implemented and tested** — parser,
 > forward pass, parity, and RT-safety harnesses all green. Build any `.nam` with the

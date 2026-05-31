@@ -76,8 +76,10 @@ impl NamModel {
     /// Parse the calibration subset of `metadata`. Returns defaults (all `None`)
     /// when there is no metadata block.
     ///
-    /// Clones and re-parses `metadata` on every call; these are cold-path config
-    /// accessors, so if you need several fields, call once and inspect the result.
+    /// Private helper: clones and re-parses the raw `metadata` JSON on each call.
+    /// That's fine for these cold-path (load-time) accessors. A caller that wants all
+    /// fields from one parse can deserialize the public [`Metadata`] from
+    /// [`Self::metadata`] directly.
     fn metadata_typed(&self) -> Metadata {
         match &self.metadata {
             Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),

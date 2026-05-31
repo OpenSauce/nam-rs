@@ -90,9 +90,12 @@ const WITH_METADATA: &str = r#"{
 #[test]
 fn parses_loudness_and_calibration_metadata() {
     let m = NamModel::from_json_str(WITH_METADATA).expect("parse");
-    assert_eq!(m.loudness(), Some(-20.02));
-    assert_eq!(m.input_level_dbu(), Some(18.3));
-    assert_eq!(m.output_level_dbu(), Some(12.3));
+    // Compare with a tolerance, not `assert_eq!`: these parse f64 -> f32, so an exact
+    // bit-match isn't guaranteed across platforms/serde versions.
+    let approx = |got: Option<f32>, want: f32| (got.expect("present") - want).abs() < 1e-4;
+    assert!(approx(m.loudness(), -20.02));
+    assert!(approx(m.input_level_dbu(), 18.3));
+    assert!(approx(m.output_level_dbu(), 12.3));
 }
 
 #[test]

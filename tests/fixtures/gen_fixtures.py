@@ -172,6 +172,78 @@ def numpy_forward(model, signal):
     return out.reshape(-1)
 
 
+def _parse_lstm_initial_states(model):
+    """Pull exported (h0, c0) per layer out of the flat blob (for the oracle)."""
+    cfg = model["config"]
+    H, L, in0 = cfg["hidden_size"], cfg["num_layers"], cfg["input_size"]
+    cur = Cursor(model["weights"])
+    h0s, c0s = [], []
+    for li in range(L):
+        in_dim = in0 if li == 0 else H
+        cur.take(4 * H * (in_dim + H))  # W
+        cur.take(4 * H)                 # bias
+        h0s.append(np.array(cur.take(H), F32))
+        c0s.append(np.array(cur.take(H), F32))
+    return np.stack(h0s), np.stack(c0s)
+
+
+def numpy_lstm_forward(model, signal):
+    """Torch-free LSTM forward, streaming from the exported h0/c0. Matches the
+    canonical core seeded the same way to ~1e-7 (verified H=8/L=1, H=16/L=2)."""
+    cfg = model["config"]
+    H, L, in0 = cfg["hidden_size"], cfg["num_layers"], cfg["input_size"]
+    cur = Cursor(model["weights"])
+    layers = []
+    for li in range(L):
+        in_dim = in0 if li == 0 else H
+        W = cur.take(4 * H * (in_dim + H)).reshape(4 * H, in_dim + H)
+        b = cur.take(4 * H)
+        h0 = np.array(cur.take(H), F32)
+        c0 = np.array(cur.take(H), F32)
+        layers.append([W, b, h0, c0, in_dim])
+    head_w = cur.take(H)
+    head_b = float(cur.take(1)[0])
+    if not cur.done():
+        raise ValueError(f"unused weights: {cur.i} of {len(cur.w)}")
+
+    def sg(z):
+        return (1.0 / (1.0 + np.exp(-z))).astype(F32)
+
+    state = [[l[2].copy(), l[3].copy()] for l in layers]
+    out = np.zeros(len(signal), F32)
+    for t, xt in enumerate(signal):
+        x = np.array([xt], F32)
+        for li, (W, b, _, _, _) in enumerate(layers):
+            hp, cp = state[li]
+            v = np.concatenate([x, hp]).astype(F32)
+            g = (W @ v + b).astype(F32)
+            i = sg(g[0:H]); f = sg(g[H:2 * H])
+            gg = np.tanh(g[2 * H:3 * H]).astype(F32); o = sg(g[3 * H:4 * H])
+            c = (f * cp + i * gg).astype(F32)
+            h = (o * np.tanh(c)).astype(F32)
+            state[li] = [h, c]
+            x = h
+        out[t] = float(np.dot(head_w, x) + head_b)
+    return out.astype(F32)
+
+
+def canonical_lstm_forward(model, signal):
+    """Canonical LSTM via neural-amp-modeler. `import_weights` sets the net's
+    initial hidden/cell from the blob's h0/c0, so `_forward` streams from the
+    exported state (matching nam-rs). Raises ImportError if torch/nam absent."""
+    import torch  # noqa: F401
+    from nam.models.recurrent import LSTM
+
+    cfg = model["config"]
+    net = LSTM(hidden_size=cfg["hidden_size"], num_layers=cfg["num_layers"],
+               input_size=cfg["input_size"])
+    net.eval()
+    net.import_weights(np.asarray(model["weights"], dtype=F32))
+    with torch.no_grad():
+        y = net._forward(torch.from_numpy(signal.astype(F32)).reshape(1, -1))
+    return y.numpy().reshape(-1).astype(F32)
+
+
 def canonical_forward(model, signal):
     """Canonical forward via the real `neural-amp-modeler` package (torch).
 
@@ -202,7 +274,17 @@ def canonical_forward(model, signal):
 
 
 def forward(model, signal):
-    """Canonical torch NAM if available, else the numpy reference."""
+    """Canonical NAM if available, else the numpy reference. Dispatches on arch."""
+    arch = model.get("architecture", "WaveNet")
+    if arch == "LSTM":
+        try:
+            out = canonical_lstm_forward(model, signal)
+            print("forward: canonical neural-amp-modeler LSTM (torch)")
+            return out
+        except ImportError:
+            print("forward: numpy LSTM reference (torch/`nam` unavailable)")
+            return numpy_lstm_forward(model, signal)
+    # WaveNet (existing behaviour)
     try:
         out = canonical_forward(model, signal)
         print("forward: canonical neural-amp-modeler (torch)")

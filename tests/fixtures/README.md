@@ -10,6 +10,32 @@ These files pin nam-rs to the reference NAM WaveNet forward pass.
 | `reference_standard.nam`        | The realistic standard model (NAM Core `example_models/wavenet_a1_standard.nam`, MIT, 13,802 weights — 16+8 channels, dilations 1..512). |
 | `input_standard.json`           | Input for the standard model, 8192 samples (its receptive field ~4093 exceeds 2048). |
 | `expected_output_standard.json` | Canonical torch output for `input_standard.json`.           |
+| `reference_lstm.nam`            | A minimal LSTM model (`hidden_size=8`, `num_layers=1`, 345 weights), emitted by `make_lstm_models.py`. |
+| `input_lstm.json`               | Input for the LSTM model, 2048 samples.                     |
+| `expected_output_lstm.json`     | Canonical `neural-amp-modeler` (torch) LSTM output for `input_lstm.json`. |
+| `reference_lstm_standard.nam`   | A larger LSTM model (`hidden_size=16`, `num_layers=2`, 3,345 weights), emitted by `make_lstm_models.py`. |
+| `input_lstm_standard.json`      | Input for the standard LSTM model, 2048 samples.            |
+| `expected_output_lstm_standard.json` | Canonical torch LSTM output for `input_lstm_standard.json`. |
+
+## LSTM fixtures
+
+`make_lstm_models.py` deterministically emits the two `.nam` files above from
+canonical `neural-amp-modeler` (`nam.models.recurrent.LSTM._get_export_dict`):
+
+```bash
+venv/bin/python tests/fixtures/make_lstm_models.py
+venv/bin/python tests/fixtures/gen_fixtures.py tests/fixtures/reference_lstm.nam _lstm 2048
+venv/bin/python tests/fixtures/gen_fixtures.py tests/fixtures/reference_lstm_standard.nam _lstm_standard 2048
+```
+
+**LSTM oracle convention.** LSTM inference streams from the model's **exported**
+initial hidden/cell vectors (`h0/c0` in the blob — the core burned in over 48k
+zeros), not zeros. `neural-amp-modeler`'s `import_weights` loads those into the
+net's initial state, so the canonical `_forward` (no start-padding) matches a
+streaming engine. Receptive field is 1, so unlike WaveNet there is **no warmup
+transient to trim** — parity compares the full output. The torch-free
+`numpy_lstm_forward` follows the same convention and agrees with the canonical
+path to ~`1e-7` on both committed models.
 
 `tests/parity.rs` asserts nam-rs reproduces each `expected_output*.json` from the
 matching `input*.json` within `1e-5`, **skipping the first `receptive_field()`

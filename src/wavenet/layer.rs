@@ -11,7 +11,7 @@
 //! out  = one_by_one(post) + x          // residual to the next layer
 //! ```
 
-use super::conv::Conv1d;
+use super::conv::{Conv1d, MAX_BLOCK};
 use crate::error::Error;
 
 /// Pointwise activation applied after the dilated conv + mix-in.
@@ -62,6 +62,11 @@ pub(super) struct Layer {
     mix: Vec<f32>,
     /// `channels`-wide scratch: post-activation value.
     post: Vec<f32>,
+    /// Planar block-path scratch: `[mid][MAX_BLOCK]` twins of `block`/`mix`, and
+    /// `[channels][MAX_BLOCK]` for `post`.
+    block_blk: Vec<f32>,
+    mix_blk: Vec<f32>,
+    post_blk: Vec<f32>,
 }
 
 impl Layer {
@@ -94,6 +99,9 @@ impl Layer {
             block: vec![0.0; mid],
             mix: vec![0.0; mid],
             post: vec![0.0; channels],
+            block_blk: vec![0.0; mid * MAX_BLOCK],
+            mix_blk: vec![0.0; mid * MAX_BLOCK],
+            post_blk: vec![0.0; channels * MAX_BLOCK],
         }
     }
 
@@ -135,6 +143,57 @@ impl Layer {
 
         self.one_by_one.process_sample(&self.post, out);
         for (o, x) in out.iter_mut().zip(input) {
+            *o += *x;
+        }
+    }
+
+    /// Block twin of [`Self::process_sample`]. All slices are **planar** `[ch][t]`,
+    /// `n <= MAX_BLOCK`: `input`/`out`/`head_accum` are `channels * n`, `condition`
+    /// is `condition_size * n`. Equivalent to `n` per-sample calls; allocation-free.
+    pub(super) fn process_block(
+        &mut self,
+        input: &[f32],
+        condition: &[f32],
+        head_accum: &mut [f32],
+        out: &mut [f32],
+        n: usize,
+    ) {
+        let mid = self.block.len();
+        let block = &mut self.block_blk[..mid * n];
+        let mix = &mut self.mix_blk[..mid * n];
+        let post = &mut self.post_blk[..self.channels * n];
+
+        self.conv.process_block(input, block, n);
+        self.mixin.process_block(condition, mix, n);
+        for (b, m) in block.iter_mut().zip(mix.iter()) {
+            *b += *m;
+        }
+
+        // Planar rows: value branch is channel `c` at `c*n`, gate branch (if gated)
+        // is channel `c + channels` at `(c + channels)*n`.
+        if self.gated {
+            for c in 0..self.channels {
+                let (vrow, grow) = (c * n, (c + self.channels) * n);
+                for t in 0..n {
+                    let a = self.activation.apply(block[vrow + t]);
+                    let g = sigmoid(block[grow + t]);
+                    post[c * n + t] = a * g;
+                }
+            }
+        } else {
+            for c in 0..self.channels {
+                for t in 0..n {
+                    post[c * n + t] = self.activation.apply(block[c * n + t]);
+                }
+            }
+        }
+
+        for (h, p) in head_accum.iter_mut().zip(post.iter()) {
+            *h += *p;
+        }
+
+        self.one_by_one.process_block(post, out, n);
+        for (o, x) in out.iter_mut().zip(input.iter()) {
             *o += *x;
         }
     }
@@ -232,6 +291,113 @@ mod tests {
         let post = 2.0_f32.tanh();
         assert!((head[0] - post).abs() < 1e-6, "head={}", head[0]);
         assert!((out[0] - (3.0 * post + 0.6)).abs() < 1e-6, "out={}", out[0]);
+    }
+
+    /// Block path reproduces the per-sample path for a full layer, gated and not,
+    /// multi-channel, dilated, with a per-sample head seed carried in planar form.
+    #[test]
+    fn process_block_equals_process_sample_loop() {
+        for gated in [false, true] {
+            let channels = 3usize;
+            let cond_sz = 2usize;
+            let kernel = 3usize;
+            let dilation = 4usize;
+            let mid = if gated { 2 * channels } else { channels };
+            let mk = |len: usize, salt: usize| -> Vec<f32> {
+                (0..len)
+                    .map(|i| (((i * 31 + salt * 7) % 29) as f32 - 14.0) * 0.07)
+                    .collect()
+            };
+            let conv_w = mk(mid * channels * kernel, 1);
+            let conv_b = mk(mid, 2);
+            let mix_w = mk(mid * cond_sz, 3);
+            let one_w = mk(channels * channels, 4);
+            let one_b = mk(channels, 5);
+
+            let total = 130usize;
+            let inp: Vec<Vec<f32>> = (0..total)
+                .map(|t| {
+                    (0..channels)
+                        .map(|c| ((t * 3 + c) as f32 * 0.21).sin())
+                        .collect()
+                })
+                .collect();
+            let cond: Vec<Vec<f32>> = (0..total)
+                .map(|t| {
+                    (0..cond_sz)
+                        .map(|c| ((t * 5 + c) as f32 * 0.17).cos())
+                        .collect()
+                })
+                .collect();
+            let seed: Vec<Vec<f32>> = (0..total)
+                .map(|t| (0..channels).map(|c| ((t + c) as f32) * 0.01).collect())
+                .collect();
+
+            let mk_layer = || {
+                Layer::new(
+                    channels,
+                    cond_sz,
+                    kernel,
+                    dilation,
+                    Activation::Tanh,
+                    gated,
+                    conv_w.clone(),
+                    conv_b.clone(),
+                    mix_w.clone(),
+                    one_w.clone(),
+                    one_b.clone(),
+                )
+            };
+
+            // Reference: per-sample.
+            let mut a = mk_layer();
+            let mut out_ref = vec![vec![0.0; channels]; total];
+            let mut head_ref = vec![vec![0.0; channels]; total];
+            for t in 0..total {
+                let mut head = seed[t].clone();
+                let mut out = vec![0.0; channels];
+                a.process_sample(&inp[t], &cond[t], &mut head, &mut out);
+                out_ref[t] = out;
+                head_ref[t] = head;
+            }
+
+            // Under test: block path in two chunks.
+            let mut b = mk_layer();
+            for (lo, len) in [(0usize, 70usize), (70, 60)] {
+                let mut bin = vec![0.0; channels * len];
+                let mut bcond = vec![0.0; cond_sz * len];
+                let mut bhead = vec![0.0; channels * len];
+                for lt in 0..len {
+                    for c in 0..channels {
+                        bin[c * len + lt] = inp[lo + lt][c];
+                        bhead[c * len + lt] = seed[lo + lt][c];
+                    }
+                    for c in 0..cond_sz {
+                        bcond[c * len + lt] = cond[lo + lt][c];
+                    }
+                }
+                let mut bout = vec![0.0; channels * len];
+                b.process_block(&bin, &bcond, &mut bhead, &mut bout, len);
+                for lt in 0..len {
+                    for c in 0..channels {
+                        let go = bout[c * len + lt];
+                        let gh = bhead[c * len + lt];
+                        assert!(
+                            (go - out_ref[lo + lt][c]).abs() < 1e-5,
+                            "gated={gated} t{} c{c} out: got {go}, want {}",
+                            lo + lt,
+                            out_ref[lo + lt][c]
+                        );
+                        assert!(
+                            (gh - head_ref[lo + lt][c]).abs() < 1e-5,
+                            "gated={gated} t{} c{c} head: got {gh}, want {}",
+                            lo + lt,
+                            head_ref[lo + lt][c]
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

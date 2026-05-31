@@ -10,6 +10,7 @@
 
 use crate::error::Error;
 use crate::model::{LayerArrayConfig, NamModel, WaveNetConfig};
+use crate::reader::Reader;
 
 mod array;
 mod conv;
@@ -17,9 +18,6 @@ mod layer;
 
 use array::LayerArray;
 use layer::{Activation, Layer};
-
-/// The only architecture this crate runs.
-const ARCHITECTURE: &str = "WaveNet";
 
 /// A ready-to-run WaveNet, with all scratch buffers pre-allocated.
 #[derive(Debug)]
@@ -31,6 +29,8 @@ pub struct WaveNet {
     receptive_field: usize,
     /// Channel width of the first array (its incoming head is silence this wide).
     channels0: usize,
+    /// Training/inference sample rate, copied from the source `NamModel`.
+    sample_rate: f64,
     /// Head signal carried between arrays (two buffers, ping-ponged).
     head_a: Vec<f32>,
     head_b: Vec<f32>,
@@ -45,10 +45,12 @@ impl WaveNet {
     /// All allocation happens here. Fails if the architecture is unsupported, an
     /// activation is unknown, or the flat weight blob does not match the config.
     pub fn new(model: &NamModel) -> Result<Self, Error> {
-        if model.architecture != ARCHITECTURE {
-            return Err(Error::UnsupportedArchitecture(model.architecture.clone()));
-        }
-        let cfg = &model.config;
+        let cfg = match &model.config {
+            crate::model::ModelConfig::WaveNet(cfg) => cfg,
+            crate::model::ModelConfig::Lstm(_) => {
+                return Err(Error::UnsupportedArchitecture(model.architecture.clone()))
+            }
+        };
 
         let expected = expected_weight_count(cfg);
         if expected != model.weights.len() {
@@ -76,6 +78,7 @@ impl WaveNet {
             head_scale,
             receptive_field: receptive_field(cfg),
             channels0,
+            sample_rate: model.sample_rate(),
             head_a: vec![0.0; head_w],
             head_b: vec![0.0; head_w],
             sig_a: vec![0.0; sig_w],
@@ -92,6 +95,11 @@ impl WaveNet {
     /// rather than a training-time forward pass that pre-pads the whole input.
     pub fn receptive_field(&self) -> usize {
         self.receptive_field
+    }
+
+    /// The model's sample rate (from the source `.nam`, or the NAM default).
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
     }
 
     /// Process a buffer of mono samples in place.
@@ -249,26 +257,6 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
     ))
 }
 
-/// Sequential reader over the flat weight blob, consumed in `export_weights`
-/// order. The caller validates the total count up front, so `take` never
-/// over-runs.
-struct Reader<'a> {
-    w: &'a [f32],
-    i: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(w: &'a [f32]) -> Self {
-        Self { w, i: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Vec<f32> {
-        let chunk = self.w[self.i..self.i + n].to_vec();
-        self.i += n;
-        chunk
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,9 +346,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_architecture_is_rejected() {
-        let bad = TINY.replace("\"WaveNet\"", "\"LSTM\"");
-        let model = NamModel::from_json_str(&bad).unwrap();
+    fn wavenet_new_rejects_non_wavenet() {
+        let lstm = r#"{
+            "version": "0.5.4", "architecture": "LSTM",
+            "config": { "input_size": 1, "hidden_size": 4, "num_layers": 1 },
+            "weights": [0.0]
+        }"#;
+        let model = NamModel::from_json_str(lstm).unwrap();
         assert!(matches!(
             WaveNet::new(&model),
             Err(Error::UnsupportedArchitecture(_))

@@ -2,8 +2,10 @@
 //!
 //! A `.nam` file is a JSON object. The fields here mirror NAM's
 //! `export_config()` / `export_weights()` output (see crate-level attribution).
-//! Only the WaveNet architecture is modelled for now; LSTM support is future work.
+//! Both the WaveNet and LSTM architectures are parsed here (see [`ModelConfig`]);
+//! the runtime forward passes live in their own modules.
 
+use serde::de::{self, Deserializer};
 use serde::Deserialize;
 
 use crate::error::Error;
@@ -17,23 +19,88 @@ pub const DEFAULT_SAMPLE_RATE: f64 = 48_000.0;
 ///
 /// This is the *file representation* — the raw config + flat weight blob. To run
 /// inference, build a [`crate::WaveNet`] from it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct NamModel {
     /// `.nam` format version string (e.g. `"0.5.4"`).
     pub version: String,
     /// Model architecture, e.g. `"WaveNet"`.
     pub architecture: String,
-    /// Architecture-specific configuration.
-    pub config: WaveNetConfig,
+    /// Architecture-specific configuration (dispatched on [`Self::architecture`]).
+    pub config: ModelConfig,
     /// Flat weight blob. The final element is `head_scale` (see NAM
     /// `export_weights`). Stored as `f32` to match NAM Core's inference precision.
     pub weights: Vec<f32>,
     /// Training sample rate. Absent in older files; see [`Self::sample_rate`].
-    #[serde(default)]
     pub sample_rate: Option<f64>,
     /// Opaque training/gear metadata. Not used for inference.
-    #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+}
+
+/// LSTM configuration (NAM `_export_config`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LstmConfig {
+    /// Input width (1 for mono amp models).
+    pub input_size: usize,
+    /// Hidden state dimension `H`.
+    pub hidden_size: usize,
+    /// Number of stacked LSTM layers `L`.
+    pub num_layers: usize,
+}
+
+/// Architecture-specific configuration, tagged by `NamModel.architecture`.
+#[derive(Debug, Clone)]
+pub enum ModelConfig {
+    /// WaveNet: a stack of dilated-convolution layer-arrays. Runnable via
+    /// [`crate::WaveNet`].
+    WaveNet(WaveNetConfig),
+    /// LSTM: stacked recurrent layers plus a linear head.
+    Lstm(LstmConfig),
+}
+
+impl<'de> Deserialize<'de> for NamModel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Parse the file shape with `config` left raw, then dispatch on
+        // `architecture` to type it. This reads the sibling `architecture` field,
+        // which `#[serde(deserialize_with)]` on a single field cannot do.
+        #[derive(Deserialize)]
+        struct Raw {
+            version: String,
+            architecture: String,
+            config: serde_json::Value,
+            weights: Vec<f32>,
+            #[serde(default)]
+            sample_rate: Option<f64>,
+            #[serde(default)]
+            metadata: Option<serde_json::Value>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let config = match raw.architecture.as_str() {
+            "WaveNet" => {
+                ModelConfig::WaveNet(serde_json::from_value(raw.config).map_err(de::Error::custom)?)
+            }
+            "LSTM" => {
+                ModelConfig::Lstm(serde_json::from_value(raw.config).map_err(de::Error::custom)?)
+            }
+            other => {
+                return Err(de::Error::custom(format!(
+                    "unsupported model architecture: {other:?}"
+                )))
+            }
+        };
+
+        Ok(NamModel {
+            version: raw.version,
+            architecture: raw.architecture,
+            config,
+            weights: raw.weights,
+            sample_rate: raw.sample_rate,
+            metadata: raw.metadata,
+        })
+    }
 }
 
 /// Loudness/level-calibration fields NAM may write into `metadata`. All optional;

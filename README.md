@@ -1,22 +1,27 @@
 # nam-rs
 
+[![crates.io](https://img.shields.io/crates/v/nam-rs.svg)](https://crates.io/crates/nam-rs)
+[![docs.rs](https://docs.rs/nam-rs/badge.svg)](https://docs.rs/nam-rs)
+
 Pure-Rust, real-time-safe inference for [Neural Amp Modeler](https://www.neuralampmodeler.com/) (NAM) `.nam` models.
 
 `nam-rs` loads a `.nam` model file and runs its neural-network forward pass
 sample-by-sample with **no heap allocation on the audio thread** — suitable for use
 inside a JACK callback, a VST3/CLAP `process()`, or any real-time audio graph.
 
-> Status: **WaveNet inference is implemented and tested** — parser, forward pass,
-> parity, and RT-safety harnesses all green. LSTM support is future work.
+> Status: **Both WaveNet and LSTM inference are implemented and tested** — parser,
+> forward pass, parity, and RT-safety harnesses all green. Build any `.nam` with the
+> architecture-agnostic `Model::from_nam`, which dispatches on the model's architecture.
 
 ## Design contract
 
 1. **Parity with the reference.** Output must equal the canonical Python/C++ NAM
    implementations within float tolerance for the same model and input. Enforced by
    `tests/parity.rs` against fixtures generated from Python NAM.
-2. **Real-time safety.** `WaveNet::process_buffer` performs zero heap allocation,
-   locks, or syscalls; all scratch buffers are pre-allocated in `WaveNet::new`.
-   Enforced by `tests/rt_safety.rs` via `assert_no_alloc`.
+2. **Real-time safety.** The runtime's `process_buffer` (for both WaveNet and LSTM,
+   reached via `Model`) performs zero heap allocation, locks, or syscalls; all scratch
+   buffers are pre-allocated at construction. Enforced by `tests/rt_safety.rs` via
+   `assert_no_alloc`.
 
 ## Install
 
@@ -27,20 +32,23 @@ cargo add nam-rs
 ## Usage
 
 ```rust
-use nam_rs::{NamModel, WaveNet};
+use nam_rs::{Model, NamModel};
 
-// Off the audio thread: load + allocate.
+// Off the audio thread: load + allocate. `Model::from_nam` dispatches on the
+// model's architecture, so the same code runs WaveNet and LSTM `.nam` files.
 let model = NamModel::from_file("twin_reverb.nam")?;
-let mut amp = WaveNet::new(&model)?;
+let mut amp = Model::from_nam(&model)?;
 
 // On the audio thread: in-place, allocation-free. Call once per audio block;
 // state carries across calls, so block-wise output matches one whole-buffer call.
+let mut audio_buffer = vec![0.0_f32; 512]; // your host's block, filled with input
 amp.process_buffer(&mut audio_buffer);
 ```
 
-The first `amp.receptive_field()` output samples are a startup transient (the dilated
-stack filling against zero-history) — the model's inherent latency, the same
-convention NAM Core / NeuralAudio use. Call `WaveNet::reset` to return to silence.
+For WaveNet models, the first `WaveNet::receptive_field()` output samples are a startup
+transient (the dilated stack filling against zero-history) — the model's inherent
+latency, the same convention NAM Core / NeuralAudio use. LSTM models have no such
+warmup. Call `Model::reset` to return to silence.
 
 ## Development
 

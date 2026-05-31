@@ -6,11 +6,11 @@
 //! ```
 //!
 //! The key pattern: do all the allocating work (parse + build) once, *off* the
-//! audio thread, then call [`WaveNet::process_buffer`] once per audio block on the
+//! audio thread, then call `Model::process_buffer` once per audio block on the
 //! hot thread. State carries across blocks, so feeding the signal block-by-block
 //! gives bit-identical output to one monolithic call — this example proves it.
 
-use nam_rs::{NamModel, WaveNet};
+use nam_rs::{Model, NamModel};
 
 /// A typical host audio block size, in samples.
 const BLOCK: usize = 128;
@@ -20,17 +20,24 @@ fn main() -> Result<(), nam_rs::Error> {
         .nth(1)
         .expect("usage: streaming <model.nam>");
 
-    // --- Setup (off the audio thread): parsing and `WaveNet::new` allocate. ---
+    // --- Setup (off the audio thread): parsing and `Model::from_nam` allocate. ---
     let model = NamModel::from_file(&path)?;
-    let mut amp = WaveNet::new(&model)?;
-    println!(
-        "loaded {path}: {} layer-arrays, receptive field {} samples \
-         (~{:.1} ms at {} Hz) — the startup transient before output settles",
-        model.config.layers.len(),
-        amp.receptive_field(),
-        amp.receptive_field() as f64 / model.sample_rate() * 1000.0,
-        model.sample_rate(),
-    );
+    let mut amp = Model::from_nam(&model)?;
+    let sr = model.sample_rate();
+    // Describe the model in architecture-appropriate terms: WaveNet has a
+    // receptive-field warmup, LSTM is recurrent (no warmup transient).
+    let summary = match &amp {
+        Model::WaveNet(w) => {
+            let rf = w.receptive_field();
+            format!(
+                "WaveNet, receptive field {rf} samples (~{:.1} ms at {sr} Hz) — the \
+                 startup transient before output settles",
+                rf as f64 / sr * 1000.0,
+            )
+        }
+        _ => "LSTM (recurrent) — no warmup transient".to_owned(),
+    };
+    println!("loaded {path}: {summary}");
 
     // A test signal long enough to clear the warmup transient.
     let signal: Vec<f32> = (0..8 * BLOCK)

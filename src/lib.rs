@@ -64,6 +64,7 @@
 //! [waveny]: https://github.com/nlpodyssey/waveny
 
 mod error;
+mod lstm;
 mod model;
 mod reader;
 mod wavenet;

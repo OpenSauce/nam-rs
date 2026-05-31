@@ -36,6 +36,21 @@ pub struct NamModel {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Loudness/level-calibration fields NAM may write into `metadata`. All optional;
+/// older or minimal files omit them. Unknown metadata keys are ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Metadata {
+    /// Perceived loudness of the model's output, in LUFS (NAM's `loudness`).
+    #[serde(default)]
+    pub loudness: Option<f32>,
+    /// Analog level (dBu) corresponding to 0 dBFS at the model input.
+    #[serde(default)]
+    pub input_level_dbu: Option<f32>,
+    /// Analog level (dBu) corresponding to 0 dBFS at the model output.
+    #[serde(default)]
+    pub output_level_dbu: Option<f32>,
+}
+
 impl NamModel {
     /// Read and parse a `.nam` model from a file on disk.
     ///
@@ -56,6 +71,36 @@ impl NamModel {
     #[must_use]
     pub fn sample_rate(&self) -> f64 {
         self.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE)
+    }
+
+    /// Parse the calibration subset of `metadata`. Returns defaults (all `None`)
+    /// when there is no metadata block.
+    ///
+    /// Clones and re-parses `metadata` on every call; these are cold-path config
+    /// accessors, so if you need several fields, call once and inspect the result.
+    fn metadata_typed(&self) -> Metadata {
+        match &self.metadata {
+            Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
+            None => Metadata::default(),
+        }
+    }
+
+    /// Output loudness in LUFS, if the file records it.
+    #[must_use]
+    pub fn loudness(&self) -> Option<f32> {
+        self.metadata_typed().loudness
+    }
+
+    /// Input calibration level in dBu (analog level at 0 dBFS in), if present.
+    #[must_use]
+    pub fn input_level_dbu(&self) -> Option<f32> {
+        self.metadata_typed().input_level_dbu
+    }
+
+    /// Output calibration level in dBu (analog level at 0 dBFS out), if present.
+    #[must_use]
+    pub fn output_level_dbu(&self) -> Option<f32> {
+        self.metadata_typed().output_level_dbu
     }
 }
 

@@ -67,3 +67,52 @@ fn sample_rate_is_read_when_present() {
 fn rejects_malformed_json() {
     assert!(NamModel::from_json_str("{ not json").is_err());
 }
+
+/// A WaveNet file carrying NAM's metadata block (keys taken from a real .nam).
+const WITH_METADATA: &str = r#"{
+    "version": "0.5.4",
+    "architecture": "WaveNet",
+    "config": {
+        "layers": [{
+            "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+            "kernel_size": 1, "dilations": [1], "activation": "ReLU",
+            "gated": false, "head_bias": false
+        }],
+        "head": null, "head_scale": 1.0
+    },
+    "weights": [1.0, 2.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+    "metadata": {
+        "loudness": -20.02, "input_level_dbu": 18.3, "output_level_dbu": 12.3,
+        "name": "Test", "gear_type": "amp"
+    }
+}"#;
+
+#[test]
+fn parses_loudness_and_calibration_metadata() {
+    let m = NamModel::from_json_str(WITH_METADATA).expect("parse");
+    assert_eq!(m.loudness(), Some(-20.02));
+    assert_eq!(m.input_level_dbu(), Some(18.3));
+    assert_eq!(m.output_level_dbu(), Some(12.3));
+}
+
+#[test]
+fn metadata_absent_yields_none() {
+    // MINIMAL_WAVENET has no metadata block at all.
+    let m = NamModel::from_json_str(MINIMAL_WAVENET).expect("parse");
+    assert_eq!(m.loudness(), None);
+    assert_eq!(m.input_level_dbu(), None);
+    assert_eq!(m.output_level_dbu(), None);
+}
+
+#[test]
+fn unrelated_metadata_keys_are_ignored() {
+    let json = WITH_METADATA.replace(
+        "\"loudness\": -20.02, \"input_level_dbu\": 18.3, \"output_level_dbu\": 12.3,",
+        "",
+    );
+    let m = NamModel::from_json_str(&json).expect("parse");
+    assert_eq!(m.loudness(), None);
+    assert_eq!(m.input_level_dbu(), None);
+    assert_eq!(m.output_level_dbu(), None);
+    // unrelated keys ("name", "gear_type") must not error.
+}

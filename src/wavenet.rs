@@ -17,6 +17,7 @@ mod conv;
 mod layer;
 
 use array::LayerArray;
+use conv::MAX_BLOCK;
 use layer::{Activation, Layer};
 
 /// A ready-to-run WaveNet, with all scratch buffers pre-allocated.
@@ -37,6 +38,13 @@ pub struct WaveNet {
     /// Layer signal carried between arrays (two buffers, ping-ponged).
     sig_a: Vec<f32>,
     sig_b: Vec<f32>,
+    /// Planar `[width][MAX_BLOCK]` block-path twins of the carry buffers, plus a
+    /// scratch copy of the conditioning chunk. Used by [`WaveNet::process_buffer`].
+    head_a_blk: Vec<f32>,
+    head_b_blk: Vec<f32>,
+    sig_a_blk: Vec<f32>,
+    sig_b_blk: Vec<f32>,
+    cond_blk: Vec<f32>,
 }
 
 impl WaveNet {
@@ -83,6 +91,11 @@ impl WaveNet {
             head_b: vec![0.0; head_w],
             sig_a: vec![0.0; sig_w],
             sig_b: vec![0.0; sig_w],
+            head_a_blk: vec![0.0; head_w * MAX_BLOCK],
+            head_b_blk: vec![0.0; head_w * MAX_BLOCK],
+            sig_a_blk: vec![0.0; sig_w * MAX_BLOCK],
+            sig_b_blk: vec![0.0; sig_w * MAX_BLOCK],
+            cond_blk: vec![0.0; MAX_BLOCK],
         })
     }
 
@@ -104,11 +117,72 @@ impl WaveNet {
 
     /// Process a buffer of mono samples in place.
     ///
+    /// Runs the block kernel: each `MAX_BLOCK`-sized chunk is pushed through one
+    /// array (and one layer) at a time, keeping each weight matrix hot across the
+    /// whole chunk. Bit-for-bit equivalent to looping [`Self::process_sample`], and
+    /// it shares the same streaming history, so the two are interchangeable.
+    ///
     /// **Real-time contract:** no heap allocation, locks, or syscalls. Enforced by
     /// `tests/rt_safety.rs`.
     pub fn process_buffer(&mut self, io: &mut [f32]) {
-        for sample in io.iter_mut() {
-            *sample = self.process_sample(*sample);
+        if self.arrays.is_empty() {
+            for s in io.iter_mut() {
+                *s *= self.head_scale;
+            }
+            return;
+        }
+        let mut off = 0;
+        while off < io.len() {
+            let n = (io.len() - off).min(MAX_BLOCK);
+            self.process_chunk(&mut io[off..off + n], n);
+            off += n;
+        }
+    }
+
+    /// Run one `n <= MAX_BLOCK` chunk through every array via the planar block path.
+    /// `chunk` is the mono input and is overwritten with the output.
+    fn process_chunk(&mut self, chunk: &mut [f32], n: usize) {
+        // The conditioning is the mono input; copy it out before we overwrite `chunk`.
+        self.cond_blk[..n].copy_from_slice(chunk);
+
+        // First array: input and condition are the mono signal; the incoming head is
+        // silence of the array's channel width.
+        self.head_a_blk[..self.channels0 * n].fill(0.0);
+        {
+            let ch = self.arrays[0].channels();
+            let hs = self.arrays[0].head_size();
+            self.arrays[0].process_block(
+                &self.cond_blk[..n],
+                &self.cond_blk[..n],
+                &self.head_a_blk[..ch * n],
+                &mut self.head_b_blk[..hs * n],
+                &mut self.sig_b_blk[..ch * n],
+                n,
+            );
+        }
+        std::mem::swap(&mut self.head_a_blk, &mut self.head_b_blk);
+        std::mem::swap(&mut self.sig_a_blk, &mut self.sig_b_blk);
+
+        for i in 1..self.arrays.len() {
+            let in_w = self.arrays[i - 1].channels();
+            let ch = self.arrays[i].channels();
+            let hs = self.arrays[i].head_size();
+            self.arrays[i].process_block(
+                &self.sig_a_blk[..in_w * n],
+                &self.cond_blk[..n],
+                &self.head_a_blk[..ch * n],
+                &mut self.head_b_blk[..hs * n],
+                &mut self.sig_b_blk[..ch * n],
+                n,
+            );
+            std::mem::swap(&mut self.head_a_blk, &mut self.head_b_blk);
+            std::mem::swap(&mut self.sig_a_blk, &mut self.sig_b_blk);
+        }
+
+        // After the final swap, head_a_blk holds the last array's head output, whose
+        // head_size is 1 — row 0 is the per-sample head signal.
+        for (t, s) in chunk.iter_mut().enumerate() {
+            *s = self.head_scale * self.head_a_blk[t];
         }
     }
 
@@ -357,5 +431,41 @@ mod tests {
             WaveNet::new(&model),
             Err(Error::UnsupportedArchitecture(_))
         ));
+    }
+
+    /// End-to-end on the realistic standard model: the block `process_buffer` must
+    /// equal a per-sample `process_sample` loop over the same signal, including
+    /// across `MAX_BLOCK` chunk boundaries. This is the top-level equivalence guard
+    /// complementing `tests/parity.rs` (which pins the per-sample path to the
+    /// reference NAM oracle).
+    #[test]
+    fn process_buffer_equals_process_sample_loop_on_standard_model() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/reference_standard.nam");
+        let json = std::fs::read_to_string(path).expect("read standard fixture");
+        let model = NamModel::from_json_str(&json).expect("parse standard fixture");
+
+        // A signal longer than MAX_BLOCK so chunking is exercised.
+        let len = 2 * MAX_BLOCK + 137;
+        let signal: Vec<f32> = (0..len)
+            .map(|i| (i as f32 * 0.013).sin() * 0.5 + (i as f32 * 0.27).sin() * 0.2)
+            .collect();
+
+        let mut per_sample = WaveNet::new(&model).unwrap();
+        let want: Vec<f32> = signal
+            .iter()
+            .map(|&x| per_sample.process_sample(x))
+            .collect();
+
+        let mut block = WaveNet::new(&model).unwrap();
+        let mut got = signal.clone();
+        block.process_buffer(&mut got);
+
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-5,
+                "sample {i}: block {g}, per-sample {w}"
+            );
+        }
     }
 }

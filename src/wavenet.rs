@@ -435,9 +435,10 @@ mod tests {
 
     /// End-to-end on the realistic standard model: the block `process_buffer` must
     /// equal a per-sample `process_sample` loop over the same signal, including
-    /// across `MAX_BLOCK` chunk boundaries. This is the top-level equivalence guard
-    /// complementing `tests/parity.rs` (which pins the per-sample path to the
-    /// reference NAM oracle).
+    /// across `MAX_BLOCK` chunk boundaries. `tests/parity.rs` drives `process_buffer`
+    /// (the block path) and pins it to the reference NAM oracle within 1e-5; this
+    /// test additionally ties the block path to the per-sample path, so the two are
+    /// transitively guaranteed equivalent and both oracle-correct.
     #[test]
     fn process_buffer_equals_process_sample_loop_on_standard_model() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

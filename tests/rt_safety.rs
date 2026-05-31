@@ -21,7 +21,9 @@ fn process_buffer_does_not_allocate() {
     let json = std::fs::read_to_string(path).expect("reference.nam (see tests/fixtures/README.md)");
     let model = NamModel::from_json_str(&json).expect("parse model");
     let mut wn = WaveNet::new(&model).expect("build WaveNet");
-    let mut buffer = vec![0.0_f32; 512];
+    // Longer than the block kernel's MAX_BLOCK (1024) so the multi-chunk loop in
+    // `process_buffer` runs under the alloc guard, not just a single chunk.
+    let mut buffer = vec![0.0_f32; 2100];
 
     // Warm up any lazy-but-bounded state outside the guard, then assert the steady
     // state allocates nothing.

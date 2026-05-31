@@ -44,27 +44,34 @@ fn bench_process_buffer(c: &mut Criterion) {
 
     for (name, rel) in MODELS {
         // `per_sample`: the per-sample loop (the old `process_buffer` body, the
-        // baseline). `block`: the planar block kernel. Both share the same model and
-        // run in the same bench invocation, so the reported delta is a clean A/B on
-        // identical hardware and weights — no reliance on a saved historical baseline.
+        // baseline). `block`: the planar block kernel. Same weights, same bench run —
+        // a clean A/B with no reliance on a saved historical baseline.
+        //
+        // Each variant gets its own model and its own buffer seeded from the SAME
+        // signal. `process_buffer` is in-place, so iterating feeds output back as
+        // input; with separate buffers neither variant contaminates the other's input
+        // stream (and since the two paths are numerically equal the streams evolve
+        // identically, keeping the comparison apples-to-apples and order-independent).
         let mut ps = load(rel);
         let mut block = load(rel);
-        let mut buffer = vec![0.0_f32; BLOCK];
-        // Warm both to steady state.
-        for s in buffer.iter_mut() {
+        let seed: Vec<f32> = (0..BLOCK).map(|i| (i as f32 * 0.05).sin() * 0.25).collect();
+        let mut ps_buf = seed.clone();
+        let mut block_buf = seed;
+        // Warm each independently to steady state.
+        for s in ps_buf.iter_mut() {
             *s = ps.process_sample(*s);
         }
-        block.process_buffer(&mut buffer);
+        block.process_buffer(&mut block_buf);
 
         group.bench_function(format!("{name}/per_sample"), |b| {
             b.iter(|| {
-                for s in buffer.iter_mut() {
+                for s in ps_buf.iter_mut() {
                     *s = ps.process_sample(black_box(*s));
                 }
             });
         });
         group.bench_function(format!("{name}/block"), |b| {
-            b.iter(|| block.process_buffer(black_box(&mut buffer)));
+            b.iter(|| block.process_buffer(black_box(&mut block_buf)));
         });
     }
 

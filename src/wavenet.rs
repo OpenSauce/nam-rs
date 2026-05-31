@@ -10,6 +10,7 @@
 
 use crate::error::Error;
 use crate::model::{LayerArrayConfig, NamModel, WaveNetConfig};
+use crate::reader::Reader;
 
 mod array;
 mod conv;
@@ -247,26 +248,6 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
         head_w,
         head_b,
     ))
-}
-
-/// Sequential reader over the flat weight blob, consumed in `export_weights`
-/// order. The caller validates the total count up front, so `take` never
-/// over-runs.
-struct Reader<'a> {
-    w: &'a [f32],
-    i: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(w: &'a [f32]) -> Self {
-        Self { w, i: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Vec<f32> {
-        let chunk = self.w[self.i..self.i + n].to_vec();
-        self.i += n;
-        chunk
-    }
 }
 
 #[cfg(test)]

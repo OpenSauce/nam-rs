@@ -65,6 +65,7 @@
 
 mod error;
 mod model;
+mod reader;
 mod wavenet;
 
 pub use error::Error;

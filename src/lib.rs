@@ -66,6 +66,7 @@
 mod error;
 mod lstm;
 mod model;
+mod model_runtime;
 mod reader;
 mod wavenet;
 
@@ -75,4 +76,5 @@ pub use model::{
     LayerArrayConfig, LstmConfig, Metadata, ModelConfig, NamModel, WaveNetConfig,
     DEFAULT_SAMPLE_RATE,
 };
+pub use model_runtime::Model;
 pub use wavenet::WaveNet;

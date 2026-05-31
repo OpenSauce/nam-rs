@@ -7,19 +7,24 @@
 //! from-scratch Rust port of NAM's inference, written against the reference
 //! implementations below and validated for **bit-level parity** against them.
 //!
+//! Both NAM architectures are supported — WaveNet and LSTM — and run through the
+//! architecture-agnostic [`Model`] enum, which dispatches on the `.nam`'s declared
+//! architecture so you never have to branch on it yourself.
+//!
 //! ## Design contract
 //!
 //! 1. **Parity with the reference.** The forward pass must produce output equal
 //!    (within float tolerance) to the canonical Python/C++ NAM implementations for
 //!    the same `.nam` file and input. This is enforced by `tests/parity.rs`.
-//! 2. **Real-time safety.** [`WaveNet::process_buffer`] performs zero heap
-//!    allocations, locks, or system calls. All scratch buffers are pre-allocated at
-//!    construction. This is enforced by `tests/rt_safety.rs`.
+//! 2. **Real-time safety.** The runtime's `process_buffer` (on both [`WaveNet`] and
+//!    [`Lstm`], reached via [`Model`]) performs zero heap allocations, locks, or
+//!    system calls. All scratch buffers are pre-allocated at construction. This is
+//!    enforced by `tests/rt_safety.rs`.
 //!
 //! ## Example
 //!
 //! ```
-//! use nam_rs::{NamModel, WaveNet};
+//! use nam_rs::{NamModel, Model};
 //!
 //! // From disk you'd use `NamModel::from_file("model.nam")?`.
 //! // Here we use a tiny in-line model for illustration.
@@ -37,11 +42,11 @@
 //! }"#;
 //!
 //! let model = NamModel::from_json_str(json)?;
-//! let mut wavenet = WaveNet::new(&model)?;          // builds + allocates here
+//! let mut amp = Model::from_nam(&model)?;   // picks WaveNet or Lstm from the file
 //!
 //! // On the audio thread: process in place, no allocation.
 //! let mut buffer = [0.1_f32, 0.2, 0.3, 0.4];
-//! wavenet.process_buffer(&mut buffer);
+//! amp.process_buffer(&mut buffer);
 //! # Ok::<(), nam_rs::Error>(())
 //! ```
 //!

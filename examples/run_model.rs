@@ -7,7 +7,7 @@
 //! Useful for smoke-testing that a real model loads and produces sane (finite,
 //! bounded) output before wiring nam-rs into a host.
 
-use nam_rs::{NamModel, WaveNet};
+use nam_rs::{Model, NamModel};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -24,7 +24,7 @@ fn main() {
         model.sample_rate()
     );
 
-    let mut wavenet = WaveNet::new(&model).expect("build WaveNet");
+    let mut amp = Model::from_nam(&model).expect("build model");
 
     // Deterministic test signal: an impulse followed by two decaying tones.
     let mut buf: Vec<f32> = (0..n)
@@ -39,7 +39,7 @@ fn main() {
     }
     let in_peak = buf.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
 
-    wavenet.process_buffer(&mut buf);
+    amp.process_buffer(&mut buf);
 
     let any_nan = buf.iter().any(|x| !x.is_finite());
     let out_peak = buf.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));

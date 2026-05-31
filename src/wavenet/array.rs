@@ -13,7 +13,7 @@
 //! head_out = head_rechannel(head_accum)
 //! ```
 
-use super::conv::Conv1d;
+use super::conv::{Conv1d, MAX_BLOCK};
 use super::layer::Layer;
 
 /// A stack of dilated layers sharing channel/kernel parameters.
@@ -30,6 +30,10 @@ pub(super) struct LayerArray {
     nxt: Vec<f32>,
     /// `channels`-wide head accumulator.
     head_accum: Vec<f32>,
+    /// Planar `[channels][MAX_BLOCK]` block-path twins of `cur`/`nxt`/`head_accum`.
+    cur_blk: Vec<f32>,
+    nxt_blk: Vec<f32>,
+    head_accum_blk: Vec<f32>,
 }
 
 impl LayerArray {
@@ -51,6 +55,9 @@ impl LayerArray {
             cur: vec![0.0; channels],
             nxt: vec![0.0; channels],
             head_accum: vec![0.0; channels],
+            cur_blk: vec![0.0; channels * MAX_BLOCK],
+            nxt_blk: vec![0.0; channels * MAX_BLOCK],
+            head_accum_blk: vec![0.0; channels * MAX_BLOCK],
         }
     }
 
@@ -95,6 +102,42 @@ impl LayerArray {
         array_out.copy_from_slice(&self.cur);
     }
 
+    /// Block twin of [`Self::process_sample`]. All slices are **planar** `[ch][t]`,
+    /// `n <= MAX_BLOCK`: `input` is `input_size * n`, `head_in`/`array_out` are
+    /// `channels * n`, `head_out` is `head_size * n`. Allocation-free.
+    pub(super) fn process_block(
+        &mut self,
+        input: &[f32],
+        condition: &[f32],
+        head_in: &[f32],
+        head_out: &mut [f32],
+        array_out: &mut [f32],
+        n: usize,
+    ) {
+        let ch = self.channels;
+        self.rechannel
+            .process_block(input, &mut self.cur_blk[..ch * n], n);
+        self.head_accum_blk[..ch * n].copy_from_slice(head_in);
+
+        for i in 0..self.layers.len() {
+            // Split-borrow the two ping-pong scratch rows for this block length.
+            let (cur, nxt) = (&self.cur_blk[..ch * n], &mut self.nxt_blk[..ch * n]);
+            // Layer reads `cur`, writes `nxt`; head accumulates in place.
+            self.layers[i].process_block(
+                cur,
+                condition,
+                &mut self.head_accum_blk[..ch * n],
+                nxt,
+                n,
+            );
+            std::mem::swap(&mut self.cur_blk, &mut self.nxt_blk);
+        }
+
+        self.head_rechannel
+            .process_block(&self.head_accum_blk[..ch * n], head_out, n);
+        array_out.copy_from_slice(&self.cur_blk[..ch * n]);
+    }
+
     pub(super) fn reset(&mut self) {
         self.rechannel.reset();
         self.head_rechannel.reset();
@@ -130,6 +173,127 @@ mod tests {
             one_w,
             one_b,
         )
+    }
+
+    /// Block path reproduces the per-sample path for a multi-layer, dilated,
+    /// multi-channel array, with a per-sample incoming head.
+    #[test]
+    fn process_block_equals_process_sample_loop() {
+        let input_size = 1usize;
+        let channels = 3usize;
+        let head_size = 2usize;
+        let cond_sz = 1usize;
+        let kernel = 3usize;
+        let mk = |len: usize, salt: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| (((i * 13 + salt * 5) % 19) as f32 - 9.0) * 0.06)
+                .collect()
+        };
+        let tanh_layer = |dilation: usize, salt: usize| {
+            Layer::new(
+                channels,
+                cond_sz,
+                kernel,
+                dilation,
+                Activation::Tanh,
+                false,
+                mk(channels * channels * kernel, salt),
+                mk(channels, salt + 1),
+                mk(channels * cond_sz, salt + 2),
+                mk(channels * channels, salt + 3),
+                mk(channels, salt + 4),
+            )
+        };
+        let mk_array = || {
+            LayerArray::new(
+                input_size,
+                channels,
+                head_size,
+                mk(channels * input_size, 20),
+                vec![tanh_layer(1, 30), tanh_layer(2, 40), tanh_layer(4, 50)],
+                mk(head_size * channels, 60),
+                Some(mk(head_size, 70)),
+            )
+        };
+
+        let total = 120usize;
+        let inp: Vec<Vec<f32>> = (0..total)
+            .map(|t| {
+                (0..input_size)
+                    .map(|c| ((t + c) as f32 * 0.23).sin())
+                    .collect()
+            })
+            .collect();
+        let cond: Vec<Vec<f32>> = (0..total)
+            .map(|t| {
+                (0..cond_sz)
+                    .map(|c| ((t + c) as f32 * 0.19).cos())
+                    .collect()
+            })
+            .collect();
+        let head_in: Vec<Vec<f32>> = (0..total)
+            .map(|t| {
+                (0..channels)
+                    .map(|c| ((t * 2 + c) as f32) * 0.013)
+                    .collect()
+            })
+            .collect();
+
+        // Reference: per-sample.
+        let mut a = mk_array();
+        let mut head_ref = vec![vec![0.0; head_size]; total];
+        let mut out_ref = vec![vec![0.0; channels]; total];
+        for t in 0..total {
+            let mut ho = vec![0.0; head_size];
+            let mut ao = vec![0.0; channels];
+            a.process_sample(&inp[t], &cond[t], &head_in[t], &mut ho, &mut ao);
+            head_ref[t] = ho;
+            out_ref[t] = ao;
+        }
+
+        // Under test: block path in uneven chunks.
+        let mut b = mk_array();
+        let mut lo = 0usize;
+        for &len in &[33usize, 1, 86] {
+            let mut bin = vec![0.0; input_size * len];
+            let mut bcond = vec![0.0; cond_sz * len];
+            let mut bhead = vec![0.0; channels * len];
+            for lt in 0..len {
+                for c in 0..input_size {
+                    bin[c * len + lt] = inp[lo + lt][c];
+                }
+                for c in 0..cond_sz {
+                    bcond[c * len + lt] = cond[lo + lt][c];
+                }
+                for c in 0..channels {
+                    bhead[c * len + lt] = head_in[lo + lt][c];
+                }
+            }
+            let mut bho = vec![0.0; head_size * len];
+            let mut bao = vec![0.0; channels * len];
+            b.process_block(&bin, &bcond, &bhead, &mut bho, &mut bao, len);
+            for lt in 0..len {
+                for c in 0..head_size {
+                    let g = bho[c * len + lt];
+                    assert!(
+                        (g - head_ref[lo + lt][c]).abs() < 1e-5,
+                        "t{} head c{c}: got {g}, want {}",
+                        lo + lt,
+                        head_ref[lo + lt][c]
+                    );
+                }
+                for c in 0..channels {
+                    let g = bao[c * len + lt];
+                    assert!(
+                        (g - out_ref[lo + lt][c]).abs() < 1e-5,
+                        "t{} out c{c}: got {g}, want {}",
+                        lo + lt,
+                        out_ref[lo + lt][c]
+                    );
+                }
+            }
+            lo += len;
+        }
     }
 
     #[test]

@@ -7,6 +7,17 @@
 //! A 1x1 convolution (`kernel = 1`, `dilation = 1`) degenerates to a per-sample
 //! matrix multiply; the same type is reused for the rechannel / input-mixer /
 //! 1x1 / head-rechannel layers.
+//!
+//! Two equivalent entry points share one streaming history (the ring): the
+//! per-sample [`Conv1d::process_sample`], and the block [`Conv1d::process_block`],
+//! which stages `[history ++ block]` into a contiguous planar scratch so the hot
+//! loop runs sample-inner over a stationary weight row (cache-friendly, and the
+//! compiler can autovectorize it). The block path is the lever behind
+//! `WaveNet::process_buffer`.
+
+/// Largest block the planar kernel processes in one call; `process_buffer` chunks
+/// longer inputs to this. Scratch is sized to it up front (off the audio thread).
+pub(super) const MAX_BLOCK: usize = 1024;
 
 /// A dilated causal convolution that processes one sample at a time, keeping the
 /// receptive-field history in a pre-allocated ring buffer (no allocation on the
@@ -25,6 +36,11 @@ pub(super) struct Conv1d {
     ring_len: usize,
     /// Index of the column written most recently.
     pos: usize,
+    /// Planar `[in_ch][hist_len + MAX_BLOCK]` staging for the block path, where
+    /// `hist_len = ring_len - 1`. Pre-allocated; the inner loop reads it contiguously
+    /// over time. `staged_stride` is the per-channel row length.
+    staged: Vec<f32>,
+    staged_stride: usize,
 }
 
 impl Conv1d {
@@ -41,6 +57,7 @@ impl Conv1d {
             assert_eq!(b.len(), out_ch, "conv bias count");
         }
         let ring_len = (kernel - 1) * dilation + 1;
+        let staged_stride = (ring_len - 1) + MAX_BLOCK;
         Self {
             in_ch,
             out_ch,
@@ -51,6 +68,8 @@ impl Conv1d {
             ring: vec![0.0; in_ch * ring_len],
             ring_len,
             pos: ring_len - 1,
+            staged: vec![0.0; in_ch * staged_stride],
+            staged_stride,
         }
     }
 
@@ -83,6 +102,70 @@ impl Conv1d {
                 }
             }
             out[o] = acc;
+        }
+    }
+
+    /// Process `n` input columns at once, in **planar** layout: `block_in` is
+    /// `in_ch * n` laid out `[channel * n + t]`, and `block_out` is `out_ch * n` the
+    /// same way. Bit-for-bit equivalent to `n` calls of [`Self::process_sample`] and
+    /// leaves the streaming history in the identical state, so the two entry points
+    /// are freely interchangeable across calls.
+    ///
+    /// `n` must be `<= MAX_BLOCK`; callers chunk longer runs. Allocation-free.
+    pub(super) fn process_block(&mut self, block_in: &[f32], block_out: &mut [f32], n: usize) {
+        debug_assert!(n <= MAX_BLOCK);
+        debug_assert_eq!(block_in.len(), self.in_ch * n);
+        debug_assert_eq!(block_out.len(), self.out_ch * n);
+        if n == 0 {
+            return;
+        }
+
+        let hist_len = self.ring_len - 1;
+        let s = self.staged_stride;
+
+        // Stage the history tail (chronological: oldest at time 0, newest at
+        // hist_len-1) followed by this block, one contiguous row per input channel.
+        for j in 0..self.in_ch {
+            let row = j * s;
+            for h in 0..hist_len {
+                let col = (self.pos + self.ring_len - (hist_len - 1) + h) % self.ring_len;
+                self.staged[row + h] = self.ring[col * self.in_ch + j];
+            }
+            let src = &block_in[j * n..j * n + n];
+            self.staged[row + hist_len..row + hist_len + n].copy_from_slice(src);
+        }
+
+        // Compute. Weight-stationary: for each (out channel, tap, in channel) the
+        // inner loop streams contiguously over time in both `staged` and `block_out`.
+        for o in 0..self.out_ch {
+            let b = self.bias.as_ref().map_or(0.0, |bias| bias[o]);
+            block_out[o * n..o * n + n].fill(b);
+        }
+        for o in 0..self.out_ch {
+            let wo = o * self.in_ch * self.kernel;
+            let out = &mut block_out[o * n..o * n + n];
+            for k in 0..self.kernel {
+                let back = (self.kernel - 1 - k) * self.dilation;
+                for j in 0..self.in_ch {
+                    let w = self.weights[wo + j * self.kernel + k];
+                    // staged time for output t is `hist_len + t`; tap k reads `- back`.
+                    let base = j * s + hist_len - back;
+                    let src = &self.staged[base..base + n];
+                    for t in 0..n {
+                        out[t] += w * src[t];
+                    }
+                }
+            }
+        }
+
+        // Advance the ring by pushing every block column (state update only, so a
+        // later `process_sample`/`process_block` continues seamlessly).
+        for t in 0..n {
+            self.pos = (self.pos + 1) % self.ring_len;
+            let base = self.pos * self.in_ch;
+            for j in 0..self.in_ch {
+                self.ring[base + j] = block_in[j * n + t];
+            }
         }
     }
 
@@ -194,6 +277,82 @@ mod tests {
         let want = naive(&xs, &w, 4);
         for (g, e) in got.iter().zip(&want) {
             assert!((g - e).abs() < 1e-6, "got {g}, want {e}");
+        }
+    }
+
+    /// The block path must reproduce the per-sample path exactly, including history
+    /// carried across successive (differently sized) blocks. Planar in/out.
+    #[test]
+    fn process_block_equals_process_sample_loop() {
+        // A few shapes: multi-channel, kernels 1..3, dilations that wrap the ring.
+        let cases = [
+            (1_usize, 1_usize, 1_usize, 1_usize),
+            (2, 3, 1, 1),
+            (3, 2, 2, 1),
+            (2, 2, 3, 4),
+            (4, 5, 2, 7),
+        ];
+        for (in_ch, out_ch, kernel, dilation) in cases {
+            let wlen = out_ch * in_ch * kernel;
+            // Deterministic pseudo-random weights/bias/input.
+            let w: Vec<f32> = (0..wlen)
+                .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.1)
+                .collect();
+            let bias: Vec<f32> = (0..out_ch).map(|o| (o as f32 + 1.0) * 0.05).collect();
+            let total = 200_usize;
+            let xs: Vec<Vec<f32>> = (0..total)
+                .map(|t| {
+                    (0..in_ch)
+                        .map(|j| ((t * in_ch + j) as f32 * 0.31).sin())
+                        .collect()
+                })
+                .collect();
+
+            // Reference: per-sample.
+            let mut a = Conv1d::new(
+                in_ch,
+                out_ch,
+                kernel,
+                dilation,
+                w.clone(),
+                Some(bias.clone()),
+            );
+            let mut want = vec![0.0; out_ch];
+            let want_all: Vec<Vec<f32>> = xs
+                .iter()
+                .map(|x| {
+                    a.process_sample(x, &mut want);
+                    want.clone()
+                })
+                .collect();
+
+            // Under test: block path, split into uneven chunks to exercise history.
+            let mut b = Conv1d::new(in_ch, out_ch, kernel, dilation, w, Some(bias));
+            let chunks = [50usize, 1, 99, 50];
+            let mut t0 = 0;
+            for &len in &chunks {
+                // Planar block_in: [channel][time].
+                let mut bin = vec![0.0; in_ch * len];
+                for (lt, x) in xs[t0..t0 + len].iter().enumerate() {
+                    for (j, &v) in x.iter().enumerate() {
+                        bin[j * len + lt] = v;
+                    }
+                }
+                let mut bout = vec![0.0; out_ch * len];
+                b.process_block(&bin, &mut bout, len);
+                for lt in 0..len {
+                    for o in 0..out_ch {
+                        let got = bout[o * len + lt];
+                        let exp = want_all[t0 + lt][o];
+                        assert!(
+                            (got - exp).abs() < 1e-5,
+                            "shape {in_ch}x{out_ch} k{kernel} d{dilation} t{} o{o}: got {got}, want {exp}",
+                            t0 + lt
+                        );
+                    }
+                }
+                t0 += len;
+            }
         }
     }
 

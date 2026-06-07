@@ -301,12 +301,7 @@ fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
 }
 
 fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Error> {
-    let activation = match &la.activation {
-        crate::model::ActivationSpec::Named { name, .. } => Activation::from_name(name)?,
-        crate::model::ActivationSpec::Unsupported(v) => {
-            return Err(Error::UnsupportedFeature(format!("activation: {v}")))
-        }
-    };
+    let activation = Activation::from_spec(&la.activation)?;
     let mid = if la.gated {
         2 * la.channels
     } else {

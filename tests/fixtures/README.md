@@ -21,7 +21,7 @@ These files pin nam-rs to the reference NAM WaveNet forward pass.
 | `wavenet_a2_max.nam`            | NAM Core v0.5.2 synthetic feature-coverage model (MIT). Negative test — must error with `UnsupportedFeature`. |
 | `wavenet_condition_dsp.nam`     | NAM Core v0.5.2 `condition_dsp` model (MIT). Negative test — must error with `UnsupportedFeature`. |
 | `leaky_wavenet.nam`             | Self-generated LeakyReLU WaveNet (`make_leaky_wavenet.py`); parity oracle for the LeakyReLU activation. |
-| `input_slim.json`               | Shared input array for SlimmableContainer parity (2048 samples). |
+| `input_slim.json`               | Shared input array for SlimmableContainer parity (8192 samples — exceeds the widest submodel's receptive field ~4093). |
 | `expected_slim_0.json`          | Canonical output for submodel 0 (LSTM) of `slimmable_container.nam`. |
 | `expected_slim_1.json`          | Canonical output for submodel 1 (first WaveNet) of `slimmable_container.nam`. |
 | `expected_slim_2.json`          | Canonical output for submodel 2 (second WaveNet / full model) of `slimmable_container.nam`. |

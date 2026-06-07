@@ -66,7 +66,7 @@
 //! }"#;
 //!
 //! let model = NamModel::from_json_str(json)?;
-//! let mut amp = Model::from_nam(&model)?;   // picks WaveNet or Lstm from the file
+//! let mut amp = Model::from_nam(&model)?;   // picks the architecture from the file
 //!
 //! // On the audio thread: process in place, no allocation.
 //! let mut buffer = [0.1_f32, 0.2, 0.3, 0.4];

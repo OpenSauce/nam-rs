@@ -2,7 +2,8 @@
 //!
 //! A `.nam` file is a JSON object. The fields here mirror NAM's
 //! `export_config()` / `export_weights()` output (see crate-level attribution).
-//! Both the WaveNet and LSTM architectures are parsed here (see [`ModelConfig`]);
+//! WaveNet, LSTM, and SlimmableContainer architectures are parsed here (see
+//! [`ModelConfig`]);
 //! the runtime forward passes live in their own modules.
 
 use serde::de::{self, Deserializer};

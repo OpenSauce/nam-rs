@@ -8,9 +8,19 @@
 //! from-scratch Rust port of NAM's inference, written against the reference
 //! implementations below and validated for **bit-level parity** against them.
 //!
-//! Both NAM architectures are supported — WaveNet and LSTM — and run through the
-//! architecture-agnostic [`Model`] enum, which dispatches on the `.nam`'s declared
-//! architecture so you never have to branch on it yourself.
+//! Three model shapes are supported through the architecture-agnostic [`Model`] enum,
+//! which dispatches on the `.nam`'s declared architecture so you never branch on it
+//! yourself: **WaveNet**, **LSTM**, and **SlimmableContainer** (NAM "A2"). A
+//! `SlimmableContainer` is a thin multiplexer over a set of complete standalone
+//! submodels (each WaveNet or LSTM); a width dial selects the active one as a
+//! CPU/quality trade-off. Drive it via [`Model::as_slimmable_mut`] →
+//! [`Slimmable::set_slim_size`] / [`Slimmable::select`]. Switching is real-time-safe
+//! (a single index write); each submodel keeps its own state, so switching mid-stream
+//! leaves a short warmup transient on the newly-selected submodel.
+//!
+//! Deferred A2 features (`condition_dsp`, FiLM, bottleneck, gated/multi-tap heads,
+//! per-layer activation lists, exotic activations) are **rejected** with
+//! [`Error::UnsupportedFeature`] rather than silently mis-run.
 //!
 //! **Sample rate.** A `.nam` is captured at a specific rate
 //! ([`NamModel::expected_sample_rate`], 48 kHz when the file does not say). `nam-rs`

@@ -81,7 +81,8 @@ fn parses_minimal_wavenet_config() {
     assert_eq!(layer.dilations, vec![1, 2]);
     assert!(
         matches!(&layer.activation, nam_rs::ActivationSpec::Named { name, negative_slope: None } if name == "Tanh"),
-        "got {:?}", layer.activation
+        "got {:?}",
+        layer.activation
     );
     assert!(!layer.gated);
     assert!(!layer.head_bias);
@@ -245,20 +246,29 @@ fn first_layer_activation(json: &str) -> ActivationSpec {
 #[test]
 fn activation_bare_string_parses() {
     let a = first_layer_activation(&wavenet_with_activation(r#""LeakyReLU""#));
-    assert!(matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU"));
+    assert!(
+        matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU")
+    );
 }
 
 #[test]
 fn activation_dict_default_slope_parses() {
     let a = first_layer_activation(&wavenet_with_activation(r#"{"type":"LeakyReLU"}"#));
-    assert!(matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU"));
+    assert!(
+        matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU")
+    );
 }
 
 #[test]
 fn activation_dict_explicit_slope_parses() {
-    let a = first_layer_activation(&wavenet_with_activation(r#"{"type":"LeakyReLU","negative_slope":0.1}"#));
+    let a = first_layer_activation(&wavenet_with_activation(
+        r#"{"type":"LeakyReLU","negative_slope":0.1}"#,
+    ));
     match a {
-        ActivationSpec::Named { name, negative_slope: Some(s) } => {
+        ActivationSpec::Named {
+            name,
+            negative_slope: Some(s),
+        } => {
             assert_eq!(name, "LeakyReLU");
             assert!((s - 0.1).abs() < 1e-6);
         }

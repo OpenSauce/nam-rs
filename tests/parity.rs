@@ -98,8 +98,7 @@ fn assert_parity_full_lstm(model_file: &str, input_file: &str, expected_file: &s
 /// receptive-field warmup, the LSTM submodel (rf 0) compares full-length.
 #[test]
 fn matches_reference_slimmable_container() {
-    let json = std::fs::read_to_string(fixture("slimmable_container.nam"))
-        .expect("read container");
+    let json = std::fs::read_to_string(fixture("slimmable_container.nam")).expect("read container");
     let base = NamModel::from_json_str(&json).expect("parse container");
     let input = load_samples("input_slim.json");
 
@@ -107,7 +106,11 @@ fn matches_reference_slimmable_container() {
     // fixtures are committed per index, so this range is fixed, not runtime-derived.
     for i in 0..3 {
         let expected = load_samples(&format!("expected_slim_{i}.json"));
-        assert_eq!(input.len(), expected.len(), "fixture length mismatch (submodel {i})");
+        assert_eq!(
+            input.len(),
+            expected.len(),
+            "fixture length mismatch (submodel {i})"
+        );
 
         let mut model = Model::from_nam(&base).expect("build container");
         model.as_slimmable_mut().expect("is slimmable").select(i);

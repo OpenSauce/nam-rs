@@ -446,7 +446,10 @@ mod tests {
             head_size: 1,
             kernel_size: 3,
             dilations,
-            activation: crate::model::ActivationSpec::Named { name: "Tanh".into(), negative_slope: None },
+            activation: crate::model::ActivationSpec::Named {
+                name: "Tanh".into(),
+                negative_slope: None,
+            },
             gated: false,
             head_bias: false,
             extra: Default::default(),
@@ -522,7 +525,10 @@ mod tests {
             head_size,
             kernel_size,
             dilations,
-            activation: crate::model::ActivationSpec::Named { name: "Tanh".into(), negative_slope: None },
+            activation: crate::model::ActivationSpec::Named {
+                name: "Tanh".into(),
+                negative_slope: None,
+            },
             gated,
             head_bias,
             extra: Default::default(),
@@ -653,12 +659,18 @@ mod tests {
         // block path == per-sample path over a signal longer than MAX_BLOCK.
         let len = MAX_BLOCK + 200;
         let signal: Vec<f32> = (0..len).map(|i| (i as f32 * 0.017).sin() * 0.4).collect();
-        let want: Vec<f32> = signal.iter().map(|&x| per_sample.process_sample(x)).collect();
+        let want: Vec<f32> = signal
+            .iter()
+            .map(|&x| per_sample.process_sample(x))
+            .collect();
         let mut block = WaveNet::new(&model).unwrap();
         let mut got = signal.clone();
         block.process_buffer(&mut got);
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert!((g - w).abs() < 1e-5, "sample {i}: block {g}, per-sample {w}");
+            assert!(
+                (g - w).abs() < 1e-5,
+                "sample {i}: block {g}, per-sample {w}"
+            );
         }
     }
 }

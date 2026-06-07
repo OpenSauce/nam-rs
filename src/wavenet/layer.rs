@@ -28,7 +28,10 @@ impl Activation {
     pub(super) fn from_spec(spec: &crate::model::ActivationSpec) -> Result<Self, Error> {
         use crate::model::ActivationSpec;
         match spec {
-            ActivationSpec::Named { name, negative_slope } => match name.as_str() {
+            ActivationSpec::Named {
+                name,
+                negative_slope,
+            } => match name.as_str() {
                 "Tanh" => Ok(Self::Tanh),
                 "ReLU" => Ok(Self::Relu),
                 "Sigmoid" => Ok(Self::Sigmoid),
@@ -419,10 +422,22 @@ mod tests {
     #[test]
     fn from_spec_resolves_named_activations() {
         use crate::model::ActivationSpec;
-        let named = |n: &str| ActivationSpec::Named { name: n.into(), negative_slope: None };
-        assert_eq!(Activation::from_spec(&named("Tanh")).unwrap(), Activation::Tanh);
-        assert_eq!(Activation::from_spec(&named("ReLU")).unwrap(), Activation::Relu);
-        assert_eq!(Activation::from_spec(&named("Sigmoid")).unwrap(), Activation::Sigmoid);
+        let named = |n: &str| ActivationSpec::Named {
+            name: n.into(),
+            negative_slope: None,
+        };
+        assert_eq!(
+            Activation::from_spec(&named("Tanh")).unwrap(),
+            Activation::Tanh
+        );
+        assert_eq!(
+            Activation::from_spec(&named("ReLU")).unwrap(),
+            Activation::Relu
+        );
+        assert_eq!(
+            Activation::from_spec(&named("Sigmoid")).unwrap(),
+            Activation::Sigmoid
+        );
         // LeakyReLU with no slope -> default 0.01.
         assert_eq!(
             Activation::from_spec(&named("LeakyReLU")).unwrap(),
@@ -442,7 +457,10 @@ mod tests {
     #[test]
     fn from_spec_rejects_unknown_and_unsupported() {
         use crate::model::ActivationSpec;
-        let bad_name = ActivationSpec::Named { name: "Softsign".into(), negative_slope: None };
+        let bad_name = ActivationSpec::Named {
+            name: "Softsign".into(),
+            negative_slope: None,
+        };
         assert!(matches!(
             Activation::from_spec(&bad_name),
             Err(crate::Error::UnsupportedActivation(_))

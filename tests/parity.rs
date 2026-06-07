@@ -128,6 +128,17 @@ fn matches_reference_slimmable_container() {
     }
 }
 
+/// LeakyReLU WaveNet parity. No shipped A2 example uses LeakyReLU, so this model is
+/// self-generated (make_leaky_wavenet.py) and oracled through canonical torch.
+#[test]
+fn matches_reference_leaky_wavenet() {
+    assert_parity(
+        "leaky_wavenet.nam",
+        "input_leaky.json",
+        "expected_output_leaky.json",
+    );
+}
+
 /// Load `model_file`, run `input_file` through it, and assert steady-state parity
 /// against `expected_file` within [`TOLERANCE`].
 fn assert_parity(model_file: &str, input_file: &str, expected_file: &str) {

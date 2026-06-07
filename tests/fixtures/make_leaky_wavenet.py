@@ -25,6 +25,9 @@ def main():
     net = _WaveNet(layers_configs=layers, head_config=None, head_scale=0.02)
     net.eval()
     cfg = net.export_config()
+    # Guard before writing: a parity fixture that didn't actually export LeakyReLU
+    # would silently test the wrong activation.
+    assert cfg["layers"][0]["activation"] == "LeakyReLU", cfg["layers"][0]["activation"]
     weights = np.asarray(net.export_weights(), dtype=np.float32).reshape(-1)
     model = {
         "version": "0.7.0", "architecture": "WaveNet", "config": cfg,
@@ -32,7 +35,6 @@ def main():
     }
     with open(os.path.join(HERE, "leaky_wavenet.nam"), "w") as f:
         json.dump(model, f)
-    assert cfg["layers"][0]["activation"] == "LeakyReLU", cfg["layers"][0]["activation"]
     print(f"wrote leaky_wavenet.nam: activation={cfg['layers'][0]['activation']} "
           f"weights={len(weights)}")
 

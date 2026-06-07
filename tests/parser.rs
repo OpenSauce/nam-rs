@@ -1,6 +1,6 @@
 //! Tests for `.nam` file parsing (the on-disk format → [`NamModel`]).
 
-use nam_rs::{ModelConfig, NamModel, DEFAULT_SAMPLE_RATE};
+use nam_rs::{ActivationSpec, ModelConfig, NamModel, DEFAULT_SAMPLE_RATE};
 
 /// A minimal but structurally-valid WaveNet `.nam`, with `sample_rate` omitted.
 const MINIMAL_WAVENET: &str = r#"{
@@ -186,8 +186,6 @@ fn unknown_architecture_fails_to_parse() {
     );
 }
 
-use nam_rs::ActivationSpec;
-
 /// Builds a WaveNet config JSON with the given raw `activation` snippet.
 fn wavenet_with_activation(activation_json: &str) -> String {
     format!(
@@ -234,5 +232,11 @@ fn activation_dict_explicit_slope_parses() {
 #[test]
 fn activation_list_form_parses_as_unsupported() {
     let a = first_layer_activation(&wavenet_with_activation(r#"["ReLU","Tanh"]"#));
+    assert!(matches!(a, ActivationSpec::Unsupported(_)));
+}
+
+#[test]
+fn activation_dict_without_type_is_unsupported() {
+    let a = first_layer_activation(&wavenet_with_activation(r#"{"negative_slope":0.01}"#));
     assert!(matches!(a, ActivationSpec::Unsupported(_)));
 }

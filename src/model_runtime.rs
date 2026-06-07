@@ -18,6 +18,56 @@ pub enum Model {
     WaveNet(WaveNet),
     /// An LSTM model.
     Lstm(Lstm),
+    /// A width-selectable container of submodels.
+    Slimmable(Slimmable),
+}
+
+/// A width-selectable set of pre-built submodels (NAM Core `SlimmableContainer`).
+///
+/// All submodels are built up front, so switching the active one is a single index
+/// write — real-time-safe, no allocation, no rebuild. Each submodel keeps its own
+/// streaming state, so switching mid-stream leaves a short warmup transient on the
+/// newly-selected submodel (NAM Core behaves the same; it does not cross-feed the
+/// inactive submodels). The container itself holds no weights and does no DSP.
+#[derive(Debug)]
+pub struct Slimmable {
+    submodels: Vec<Model>,
+    max_values: Vec<f32>,
+    active: usize,
+}
+
+impl Slimmable {
+    /// Number of submodels.
+    pub fn len(&self) -> usize {
+        self.submodels.len()
+    }
+
+    /// Always `false` (a built container has at least one submodel).
+    pub fn is_empty(&self) -> bool {
+        self.submodels.is_empty()
+    }
+
+    /// Index of the currently-active submodel.
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    /// Select a submodel by index, clamping out-of-range to the last (full) submodel
+    /// — mirroring NAM Core's "else last" leniency. Real-time-safe.
+    pub fn select(&mut self, index: usize) {
+        self.active = index.min(self.submodels.len() - 1);
+    }
+
+    /// Set the width dial: activate the first submodel whose `max_value` exceeds
+    /// `value`, else the last (full) submodel. Matches NAM Core `SetSlimmableSize`.
+    /// Real-time-safe.
+    pub fn set_slim_size(&mut self, value: f32) {
+        self.active = self
+            .max_values
+            .iter()
+            .position(|&m| m > value)
+            .unwrap_or(self.submodels.len() - 1);
+    }
 }
 
 impl Model {
@@ -26,8 +76,22 @@ impl Model {
         match &model.config {
             ModelConfig::WaveNet(_) => Ok(Model::WaveNet(WaveNet::new(model)?)),
             ModelConfig::Lstm(_) => Ok(Model::Lstm(Lstm::new(model)?)),
-            ModelConfig::Slimmable(_) => {
-                Err(Error::UnsupportedArchitecture(model.architecture.clone()))
+            ModelConfig::Slimmable(cfg) => {
+                if cfg.submodels.is_empty() {
+                    return Err(Error::UnsupportedFeature("empty SlimmableContainer".into()));
+                }
+                let mut submodels = Vec::with_capacity(cfg.submodels.len());
+                let mut max_values = Vec::with_capacity(cfg.submodels.len());
+                for sm in &cfg.submodels {
+                    submodels.push(Model::from_nam(&sm.model)?);
+                    max_values.push(sm.max_value);
+                }
+                let active = submodels.len() - 1; // default = full
+                Ok(Model::Slimmable(Slimmable {
+                    submodels,
+                    max_values,
+                    active,
+                }))
             }
         }
     }
@@ -37,6 +101,7 @@ impl Model {
         match self {
             Model::WaveNet(w) => w.process_buffer(io),
             Model::Lstm(l) => l.process_buffer(io),
+            Model::Slimmable(s) => s.submodels[s.active].process_buffer(io),
         }
     }
 
@@ -45,6 +110,7 @@ impl Model {
         match self {
             Model::WaveNet(w) => w.process_sample(x),
             Model::Lstm(l) => l.process_sample(x),
+            Model::Slimmable(s) => s.submodels[s.active].process_sample(x),
         }
     }
 
@@ -53,6 +119,7 @@ impl Model {
         match self {
             Model::WaveNet(w) => w.reset(),
             Model::Lstm(l) => l.reset(),
+            Model::Slimmable(s) => s.submodels[s.active].reset(),
         }
     }
 
@@ -66,6 +133,25 @@ impl Model {
         match self {
             Model::WaveNet(w) => w.receptive_field(),
             Model::Lstm(_) => 0,
+            Model::Slimmable(s) => s.submodels[s.active].receptive_field(),
+        }
+    }
+
+    /// The width-selectable container, if this model is one. Use it to drive the
+    /// slim dial ([`Slimmable::select`] / [`Slimmable::set_slim_size`]); plain
+    /// WaveNet/LSTM models return `None`.
+    pub fn as_slimmable(&self) -> Option<&Slimmable> {
+        match self {
+            Model::Slimmable(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Mutable variant of [`Model::as_slimmable`], for setting the active submodel.
+    pub fn as_slimmable_mut(&mut self) -> Option<&mut Slimmable> {
+        match self {
+            Model::Slimmable(s) => Some(s),
+            _ => None,
         }
     }
 }
@@ -79,6 +165,7 @@ const _: () = {
     let _ = assert_send_sync::<Model>;
     let _ = assert_send_sync::<WaveNet>;
     let _ = assert_send_sync::<Lstm>;
+    let _ = assert_send_sync::<Slimmable>;
 };
 
 #[cfg(test)]
@@ -128,5 +215,63 @@ mod tests {
         let mut buf = [0.5_f32];
         model.process_buffer(&mut buf);
         assert!((buf[0] - 1.1623).abs() < 1e-3, "got {}", buf[0]);
+    }
+
+    fn container() -> Model {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/slimmable_container.nam");
+        let json = std::fs::read_to_string(path).expect("read container");
+        let m = NamModel::from_json_str(&json).expect("parse container");
+        Model::from_nam(&m).expect("build container")
+    }
+
+    #[test]
+    fn from_nam_builds_slimmable_default_full() {
+        let mut model = container();
+        let s = model.as_slimmable_mut().expect("is slimmable");
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.active_index(), 2, "default = last/full submodel");
+    }
+
+    #[test]
+    fn select_clamps_out_of_range() {
+        let mut model = container();
+        let s = model.as_slimmable_mut().unwrap();
+        s.select(0);
+        assert_eq!(s.active_index(), 0);
+        s.select(99);
+        assert_eq!(s.active_index(), 2, "clamped to last");
+    }
+
+    #[test]
+    fn set_slim_size_picks_first_threshold_above_value() {
+        let mut model = container();
+        let s = model.as_slimmable_mut().unwrap();
+        // max_values = [0.33, 0.66, 1.0]; first max_value > v, else last.
+        s.set_slim_size(0.0);
+        assert_eq!(s.active_index(), 0); // 0.33 > 0.0
+        s.set_slim_size(0.5);
+        assert_eq!(s.active_index(), 1); // 0.33 !> 0.5, 0.66 > 0.5
+        s.set_slim_size(0.99);
+        assert_eq!(s.active_index(), 2); // only 1.0 > 0.99
+        s.set_slim_size(5.0);
+        assert_eq!(s.active_index(), 2); // none > 5.0 -> last
+    }
+
+    #[test]
+    fn slimmable_processes_through_active_submodel() {
+        let mut model = container();
+        model.as_slimmable_mut().unwrap().select(0); // LSTM submodel
+        let mut a = vec![0.1_f32; 32];
+        model.process_buffer(&mut a);
+        model.as_slimmable_mut().unwrap().select(2); // full WaveNet submodel
+        let mut b = vec![0.1_f32; 32];
+        model.process_buffer(&mut b);
+    }
+
+    #[test]
+    fn as_slimmable_none_for_plain_models() {
+        let mut wn = Model::from_nam(&NamModel::from_json_str(TINY_WAVENET).unwrap()).unwrap();
+        assert!(wn.as_slimmable_mut().is_none());
     }
 }

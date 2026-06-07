@@ -95,5 +95,5 @@ pub use model::{
     ActivationSpec, LayerArrayConfig, LstmConfig, Metadata, ModelConfig, NamModel,
     SlimmableConfig, SlimmableSubmodel, WaveNetConfig, DEFAULT_SAMPLE_RATE,
 };
-pub use model_runtime::Model;
+pub use model_runtime::{Model, Slimmable};
 pub use wavenet::WaveNet;

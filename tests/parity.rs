@@ -92,6 +92,40 @@ fn assert_parity_full_lstm(model_file: &str, input_file: &str, expected_file: &s
     );
 }
 
+/// SlimmableContainer parity: at each slim selection, the container must reproduce
+/// the corresponding submodel's reference output. Each submodel is a standalone model
+/// oracled independently (make_slim_fixtures.py); the WaveNet submodels skip their
+/// receptive-field warmup, the LSTM submodel (rf 0) compares full-length.
+#[test]
+fn matches_reference_slimmable_container() {
+    let json = std::fs::read_to_string(fixture("slimmable_container.nam"))
+        .expect("read container");
+    let base = NamModel::from_json_str(&json).expect("parse container");
+    let input = load_samples("input_slim.json");
+
+    for i in 0..3 {
+        let expected = load_samples(&format!("expected_slim_{i}.json"));
+        assert_eq!(input.len(), expected.len(), "fixture length mismatch (submodel {i})");
+
+        let mut model = Model::from_nam(&base).expect("build container");
+        model.as_slimmable_mut().expect("is slimmable").select(i);
+        let rf = model.receptive_field();
+
+        let mut signal = input.clone();
+        model.process_buffer(&mut signal);
+
+        let max_err = signal[rf..]
+            .iter()
+            .zip(&expected[rf..])
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_err <= TOLERANCE,
+            "submodel {i}: max steady-state error {max_err} exceeds {TOLERANCE} (skipped rf={rf})"
+        );
+    }
+}
+
 /// Load `model_file`, run `input_file` through it, and assert steady-state parity
 /// against `expected_file` within [`TOLERANCE`].
 fn assert_parity(model_file: &str, input_file: &str, expected_file: &str) {

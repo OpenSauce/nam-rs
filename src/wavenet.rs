@@ -616,4 +616,49 @@ mod tests {
             );
         }
     }
+
+    /// Non-power-of-2 and out-of-order dilations with kernel 6 must size buffers
+    /// correctly: receptive field is order-independent, and the block path equals the
+    /// per-sample path. Mirrors A2's `[1,5,29,97,227]`-style dilations.
+    #[test]
+    fn non_pow2_out_of_order_dilations_size_correctly() {
+        let json = r#"{
+            "version":"0.7.0","architecture":"WaveNet","config":{"layers":[{
+                "input_size":1,"condition_size":1,"channels":2,"head_size":1,
+                "kernel_size":6,"dilations":[97,1,227,5,29],"activation":"ReLU",
+                "gated":false,"head_bias":false}],"head":null,"head_scale":0.5},
+            "weights":[]}"#;
+        // Parse the config, then fill weights to the exact expected count so build succeeds.
+        let model0 = NamModel::from_json_str(json).unwrap();
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n = expected_weight_count(cfg).unwrap();
+        let weights: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+        let model = NamModel {
+            version: "0.7.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights,
+            sample_rate: None,
+            metadata: None,
+        };
+
+        // rf = 1 + (k-1)*sum(dilations), order-independent.
+        let want_rf = 1 + (6 - 1) * (97 + 1 + 227 + 5 + 29);
+        let mut per_sample = WaveNet::new(&model).unwrap();
+        assert_eq!(per_sample.receptive_field(), want_rf);
+
+        // block path == per-sample path over a signal longer than MAX_BLOCK.
+        let len = MAX_BLOCK + 200;
+        let signal: Vec<f32> = (0..len).map(|i| (i as f32 * 0.017).sin() * 0.4).collect();
+        let want: Vec<f32> = signal.iter().map(|&x| per_sample.process_sample(x)).collect();
+        let mut block = WaveNet::new(&model).unwrap();
+        let mut got = signal.clone();
+        block.process_buffer(&mut got);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() < 1e-5, "sample {i}: block {g}, per-sample {w}");
+        }
+    }
 }

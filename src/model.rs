@@ -2,13 +2,69 @@
 //!
 //! A `.nam` file is a JSON object. The fields here mirror NAM's
 //! `export_config()` / `export_weights()` output (see crate-level attribution).
-//! Both the WaveNet and LSTM architectures are parsed here (see [`ModelConfig`]);
+//! WaveNet, LSTM, and SlimmableContainer architectures are parsed here (see
+//! [`ModelConfig`]);
 //! the runtime forward passes live in their own modules.
 
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 
 use crate::error::Error;
+
+/// How a layer-array's `activation` field was specified in the `.nam`.
+///
+/// NAM A1 writes a bare string (`"Tanh"`); A2 may write a dict
+/// (`{"type": "LeakyReLU", "negative_slope": 0.01}`). A per-layer *list* (a
+/// distinct activation per layer) is not modeled and is captured as
+/// [`ActivationSpec::Unsupported`], which the runtime rejects with
+/// [`crate::Error::UnsupportedFeature`] rather than silently mis-running.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivationSpec {
+    /// A single named activation, with an optional negative slope (LeakyReLU).
+    Named {
+        /// Activation name, e.g. `"Tanh"`, `"ReLU"`, `"LeakyReLU"`.
+        name: String,
+        /// LeakyReLU negative slope, if the file specified one. `None` → the
+        /// runtime applies NAM's default of `0.01`.
+        negative_slope: Option<f32>,
+    },
+    /// A shape this crate does not model (e.g. a per-layer activation list).
+    Unsupported(serde_json::Value),
+}
+
+impl<'de> Deserialize<'de> for ActivationSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        Ok(match &v {
+            serde_json::Value::String(s) => ActivationSpec::Named {
+                name: s.clone(),
+                negative_slope: None,
+            },
+            serde_json::Value::Object(map) => match map.get("type") {
+                Some(serde_json::Value::String(t)) => match map.get("negative_slope") {
+                    // Absent or explicit-null slope → runtime default (0.01).
+                    None | Some(serde_json::Value::Null) => ActivationSpec::Named {
+                        name: t.clone(),
+                        negative_slope: None,
+                    },
+                    // Present and numeric → use it.
+                    Some(slope) if slope.as_f64().is_some() => ActivationSpec::Named {
+                        name: t.clone(),
+                        negative_slope: slope.as_f64().map(|x| x as f32),
+                    },
+                    // Present but not a number → malformed; reject rather than silently
+                    // defaulting (a corrupt/upstream-format error must not pass silently).
+                    Some(_) => ActivationSpec::Unsupported(v.clone()),
+                },
+                _ => ActivationSpec::Unsupported(v),
+            },
+            _ => ActivationSpec::Unsupported(v),
+        })
+    }
+}
 
 /// Sample rate assumed when a `.nam` file omits the `sample_rate` field.
 ///
@@ -47,6 +103,24 @@ pub struct LstmConfig {
     pub num_layers: usize,
 }
 
+/// One entry in a [`SlimmableConfig`]: a complete standalone submodel plus the
+/// width-dial threshold at which it becomes active.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlimmableSubmodel {
+    /// Upper width-dial value this submodel covers (NAM Core `max_value`).
+    pub max_value: f32,
+    /// The submodel itself — a full standalone `.nam` of any architecture.
+    pub model: NamModel,
+}
+
+/// `SlimmableContainer` configuration: an ordered list of standalone submodels
+/// selected at runtime by a width dial. The container holds no weights of its own.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlimmableConfig {
+    /// Submodels in ascending `max_value` order; the last is the full-width model.
+    pub submodels: Vec<SlimmableSubmodel>,
+}
+
 /// Architecture-specific configuration, tagged by `NamModel.architecture`.
 #[derive(Debug, Clone)]
 pub enum ModelConfig {
@@ -55,6 +129,8 @@ pub enum ModelConfig {
     WaveNet(WaveNetConfig),
     /// LSTM: stacked recurrent layers plus a linear head.
     Lstm(LstmConfig),
+    /// SlimmableContainer: a width-selectable set of standalone submodels.
+    Slimmable(SlimmableConfig),
 }
 
 impl<'de> Deserialize<'de> for NamModel {
@@ -85,6 +161,9 @@ impl<'de> Deserialize<'de> for NamModel {
             "LSTM" => {
                 ModelConfig::Lstm(serde_json::from_value(raw.config).map_err(de::Error::custom)?)
             }
+            "SlimmableContainer" => ModelConfig::Slimmable(
+                serde_json::from_value(raw.config).map_err(de::Error::custom)?,
+            ),
             other => {
                 return Err(de::Error::custom(format!(
                     "unsupported model architecture: {other:?}"
@@ -188,11 +267,16 @@ impl NamModel {
 pub struct WaveNetConfig {
     /// One config per layer-array (NAM standard models have two).
     pub layers: Vec<LayerArrayConfig>,
-    /// Optional separate head. `null` in standard models.
+    /// Optional separate head. `null` in shipped models; a non-null head is a
+    /// deferred feature (rejected at build time).
     #[serde(default)]
     pub head: Option<serde_json::Value>,
     /// Output gain applied after the head.
     pub head_scale: f32,
+    /// Unrecognized top-level config keys (e.g. `condition_dsp`), captured so the
+    /// feature-guard can reject deferred features instead of silently dropping them.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Configuration for a single WaveNet layer-array (a stack of dilated layers
@@ -211,10 +295,17 @@ pub struct LayerArrayConfig {
     pub kernel_size: usize,
     /// Per-layer dilation factors, e.g. `[1, 2, 4, ..., 512]`.
     pub dilations: Vec<usize>,
-    /// Activation function name, e.g. `"Tanh"`.
-    pub activation: String,
-    /// Whether the layer uses a gated activation (`tanh * sigmoid`).
+    /// Activation function spec, e.g. `"Tanh"` or `{"type":"LeakyReLU"}`.
+    pub activation: ActivationSpec,
+    /// Whether the layer uses a gated activation (`tanh * sigmoid`). Absent in some
+    /// A2 layers (which use `gating_mode` instead — a deferred feature).
+    #[serde(default)]
     pub gated: bool,
     /// Whether the head 1x1 has a bias term.
     pub head_bias: bool,
+    /// Unrecognized per-layer keys (e.g. `bottleneck`, FiLM, `groups_input`, a
+    /// non-null nested `head`), captured for the feature-guard. The benign
+    /// training key `slimmable` lives here too and is allowlisted.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }

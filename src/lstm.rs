@@ -30,7 +30,7 @@ impl Lstm {
     pub fn new(model: &NamModel) -> Result<Self, Error> {
         let cfg = match &model.config {
             ModelConfig::Lstm(cfg) => cfg,
-            ModelConfig::WaveNet(_) => {
+            ModelConfig::WaveNet(_) | ModelConfig::Slimmable(_) => {
                 return Err(Error::UnsupportedArchitecture(model.architecture.clone()))
             }
         };

@@ -10,9 +10,10 @@ buffer at a time (WaveNet uses a cache-friendly block kernel) or one sample at a
 with **no heap allocation on the audio thread**, suitable for use inside a JACK
 callback, a VST3/CLAP `process()`, or any real-time audio graph.
 
-> Status: **Both WaveNet and LSTM inference are implemented and tested** — parser,
-> forward pass, parity, and RT-safety harnesses all green. Build any `.nam` with the
-> architecture-agnostic `Model::from_nam`, which dispatches on the model's architecture.
+> Status: **WaveNet, LSTM, and SlimmableContainer (NAM "A2") inference are implemented
+> and tested** — parser, forward pass, parity, and RT-safety harnesses all green. Build
+> any `.nam` with the architecture-agnostic `Model::from_nam`, which dispatches on the
+> model's architecture.
 
 ## Design contract
 
@@ -62,6 +63,20 @@ NAM plugin additionally applies a DC blocker (high-pass) and, optionally, loudne
 normalization on the output — those belong to the host's audio graph, not the model.
 The calibration accessors (`NamModel::loudness()` etc.) give you the numbers for that
 gain-staging.
+
+## Supported architectures
+
+- **WaveNet** (A1 and A2 single models) — dilated-conv forward pass, parity-tested.
+- **LSTM** — recurrent forward pass, parity-tested.
+- **SlimmableContainer** (NAM "A2") — a width-selectable set of complete standalone
+  submodels (any mix of WaveNet/LSTM). The container holds no weights; it delegates to
+  the active submodel. Select the width with `model.as_slimmable_mut()` →
+  `set_slim_size(value)` (NAM Core semantics: the first submodel whose `max_value`
+  exceeds `value`, else the full model) or `select(index)`. Switching is real-time-safe.
+
+Deferred A2 features (`condition_dsp`, FiLM, bottleneck, gated/multi-tap heads, per-layer
+activation lists, exotic activations) are rejected with a clear `Error::UnsupportedFeature`
+rather than silently mis-run.
 
 ## Development
 

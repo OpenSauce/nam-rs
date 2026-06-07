@@ -1,6 +1,43 @@
 //! Tests for `.nam` file parsing (the on-disk format → [`NamModel`]).
 
-use nam_rs::{ModelConfig, NamModel, DEFAULT_SAMPLE_RATE};
+use nam_rs::{ActivationSpec, ModelConfig, NamModel, SlimmableConfig, DEFAULT_SAMPLE_RATE};
+use nam_rs::{Error, Model};
+
+fn build_fixture(name: &str) -> Result<Model, Error> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let json = std::fs::read_to_string(path).expect("read fixture");
+    let model = NamModel::from_json_str(&json)?;
+    Model::from_nam(&model)
+}
+
+#[test]
+fn a2_max_features_are_rejected_not_run() {
+    // wavenet_a2_max.nam carries bottleneck/FiLM/groups/dict-activation etc.
+    // It must error cleanly (UnsupportedFeature or WeightCountMismatch), never panic.
+    match build_fixture("wavenet_a2_max.nam") {
+        Err(Error::UnsupportedFeature(_)) | Err(Error::WeightCountMismatch { .. }) => {}
+        other => panic!("expected a clean rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn condition_dsp_is_rejected_not_run() {
+    // 147 == 147 reconciles, so the weight-count check passes; the guard must catch it.
+    match build_fixture("wavenet_condition_dsp.nam") {
+        Err(Error::UnsupportedFeature(msg)) => assert!(msg.contains("condition_dsp"), "{msg}"),
+        other => panic!("expected UnsupportedFeature(condition_dsp), got {other:?}"),
+    }
+}
+
+#[test]
+fn slimmable_wavenet_still_builds_and_runs() {
+    // The benign `slimmable` training key must NOT trip the guard.
+    let mut m = build_fixture("slimmable_wavenet.nam").expect("should build");
+    let mut buf = vec![0.1_f32; 64];
+    m.process_buffer(&mut buf); // must not panic
+}
 
 /// A minimal but structurally-valid WaveNet `.nam`, with `sample_rate` omitted.
 const MINIMAL_WAVENET: &str = r#"{
@@ -42,7 +79,11 @@ fn parses_minimal_wavenet_config() {
     assert_eq!(layer.channels, 2);
     assert_eq!(layer.kernel_size, 3);
     assert_eq!(layer.dilations, vec![1, 2]);
-    assert_eq!(layer.activation, "Tanh");
+    assert!(
+        matches!(&layer.activation, nam_rs::ActivationSpec::Named { name, negative_slope: None } if name == "Tanh"),
+        "got {:?}",
+        layer.activation
+    );
     assert!(!layer.gated);
     assert!(!layer.head_bias);
 
@@ -181,4 +222,112 @@ fn unknown_architecture_fails_to_parse() {
         format!("{err}").contains("Transformer"),
         "error should name the bad architecture: {err}"
     );
+}
+
+/// Builds a WaveNet config JSON with the given raw `activation` snippet.
+fn wavenet_with_activation(activation_json: &str) -> String {
+    format!(
+        r#"{{"version":"0.7.0","architecture":"WaveNet","config":{{"layers":[{{
+            "input_size":1,"condition_size":1,"channels":1,"head_size":1,
+            "kernel_size":1,"dilations":[1],"activation":{activation_json},
+            "gated":false,"head_bias":false}}],"head":null,"head_scale":1.0}},
+            "weights":[1.0,2.0,0.0,0.0,1.0,0.0,1.0,1.0]}}"#
+    )
+}
+
+fn first_layer_activation(json: &str) -> ActivationSpec {
+    let m = NamModel::from_json_str(json).expect("parse");
+    match &m.config {
+        ModelConfig::WaveNet(c) => c.layers[0].activation.clone(),
+        other => panic!("expected WaveNet, got {other:?}"),
+    }
+}
+
+#[test]
+fn activation_bare_string_parses() {
+    let a = first_layer_activation(&wavenet_with_activation(r#""LeakyReLU""#));
+    assert!(
+        matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU")
+    );
+}
+
+#[test]
+fn activation_dict_default_slope_parses() {
+    let a = first_layer_activation(&wavenet_with_activation(r#"{"type":"LeakyReLU"}"#));
+    assert!(
+        matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU")
+    );
+}
+
+#[test]
+fn activation_dict_explicit_slope_parses() {
+    let a = first_layer_activation(&wavenet_with_activation(
+        r#"{"type":"LeakyReLU","negative_slope":0.1}"#,
+    ));
+    match a {
+        ActivationSpec::Named {
+            name,
+            negative_slope: Some(s),
+        } => {
+            assert_eq!(name, "LeakyReLU");
+            assert!((s - 0.1).abs() < 1e-6);
+        }
+        other => panic!("expected Named with slope, got {other:?}"),
+    }
+}
+
+#[test]
+fn activation_list_form_parses_as_unsupported() {
+    let a = first_layer_activation(&wavenet_with_activation(r#"["ReLU","Tanh"]"#));
+    assert!(matches!(a, ActivationSpec::Unsupported(_)));
+}
+
+#[test]
+fn activation_dict_without_type_is_unsupported() {
+    let a = first_layer_activation(&wavenet_with_activation(r#"{"negative_slope":0.01}"#));
+    assert!(matches!(a, ActivationSpec::Unsupported(_)));
+}
+
+#[test]
+fn activation_dict_non_numeric_slope_is_unsupported() {
+    // A present-but-malformed `negative_slope` (here a string) must be rejected, not
+    // silently treated as the 0.01 default — consistent with the crate's fail-loud
+    // handling of unmodeled activation shapes.
+    let a = first_layer_activation(&wavenet_with_activation(
+        r#"{"type":"LeakyReLU","negative_slope":"0.1"}"#,
+    ));
+    assert!(matches!(a, ActivationSpec::Unsupported(_)));
+}
+
+#[test]
+fn activation_dict_null_slope_uses_default() {
+    // An explicit null slope means "no value" → runtime default, like an absent key.
+    let a = first_layer_activation(&wavenet_with_activation(
+        r#"{"type":"LeakyReLU","negative_slope":null}"#,
+    ));
+    assert!(
+        matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU")
+    );
+}
+
+#[test]
+fn parses_slimmable_container() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/slimmable_container.nam");
+    let json = std::fs::read_to_string(path).expect("read container");
+    let m = NamModel::from_json_str(&json).expect("parse container");
+    assert_eq!(m.architecture, "SlimmableContainer");
+    let cfg: &SlimmableConfig = match &m.config {
+        ModelConfig::Slimmable(c) => c,
+        other => panic!("expected Slimmable config, got {other:?}"),
+    };
+    assert_eq!(cfg.submodels.len(), 3);
+    // max_values are ascending [0.33, 0.66, 1.0].
+    let maxes: Vec<f32> = cfg.submodels.iter().map(|s| s.max_value).collect();
+    assert!((maxes[0] - 0.33).abs() < 1e-6);
+    assert!((maxes[2] - 1.0).abs() < 1e-6);
+    // Submodels are mixed architecture: [LSTM, WaveNet, WaveNet].
+    assert_eq!(cfg.submodels[0].model.architecture, "LSTM");
+    assert_eq!(cfg.submodels[1].model.architecture, "WaveNet");
+    assert_eq!(cfg.submodels[2].model.architecture, "WaveNet");
 }

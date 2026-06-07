@@ -289,6 +289,28 @@ fn activation_dict_without_type_is_unsupported() {
 }
 
 #[test]
+fn activation_dict_non_numeric_slope_is_unsupported() {
+    // A present-but-malformed `negative_slope` (here a string) must be rejected, not
+    // silently treated as the 0.01 default — consistent with the crate's fail-loud
+    // handling of unmodeled activation shapes.
+    let a = first_layer_activation(&wavenet_with_activation(
+        r#"{"type":"LeakyReLU","negative_slope":"0.1"}"#,
+    ));
+    assert!(matches!(a, ActivationSpec::Unsupported(_)));
+}
+
+#[test]
+fn activation_dict_null_slope_uses_default() {
+    // An explicit null slope means "no value" → runtime default, like an absent key.
+    let a = first_layer_activation(&wavenet_with_activation(
+        r#"{"type":"LeakyReLU","negative_slope":null}"#,
+    ));
+    assert!(
+        matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU")
+    );
+}
+
+#[test]
 fn parses_slimmable_container() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/slimmable_container.nam");

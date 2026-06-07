@@ -70,5 +70,8 @@ fn slimmable_process_and_select_do_not_allocate() {
         m.process_buffer(&mut buffer);
         m.as_slimmable_mut().unwrap().set_slim_size(0.0);
         m.process_buffer(&mut buffer);
+        // reset() resets *every* submodel (iterate a Vec, fill pre-allocated buffers):
+        // still allocation-free, so a host may call it on the audio thread.
+        m.reset();
     });
 }

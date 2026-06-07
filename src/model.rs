@@ -44,12 +44,20 @@ impl<'de> Deserialize<'de> for ActivationSpec {
                 negative_slope: None,
             },
             serde_json::Value::Object(map) => match map.get("type") {
-                Some(serde_json::Value::String(t)) => ActivationSpec::Named {
-                    name: t.clone(),
-                    negative_slope: map
-                        .get("negative_slope")
-                        .and_then(serde_json::Value::as_f64)
-                        .map(|x| x as f32),
+                Some(serde_json::Value::String(t)) => match map.get("negative_slope") {
+                    // Absent or explicit-null slope → runtime default (0.01).
+                    None | Some(serde_json::Value::Null) => ActivationSpec::Named {
+                        name: t.clone(),
+                        negative_slope: None,
+                    },
+                    // Present and numeric → use it.
+                    Some(slope) if slope.as_f64().is_some() => ActivationSpec::Named {
+                        name: t.clone(),
+                        negative_slope: slope.as_f64().map(|x| x as f32),
+                    },
+                    // Present but not a number → malformed; reject rather than silently
+                    // defaulting (a corrupt/upstream-format error must not pass silently).
+                    Some(_) => ActivationSpec::Unsupported(v.clone()),
                 },
                 _ => ActivationSpec::Unsupported(v),
             },

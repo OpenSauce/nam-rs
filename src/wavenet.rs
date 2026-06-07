@@ -58,6 +58,7 @@ impl WaveNet {
             }
         };
 
+        check_unsupported_features(cfg)?;
         let expected = expected_weight_count(cfg)?;
         if expected != model.weights.len() {
             return Err(Error::WeightCountMismatch {
@@ -245,6 +246,59 @@ impl WaveNet {
     }
 }
 
+/// Per-layer keys that mark a deferred A2 feature. Present-and-non-null → reject.
+/// (`slimmable` is intentionally absent: it is benign training metadata.)
+const DEFERRED_LAYER_KEYS: &[&str] = &[
+    "condition_dsp",
+    "bottleneck",
+    "gating_mode",
+    "groups_input",
+    "groups_input_mixin",
+    "head1x1",
+    "layer1x1",
+    "secondary_activation",
+    "conv_pre_film",
+    "conv_post_film",
+    "input_mixin_pre_film",
+    "input_mixin_post_film",
+    "activation_pre_film",
+    "activation_post_film",
+    "layer1x1_post_film",
+    "head1x1_post_film",
+];
+
+/// Reject the deferred/exotic A2 features this crate does not implement, with a clear
+/// [`Error::UnsupportedFeature`], rather than silently dropping the config key and
+/// mis-running. The weight-count invariant catches features that reshape the flat
+/// blob; this catches the rest (notably `condition_dsp`, which reconciles exactly).
+fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
+    let non_null = |v: &serde_json::Value| !v.is_null();
+
+    if let Some(h) = &cfg.head {
+        if non_null(h) {
+            return Err(Error::UnsupportedFeature(
+                "separate head (config.head); shipped A2 keeps it null".into(),
+            ));
+        }
+    }
+    if cfg.extra.get("condition_dsp").is_some_and(non_null) {
+        return Err(Error::UnsupportedFeature("condition_dsp".into()));
+    }
+    for la in &cfg.layers {
+        for key in DEFERRED_LAYER_KEYS {
+            if la.extra.get(*key).is_some_and(non_null) {
+                return Err(Error::UnsupportedFeature((*key).to_string()));
+            }
+        }
+        if la.extra.get("head").is_some_and(non_null) {
+            return Err(Error::UnsupportedFeature(
+                "per-layer head (multi-tap); shipped A2 keeps it null".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Receptive field implied by `config`: `1 + Σ (kernel_size - 1) · dilation` over
 /// every dilated layer in every array. The stacked dilated convs compose additively,
 /// so this is the number of past input samples the final output depends on.
@@ -394,11 +448,13 @@ mod tests {
             activation: crate::model::ActivationSpec::Named { name: "Tanh".into(), negative_slope: None },
             gated: false,
             head_bias: false,
+            extra: Default::default(),
         };
         let cfg = WaveNetConfig {
             layers: vec![mk(vec![1, 2]), mk(vec![8])],
             head: None,
             head_scale: 1.0,
+            extra: Default::default(),
         };
         // (3-1)*1 + (3-1)*2 + (3-1)*8 = 2 + 4 + 16 = 22, + 1 = 23.
         assert_eq!(receptive_field(&cfg), 23);
@@ -468,6 +524,7 @@ mod tests {
             activation: crate::model::ActivationSpec::Named { name: "Tanh".into(), negative_slope: None },
             gated,
             head_bias,
+            extra: Default::default(),
         };
         let layer_sets = vec![
             vec![mk(1, 1, 1, 1, vec![1], false, false)],
@@ -485,6 +542,7 @@ mod tests {
                 layers,
                 head: None,
                 head_scale: 1.0,
+                extra: Default::default(),
             };
             let n = expected_weight_count(&cfg).unwrap();
             let mk_model = |count: usize| NamModel {

@@ -235,11 +235,16 @@ impl NamModel {
 pub struct WaveNetConfig {
     /// One config per layer-array (NAM standard models have two).
     pub layers: Vec<LayerArrayConfig>,
-    /// Optional separate head. `null` in standard models.
+    /// Optional separate head. `null` in shipped models; a non-null head is a
+    /// deferred feature (rejected at build time).
     #[serde(default)]
     pub head: Option<serde_json::Value>,
     /// Output gain applied after the head.
     pub head_scale: f32,
+    /// Unrecognized top-level config keys (e.g. `condition_dsp`), captured so the
+    /// feature-guard can reject deferred features instead of silently dropping them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Configuration for a single WaveNet layer-array (a stack of dilated layers
@@ -260,8 +265,15 @@ pub struct LayerArrayConfig {
     pub dilations: Vec<usize>,
     /// Activation function spec, e.g. `"Tanh"` or `{"type":"LeakyReLU"}`.
     pub activation: ActivationSpec,
-    /// Whether the layer uses a gated activation (`tanh * sigmoid`).
+    /// Whether the layer uses a gated activation (`tanh * sigmoid`). Absent in some
+    /// A2 layers (which use `gating_mode` instead — a deferred feature).
+    #[serde(default)]
     pub gated: bool,
     /// Whether the head 1x1 has a bias term.
     pub head_bias: bool,
+    /// Unrecognized per-layer keys (e.g. `bottleneck`, FiLM, `groups_input`, a
+    /// non-null nested `head`), captured for the feature-guard. The benign
+    /// training key `slimmable` lives here too and is allowlisted.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }

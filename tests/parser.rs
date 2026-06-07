@@ -1,6 +1,43 @@
 //! Tests for `.nam` file parsing (the on-disk format → [`NamModel`]).
 
 use nam_rs::{ActivationSpec, ModelConfig, NamModel, DEFAULT_SAMPLE_RATE};
+use nam_rs::{Error, Model};
+
+fn build_fixture(name: &str) -> Result<Model, Error> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let json = std::fs::read_to_string(path).expect("read fixture");
+    let model = NamModel::from_json_str(&json)?;
+    Model::from_nam(&model)
+}
+
+#[test]
+fn a2_max_features_are_rejected_not_run() {
+    // wavenet_a2_max.nam carries bottleneck/FiLM/groups/dict-activation etc.
+    // It must error cleanly (UnsupportedFeature or WeightCountMismatch), never panic.
+    match build_fixture("wavenet_a2_max.nam") {
+        Err(Error::UnsupportedFeature(_)) | Err(Error::WeightCountMismatch { .. }) => {}
+        other => panic!("expected a clean rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn condition_dsp_is_rejected_not_run() {
+    // 147 == 147 reconciles, so the weight-count check passes; the guard must catch it.
+    match build_fixture("wavenet_condition_dsp.nam") {
+        Err(Error::UnsupportedFeature(msg)) => assert!(msg.contains("condition_dsp"), "{msg}"),
+        other => panic!("expected UnsupportedFeature(condition_dsp), got {other:?}"),
+    }
+}
+
+#[test]
+fn slimmable_wavenet_still_builds_and_runs() {
+    // The benign `slimmable` training key must NOT trip the guard.
+    let mut m = build_fixture("slimmable_wavenet.nam").expect("should build");
+    let mut buf = vec![0.1_f32; 64];
+    m.process_buffer(&mut buf); // must not panic
+}
 
 /// A minimal but structurally-valid WaveNet `.nam`, with `sample_rate` omitted.
 const MINIMAL_WAVENET: &str = r#"{

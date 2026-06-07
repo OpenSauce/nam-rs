@@ -8,7 +8,7 @@
 //! outside the guard.
 
 use assert_no_alloc::*;
-use nam_rs::{Lstm, NamModel, WaveNet};
+use nam_rs::{Lstm, Model, NamModel, WaveNet};
 
 #[cfg(debug_assertions)]
 #[global_allocator]
@@ -45,5 +45,30 @@ fn lstm_process_buffer_does_not_allocate() {
     net.process_buffer(&mut buffer); // warm up off-guard
     assert_no_alloc(|| {
         net.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
+fn slimmable_process_and_select_do_not_allocate() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/slimmable_container.nam");
+    let json = std::fs::read_to_string(path).expect("slimmable_container.nam");
+    let model = NamModel::from_json_str(&json).expect("parse container");
+    let mut m = Model::from_nam(&model).expect("build container");
+    let mut buffer = vec![0.0_f32; 512];
+
+    // Warm up each submodel off-guard (select then process), so any lazy-but-bounded
+    // state is initialized before the guard.
+    for i in 0..m.as_slimmable().unwrap().len() {
+        m.as_slimmable_mut().unwrap().select(i);
+        m.process_buffer(&mut buffer);
+    }
+
+    assert_no_alloc(|| {
+        // Switching the active submodel is a single index write — no allocation.
+        m.as_slimmable_mut().unwrap().select(2);
+        m.process_buffer(&mut buffer);
+        m.as_slimmable_mut().unwrap().set_slim_size(0.0);
+        m.process_buffer(&mut buffer);
     });
 }

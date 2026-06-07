@@ -10,6 +10,53 @@ use serde::Deserialize;
 
 use crate::error::Error;
 
+/// How a layer-array's `activation` field was specified in the `.nam`.
+///
+/// NAM A1 writes a bare string (`"Tanh"`); A2 may write a dict
+/// (`{"type": "LeakyReLU", "negative_slope": 0.01}`). A per-layer *list* (a
+/// distinct activation per layer) is not modeled and is captured as
+/// [`ActivationSpec::Unsupported`], which the runtime rejects with
+/// [`crate::Error::UnsupportedFeature`] rather than silently mis-running.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivationSpec {
+    /// A single named activation, with an optional negative slope (LeakyReLU).
+    Named {
+        /// Activation name, e.g. `"Tanh"`, `"ReLU"`, `"LeakyReLU"`.
+        name: String,
+        /// LeakyReLU negative slope, if the file specified one. `None` → the
+        /// runtime applies NAM's default of `0.01`.
+        negative_slope: Option<f32>,
+    },
+    /// A shape this crate does not model (e.g. a per-layer activation list).
+    Unsupported(serde_json::Value),
+}
+
+impl<'de> Deserialize<'de> for ActivationSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        Ok(match &v {
+            serde_json::Value::String(s) => ActivationSpec::Named {
+                name: s.clone(),
+                negative_slope: None,
+            },
+            serde_json::Value::Object(map) => match map.get("type") {
+                Some(serde_json::Value::String(t)) => ActivationSpec::Named {
+                    name: t.clone(),
+                    negative_slope: map
+                        .get("negative_slope")
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|x| x as f32),
+                },
+                _ => ActivationSpec::Unsupported(v),
+            },
+            _ => ActivationSpec::Unsupported(v),
+        })
+    }
+}
+
 /// Sample rate assumed when a `.nam` file omits the `sample_rate` field.
 ///
 /// Matches NAM's documented default.
@@ -211,8 +258,8 @@ pub struct LayerArrayConfig {
     pub kernel_size: usize,
     /// Per-layer dilation factors, e.g. `[1, 2, 4, ..., 512]`.
     pub dilations: Vec<usize>,
-    /// Activation function name, e.g. `"Tanh"`.
-    pub activation: String,
+    /// Activation function spec, e.g. `"Tanh"` or `{"type":"LeakyReLU"}`.
+    pub activation: ActivationSpec,
     /// Whether the layer uses a gated activation (`tanh * sigmoid`).
     pub gated: bool,
     /// Whether the head 1x1 has a bias term.

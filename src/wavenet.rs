@@ -301,7 +301,12 @@ fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
 }
 
 fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Error> {
-    let activation = Activation::from_name(&la.activation)?;
+    let activation = match &la.activation {
+        crate::model::ActivationSpec::Named { name, .. } => Activation::from_name(name)?,
+        crate::model::ActivationSpec::Unsupported(v) => {
+            return Err(Error::UnsupportedFeature(format!("activation: {v}")))
+        }
+    };
     let mid = if la.gated {
         2 * la.channels
     } else {
@@ -391,7 +396,7 @@ mod tests {
             head_size: 1,
             kernel_size: 3,
             dilations,
-            activation: "Tanh".into(),
+            activation: crate::model::ActivationSpec::Named { name: "Tanh".into(), negative_slope: None },
             gated: false,
             head_bias: false,
         };
@@ -465,7 +470,7 @@ mod tests {
             head_size,
             kernel_size,
             dilations,
-            activation: "Tanh".into(),
+            activation: crate::model::ActivationSpec::Named { name: "Tanh".into(), negative_slope: None },
             gated,
             head_bias,
         };

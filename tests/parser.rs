@@ -42,7 +42,10 @@ fn parses_minimal_wavenet_config() {
     assert_eq!(layer.channels, 2);
     assert_eq!(layer.kernel_size, 3);
     assert_eq!(layer.dilations, vec![1, 2]);
-    assert_eq!(layer.activation, "Tanh");
+    assert!(
+        matches!(&layer.activation, nam_rs::ActivationSpec::Named { name, negative_slope: None } if name == "Tanh"),
+        "got {:?}", layer.activation
+    );
     assert!(!layer.gated);
     assert!(!layer.head_bias);
 
@@ -181,4 +184,55 @@ fn unknown_architecture_fails_to_parse() {
         format!("{err}").contains("Transformer"),
         "error should name the bad architecture: {err}"
     );
+}
+
+use nam_rs::ActivationSpec;
+
+/// Builds a WaveNet config JSON with the given raw `activation` snippet.
+fn wavenet_with_activation(activation_json: &str) -> String {
+    format!(
+        r#"{{"version":"0.7.0","architecture":"WaveNet","config":{{"layers":[{{
+            "input_size":1,"condition_size":1,"channels":1,"head_size":1,
+            "kernel_size":1,"dilations":[1],"activation":{activation_json},
+            "gated":false,"head_bias":false}}],"head":null,"head_scale":1.0}},
+            "weights":[1.0,2.0,0.0,0.0,1.0,0.0,1.0,1.0]}}"#
+    )
+}
+
+fn first_layer_activation(json: &str) -> ActivationSpec {
+    let m = NamModel::from_json_str(json).expect("parse");
+    match &m.config {
+        ModelConfig::WaveNet(c) => c.layers[0].activation.clone(),
+        other => panic!("expected WaveNet, got {other:?}"),
+    }
+}
+
+#[test]
+fn activation_bare_string_parses() {
+    let a = first_layer_activation(&wavenet_with_activation(r#""LeakyReLU""#));
+    assert!(matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU"));
+}
+
+#[test]
+fn activation_dict_default_slope_parses() {
+    let a = first_layer_activation(&wavenet_with_activation(r#"{"type":"LeakyReLU"}"#));
+    assert!(matches!(a, ActivationSpec::Named { name, negative_slope: None } if name == "LeakyReLU"));
+}
+
+#[test]
+fn activation_dict_explicit_slope_parses() {
+    let a = first_layer_activation(&wavenet_with_activation(r#"{"type":"LeakyReLU","negative_slope":0.1}"#));
+    match a {
+        ActivationSpec::Named { name, negative_slope: Some(s) } => {
+            assert_eq!(name, "LeakyReLU");
+            assert!((s - 0.1).abs() < 1e-6);
+        }
+        other => panic!("expected Named with slope, got {other:?}"),
+    }
+}
+
+#[test]
+fn activation_list_form_parses_as_unsupported() {
+    let a = first_layer_activation(&wavenet_with_activation(r#"["ReLU","Tanh"]"#));
+    assert!(matches!(a, ActivationSpec::Unsupported(_)));
 }

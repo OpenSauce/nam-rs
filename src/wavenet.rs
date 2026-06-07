@@ -247,9 +247,10 @@ impl WaveNet {
 }
 
 /// Per-layer keys that mark a deferred A2 feature. Present-and-non-null → reject.
-/// (`slimmable` is intentionally absent: it is benign training metadata.)
+/// (`slimmable` is intentionally absent: it is benign training metadata.
+/// `condition_dsp` is absent too: it is a *top-level* config key, guarded separately
+/// in [`check_unsupported_features`], not a per-layer one.)
 const DEFERRED_LAYER_KEYS: &[&str] = &[
-    "condition_dsp",
     "bottleneck",
     "gating_mode",
     "groups_input",

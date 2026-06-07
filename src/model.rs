@@ -244,7 +244,7 @@ pub struct WaveNetConfig {
     /// Unrecognized top-level config keys (e.g. `condition_dsp`), captured so the
     /// feature-guard can reject deferred features instead of silently dropping them.
     #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Configuration for a single WaveNet layer-array (a stack of dilated layers
@@ -275,5 +275,5 @@ pub struct LayerArrayConfig {
     /// non-null nested `head`), captured for the feature-guard. The benign
     /// training key `slimmable` lives here too and is allowlisted.
     #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }

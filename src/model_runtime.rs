@@ -119,7 +119,10 @@ impl Model {
         match self {
             Model::WaveNet(w) => w.reset(),
             Model::Lstm(l) => l.reset(),
-            Model::Slimmable(s) => s.submodels[s.active].reset(),
+            // Reset EVERY submodel: `reset` is a full clean slate, and a later
+            // `select` must not surface stale state from a previously-active submodel.
+            // Iterating a `Vec` allocates nothing, so this stays real-time-safe.
+            Model::Slimmable(s) => s.submodels.iter_mut().for_each(Model::reset),
         }
     }
 
@@ -256,6 +259,37 @@ mod tests {
         assert_eq!(s.active_index(), 2); // only 1.0 > 0.99
         s.set_slim_size(5.0);
         assert_eq!(s.active_index(), 2); // none > 5.0 -> last
+    }
+
+    #[test]
+    fn reset_clears_all_submodels_not_just_active() {
+        // reset() must restore EVERY submodel to initial conditions, not only the
+        // active one — Model::reset's contract is a full clean slate. The LSTM
+        // submodel (index 0, receptive field 1) is ideal: state shows up immediately.
+        let mut model = container();
+
+        // Probe value a fresh (never-processed) submodel-0 produces.
+        let mut fresh = container();
+        fresh.as_slimmable_mut().unwrap().select(0);
+        let mut probe_fresh = vec![0.3_f32; 8];
+        fresh.process_buffer(&mut probe_fresh);
+
+        // Dirty submodel 0, switch away, reset, switch back: it must be clean again.
+        model.as_slimmable_mut().unwrap().select(0);
+        let mut warm = vec![0.5_f32; 16];
+        model.process_buffer(&mut warm);
+        model.as_slimmable_mut().unwrap().select(2);
+        model.reset();
+        model.as_slimmable_mut().unwrap().select(0);
+        let mut probe = vec![0.3_f32; 8];
+        model.process_buffer(&mut probe);
+
+        for (i, (got, want)) in probe.iter().zip(&probe_fresh).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "reset left submodel 0 dirty at sample {i}: {got} vs fresh {want}"
+            );
+        }
     }
 
     #[test]

@@ -26,6 +26,9 @@ impl Model {
         match &model.config {
             ModelConfig::WaveNet(_) => Ok(Model::WaveNet(WaveNet::new(model)?)),
             ModelConfig::Lstm(_) => Ok(Model::Lstm(Lstm::new(model)?)),
+            ModelConfig::Slimmable(_) => {
+                Err(Error::UnsupportedArchitecture(model.architecture.clone()))
+            }
         }
     }
 

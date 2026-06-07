@@ -94,6 +94,24 @@ pub struct LstmConfig {
     pub num_layers: usize,
 }
 
+/// One entry in a [`SlimmableConfig`]: a complete standalone submodel plus the
+/// width-dial threshold at which it becomes active.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlimmableSubmodel {
+    /// Upper width-dial value this submodel covers (NAM Core `max_value`).
+    pub max_value: f32,
+    /// The submodel itself — a full standalone `.nam` of any architecture.
+    pub model: NamModel,
+}
+
+/// `SlimmableContainer` configuration: an ordered list of standalone submodels
+/// selected at runtime by a width dial. The container holds no weights of its own.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlimmableConfig {
+    /// Submodels in ascending `max_value` order; the last is the full-width model.
+    pub submodels: Vec<SlimmableSubmodel>,
+}
+
 /// Architecture-specific configuration, tagged by `NamModel.architecture`.
 #[derive(Debug, Clone)]
 pub enum ModelConfig {
@@ -102,6 +120,8 @@ pub enum ModelConfig {
     WaveNet(WaveNetConfig),
     /// LSTM: stacked recurrent layers plus a linear head.
     Lstm(LstmConfig),
+    /// SlimmableContainer: a width-selectable set of standalone submodels.
+    Slimmable(SlimmableConfig),
 }
 
 impl<'de> Deserialize<'de> for NamModel {
@@ -132,6 +152,9 @@ impl<'de> Deserialize<'de> for NamModel {
             "LSTM" => {
                 ModelConfig::Lstm(serde_json::from_value(raw.config).map_err(de::Error::custom)?)
             }
+            "SlimmableContainer" => ModelConfig::Slimmable(
+                serde_json::from_value(raw.config).map_err(de::Error::custom)?,
+            ),
             other => {
                 return Err(de::Error::custom(format!(
                     "unsupported model architecture: {other:?}"

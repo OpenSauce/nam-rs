@@ -53,7 +53,7 @@ impl WaveNet {
     pub fn new(model: &NamModel) -> Result<Self, Error> {
         let cfg = match &model.config {
             crate::model::ModelConfig::WaveNet(cfg) => cfg,
-            crate::model::ModelConfig::Lstm(_) => {
+            crate::model::ModelConfig::Lstm(_) | crate::model::ModelConfig::Slimmable(_) => {
                 return Err(Error::UnsupportedArchitecture(model.architecture.clone()))
             }
         };

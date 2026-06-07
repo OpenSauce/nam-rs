@@ -1,6 +1,6 @@
 //! Tests for `.nam` file parsing (the on-disk format → [`NamModel`]).
 
-use nam_rs::{ActivationSpec, ModelConfig, NamModel, DEFAULT_SAMPLE_RATE};
+use nam_rs::{ActivationSpec, ModelConfig, NamModel, SlimmableConfig, DEFAULT_SAMPLE_RATE};
 use nam_rs::{Error, Model};
 
 fn build_fixture(name: &str) -> Result<Model, Error> {
@@ -276,4 +276,26 @@ fn activation_list_form_parses_as_unsupported() {
 fn activation_dict_without_type_is_unsupported() {
     let a = first_layer_activation(&wavenet_with_activation(r#"{"negative_slope":0.01}"#));
     assert!(matches!(a, ActivationSpec::Unsupported(_)));
+}
+
+#[test]
+fn parses_slimmable_container() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/slimmable_container.nam");
+    let json = std::fs::read_to_string(path).expect("read container");
+    let m = NamModel::from_json_str(&json).expect("parse container");
+    assert_eq!(m.architecture, "SlimmableContainer");
+    let cfg: &SlimmableConfig = match &m.config {
+        ModelConfig::Slimmable(c) => c,
+        other => panic!("expected Slimmable config, got {other:?}"),
+    };
+    assert_eq!(cfg.submodels.len(), 3);
+    // max_values are ascending [0.33, 0.66, 1.0].
+    let maxes: Vec<f32> = cfg.submodels.iter().map(|s| s.max_value).collect();
+    assert!((maxes[0] - 0.33).abs() < 1e-6);
+    assert!((maxes[2] - 1.0).abs() < 1e-6);
+    // Submodels are mixed architecture: [LSTM, WaveNet, WaveNet].
+    assert_eq!(cfg.submodels[0].model.architecture, "LSTM");
+    assert_eq!(cfg.submodels[1].model.architecture, "WaveNet");
+    assert_eq!(cfg.submodels[2].model.architecture, "WaveNet");
 }

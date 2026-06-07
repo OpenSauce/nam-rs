@@ -92,8 +92,8 @@ mod wavenet;
 pub use error::Error;
 pub use lstm::Lstm;
 pub use model::{
-    ActivationSpec, LayerArrayConfig, LstmConfig, Metadata, ModelConfig, NamModel, WaveNetConfig,
-    DEFAULT_SAMPLE_RATE,
+    ActivationSpec, LayerArrayConfig, LstmConfig, Metadata, ModelConfig, NamModel,
+    SlimmableConfig, SlimmableSubmodel, WaveNetConfig, DEFAULT_SAMPLE_RATE,
 };
 pub use model_runtime::Model;
 pub use wavenet::WaveNet;

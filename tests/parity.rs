@@ -103,6 +103,8 @@ fn matches_reference_slimmable_container() {
     let base = NamModel::from_json_str(&json).expect("parse container");
     let input = load_samples("input_slim.json");
 
+    // slimmable_container.nam has exactly 3 submodels (indices 0..=2); the oracle
+    // fixtures are committed per index, so this range is fixed, not runtime-derived.
     for i in 0..3 {
         let expected = load_samples(&format!("expected_slim_{i}.json"));
         assert_eq!(input.len(), expected.len(), "fixture length mismatch (submodel {i})");

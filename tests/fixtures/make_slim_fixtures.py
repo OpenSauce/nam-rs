@@ -22,14 +22,16 @@ N = 8192
 
 
 def main():
-    container = json.load(open(os.path.join(HERE, "slimmable_container.nam")))
+    with open(os.path.join(HERE, "slimmable_container.nam")) as f:
+        container = json.load(f)
     submodels = container["config"]["submodels"]
     signal = gf.make_signal(N)
-    json.dump([float(x) for x in signal], open(os.path.join(HERE, "input_slim.json"), "w"))
+    with open(os.path.join(HERE, "input_slim.json"), "w") as f:
+        json.dump([float(x) for x in signal], f)
     for i, sm in enumerate(submodels):
         out = gf.forward(sm["model"], signal)
-        path = os.path.join(HERE, f"expected_slim_{i}.json")
-        json.dump([float(x) for x in out], open(path, "w"))
+        with open(os.path.join(HERE, f"expected_slim_{i}.json"), "w") as f:
+            json.dump([float(x) for x in out], f)
         print(f"submodel[{i}] arch={sm['model']['architecture']} "
               f"max_value={sm['max_value']} -> expected_slim_{i}.json ({len(out)} samples)")
 

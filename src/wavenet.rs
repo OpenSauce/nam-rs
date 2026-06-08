@@ -273,10 +273,13 @@ impl WaveNet {
     }
 }
 
-/// Reject A2 features whose forward pass is not implemented yet, with a clear
-/// [`Error::UnsupportedFeature`] (rather than silently mis-running). This is the
-/// inverse of the old key-denylist: we now check typed fields. Each rejected case
-/// is implemented in a later phase, at which point its check is removed here.
+/// Reject WaveNet-top-level features whose forward pass is not implemented yet, with
+/// a clear [`Error::UnsupportedFeature`] (rather than silently mis-running). The
+/// per-layer A2 features (grouped convs, head1x1, bottleneck≠channels, all 8 FiLM
+/// sites, BLENDED gating, non-sigmoid secondaries, inactive layer1x1) are now fully
+/// supported by [`Layer`]; only the WaveNet-top-level scope (post-stack head,
+/// condition DSP, multi-channel input) and the within-array mixed-gating case remain
+/// unsupported.
 fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
     if cfg.post_stack_head.is_some() {
         return Err(Error::UnsupportedFeature("post-stack head".into()));
@@ -288,54 +291,14 @@ fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
         return Err(Error::UnsupportedFeature("in_channels != 1".into()));
     }
     for la in &cfg.layers {
-        if la.bottleneck != la.channels {
-            return Err(Error::UnsupportedFeature("bottleneck != channels".into()));
-        }
-        if !la.layer1x1.active {
-            return Err(Error::UnsupportedFeature("inactive layer1x1".into()));
-        }
-        if la.layer1x1.groups != 1 {
-            return Err(Error::UnsupportedFeature("grouped layer1x1".into()));
-        }
-        if la.head1x1.active {
-            return Err(Error::UnsupportedFeature("head1x1".into()));
-        }
-        if la.groups_input != 1 || la.groups_input_mixin != 1 {
-            return Err(Error::UnsupportedFeature("grouped input conv".into()));
-        }
-        for f in [
-            &la.conv_pre_film,
-            &la.conv_post_film,
-            &la.input_mixin_pre_film,
-            &la.input_mixin_post_film,
-            &la.activation_pre_film,
-            &la.activation_post_film,
-            &la.layer1x1_post_film,
-            &la.head1x1_post_film,
-        ] {
-            if f.active {
-                return Err(Error::UnsupportedFeature("FiLM".into()));
-            }
-        }
+        // The array builds one `Gating` from the uniform `gating_mode()`; a layer-array
+        // mixing modes across its layers is still unsupported.
         let first = la.gating_mode();
         if la.gating_modes.iter().any(|&g| g != first) {
             return Err(Error::UnsupportedFeature("mixed gating modes".into()));
         }
-        if first == GatingMode::Blended {
-            return Err(Error::UnsupportedFeature("blended gating".into()));
-        }
-        if first == GatingMode::Gated && la.secondary_activations.iter().any(|s| !is_sigmoid(s)) {
-            return Err(Error::UnsupportedFeature(
-                "non-sigmoid secondary activation".into(),
-            ));
-        }
     }
     Ok(())
-}
-
-/// True if `spec` is the (default) Sigmoid secondary activation.
-fn is_sigmoid(spec: &crate::model::ActivationSpec) -> bool {
-    matches!(spec, crate::model::ActivationSpec::Named { name, .. } if name == "Sigmoid")
 }
 
 /// Receptive field implied by `config`: per layer `(kernel_size - 1)·dilation`,
@@ -978,5 +941,71 @@ mod tests {
                 "sample {i}: block {g} vs per-sample {w}"
             );
         }
+    }
+
+    #[test]
+    fn formerly_guarded_a2_features_now_build() {
+        // grouped input conv + head1x1 + bottleneck<channels + FiLM + BLENDED + non-sigmoid
+        // secondary, in one array. Weight count drives the (zeroed) blob length.
+        let json = r#"{
+            "version":"0.7.0","architecture":"WaveNet","config":{"layers":[{
+                "input_size":1,"condition_size":1,"channels":4,"bottleneck":2,
+                "dilations":[1,2],"kernel_sizes":[3,3],
+                "activation":[{"type":"Tanh"},{"type":"Tanh"}],
+                "gating_mode":["blended","blended"],
+                "secondary_activation":[{"type":"Tanh"},{"type":"Tanh"}],
+                "groups_input":2,"groups_input_mixin":1,
+                "layer1x1":{"active":true,"groups":2},
+                "head1x1":{"active":true,"out_channels":3,"groups":1},
+                "head":{"out_channels":1,"kernel_size":1,"bias":false},
+                "conv_post_film":{"active":true,"shift":true,"groups":1},
+                "activation_post_film":{"active":true,"shift":false,"groups":1},
+                "layer1x1_post_film":{"active":true,"shift":false,"groups":1}
+            }],"head":null,"head_scale":0.5},"weights":[]}"#;
+        let m0 = NamModel::from_json_str(json).unwrap();
+        let cfg = match &m0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n = expected_weight_count(cfg).unwrap();
+        let weights: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.02).collect();
+        let model = NamModel {
+            version: "0.7.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights,
+            sample_rate: None,
+            metadata: None,
+        };
+        assert!(
+            WaveNet::new(&model).is_ok(),
+            "full A2 feature layer must build now"
+        );
+
+        // Inactive-layer1x1 (bottleneck==channels) also builds.
+        let json2 = r#"{"version":"0.7.0","architecture":"WaveNet","config":{"layers":[{
+            "input_size":1,"condition_size":1,"channels":2,"bottleneck":2,
+            "dilations":[1],"kernel_sizes":[3],"activation":[{"type":"ReLU"}],
+            "gating_mode":["none"],"layer1x1":{"active":false,"groups":1},
+            "head":{"out_channels":1,"kernel_size":1,"bias":false}}],
+            "head":null,"head_scale":0.5},"weights":[]}"#;
+        let m2 = NamModel::from_json_str(json2).unwrap();
+        let c2 = match &m2.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n2 = expected_weight_count(c2).unwrap();
+        let model2 = NamModel {
+            version: "0.7.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(c2.clone()),
+            weights: vec![0.0; n2],
+            sample_rate: None,
+            metadata: None,
+        };
+        assert!(
+            WaveNet::new(&model2).is_ok(),
+            "inactive layer1x1 must build now"
+        );
     }
 }

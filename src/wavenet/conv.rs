@@ -28,6 +28,12 @@ pub(super) struct Conv1d {
     out_ch: usize,
     kernel: usize,
     dilation: usize,
+    /// Number of convolution groups (block-diagonal). `1` is the dense fast path.
+    groups: usize,
+    /// `out_ch / groups`.
+    out_per_group: usize,
+    /// `in_ch / groups`.
+    in_per_group: usize,
     /// `[out_ch][in_ch][kernel]`, row-major.
     weights: Vec<f32>,
     bias: Option<Vec<f32>>,
@@ -44,6 +50,7 @@ pub(super) struct Conv1d {
 }
 
 impl Conv1d {
+    /// Dense (ungrouped) convolution — `groups = 1`.
     pub(super) fn new(
         in_ch: usize,
         out_ch: usize,
@@ -52,7 +59,30 @@ impl Conv1d {
         weights: Vec<f32>,
         bias: Option<Vec<f32>>,
     ) -> Self {
-        assert_eq!(weights.len(), out_ch * in_ch * kernel, "conv weight count");
+        Self::new_grouped(in_ch, out_ch, kernel, dilation, 1, weights, bias)
+    }
+
+    /// Grouped convolution. Weights are **compact** (no off-block zeros), laid out in
+    /// NAMCore order: group-major, then out-per-group, then in-per-group, then tap —
+    /// i.e. `idx(g,i,j,k) = (((g*out_per_group + i)*in_per_group) + j)*kernel + k`.
+    /// `groups = 1` reduces this to the dense `[out][in][kernel]` layout exactly.
+    pub(super) fn new_grouped(
+        in_ch: usize,
+        out_ch: usize,
+        kernel: usize,
+        dilation: usize,
+        groups: usize,
+        weights: Vec<f32>,
+        bias: Option<Vec<f32>>,
+    ) -> Self {
+        assert!(groups >= 1, "conv groups must be >= 1");
+        assert_eq!(in_ch % groups, 0, "in_ch must be divisible by groups");
+        assert_eq!(out_ch % groups, 0, "out_ch must be divisible by groups");
+        assert_eq!(
+            weights.len(),
+            out_ch * in_ch * kernel / groups,
+            "grouped conv weight count"
+        );
         if let Some(b) = &bias {
             assert_eq!(b.len(), out_ch, "conv bias count");
         }
@@ -63,6 +93,9 @@ impl Conv1d {
             out_ch,
             kernel,
             dilation,
+            groups,
+            out_per_group: out_ch / groups,
+            in_per_group: in_ch / groups,
             weights,
             bias,
             ring: vec![0.0; in_ch * ring_len],
@@ -354,6 +387,15 @@ mod tests {
                 t0 += len;
             }
         }
+    }
+
+    #[test]
+    fn grouped_constructor_accepts_compact_weight_count() {
+        // out=4, in=4, kernel=2, groups=2 -> out_per_group=2, in_per_group=2.
+        // Compact weight count = 4*4*2 / 2 = 16. Plus 4 bias entries.
+        let w: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let conv = Conv1d::new_grouped(4, 4, 2, 1, 2, w, Some(vec![0.0; 4]));
+        assert_eq!(conv.out_ch(), 4);
     }
 
     #[test]

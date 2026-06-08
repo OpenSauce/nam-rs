@@ -168,6 +168,47 @@ fn conv_head_matches_namcore_oracle() {
     );
 }
 
+/// End-to-end parity for the committed synthetic A2 fixtures: each `a2_*.nam` run
+/// through nam-rs must equal the NAMCore oracle output in steady state within
+/// TOLERANCE. CI-safe (committed fixtures; skips cleanly if any are absent).
+#[test]
+fn a2_synthetic_fixtures_match_namcore_oracle() {
+    for name in [
+        "grouped",
+        "film",
+        "gated",
+        "blended",
+        "head1x1",
+        "bottleneck",
+    ] {
+        let model_file = format!("a2_{name}.nam");
+        let in_file = format!("input_a2_{name}.json");
+        let exp_file = format!("expected_a2_{name}.json");
+        if !fixture(&model_file).exists() || !fixture(&exp_file).exists() {
+            eprintln!("skip a2_{name}: fixture missing");
+            continue;
+        }
+        let json = std::fs::read_to_string(fixture(&model_file)).unwrap();
+        let model = NamModel::from_json_str(&json).expect("parse a2 synthetic");
+        let mut net = Model::from_nam(&model).expect("a2 synthetic builds");
+        let input = load_samples(&in_file);
+        let expected = load_samples(&exp_file);
+        assert_eq!(input.len(), expected.len());
+        let rf = net.receptive_field();
+        let mut signal = input.clone();
+        net.process_buffer(&mut signal);
+        let max_err = signal[rf..]
+            .iter()
+            .zip(&expected[rf..])
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_err <= TOLERANCE,
+            "a2_{name}: max steady-state err {max_err} > {TOLERANCE}"
+        );
+    }
+}
+
 /// End-to-end parity for the real A2 captures (gitignored). For each file, compare
 /// nam-rs against the NAMCore oracle binary on the same input, in steady state.
 /// Skips when the oracle binary or the capture files are absent (e.g. CI).

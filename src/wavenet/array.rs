@@ -74,6 +74,13 @@ impl LayerArray {
         self.channels
     }
 
+    /// Width of the head accumulator / incoming-head buffer (`head1x1.active ?
+    /// head1x1_out : bottleneck`). The previous array's `head_size` output is seeded
+    /// into a buffer of this width.
+    pub(super) fn head_in(&self) -> usize {
+        self.head_in
+    }
+
     pub(super) fn head_size(&self) -> usize {
         self.head_size
     }

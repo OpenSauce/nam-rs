@@ -33,8 +33,9 @@ pub struct WaveNet {
     /// Samples of input history the deepest dilated tap reaches back over; equals
     /// the model's warmup length / processing latency in samples.
     receptive_field: usize,
-    /// Channel width of the first array (its incoming head is silence this wide).
-    channels0: usize,
+    /// Head-accumulator width of the first array (its incoming head is silence this
+    /// wide).
+    head_in0: usize,
     /// Head signal carried between arrays (two buffers, ping-ponged).
     head_a: Vec<f32>,
     head_b: Vec<f32>,
@@ -77,20 +78,21 @@ impl WaveNet {
         for la in &cfg.layers {
             arrays.push(build_array(&mut r, la)?);
         }
-        // Head-carry invariant: each array's head output feeds the next array's head
-        // input, and the per-sample/per-block paths size that carried buffer by the
-        // *consumer's* channel count (`arrays[i].channels()`). So the producer's head
-        // width must match: `arrays[i-1].head_size() == arrays[i].channels()`. Holds
-        // for every real model and the 2-array A1 parity fixture; guard it explicitly
-        // so a future multi-array A2 model that chains mismatched widths fails loudly
+        // Head-carry invariant: each array's head *output* (its `head_size`-wide head
+        // rechannel result) is seeded into the next array's head *accumulator*, whose
+        // width is that array's `head_in` (`head1x1.active ? head1x1_out : bottleneck`).
+        // So the producer's head width must match the consumer's accumulator width:
+        // `arrays[i-1].head_size() == arrays[i].head_in()`. (For A1, head_in == channels
+        // == head_size, so this reduces to the old `head_size == channels` chain.) Guard
+        // it explicitly so a multi-array model chaining mismatched widths fails loudly
         // here instead of silently reading stale/garbage head rows.
         for i in 1..arrays.len() {
             let produced = arrays[i - 1].head_size();
-            let consumed = arrays[i].channels();
+            let consumed = arrays[i].head_in();
             if produced != consumed {
                 return Err(Error::UnsupportedFeature(format!(
                     "layer-array head-carry width mismatch: array {} head_size {produced} \
-                     != array {i} channels {consumed}",
+                     != array {i} head_in {consumed}",
                     i - 1
                 )));
             }
@@ -111,15 +113,19 @@ impl WaveNet {
 
         let max_ch = arrays.iter().map(LayerArray::channels).max().unwrap_or(1);
         let max_head = arrays.iter().map(LayerArray::head_size).max().unwrap_or(1);
-        let head_w = max_ch.max(max_head).max(1);
+        let max_head_in = arrays.iter().map(LayerArray::head_in).max().unwrap_or(1);
+        // The head carry buffer holds either a producer's `head_size`-wide output or a
+        // consumer's `head_in`-wide accumulator seed, so size it to the max of both.
+        let head_w = max_ch.max(max_head).max(max_head_in).max(1);
         let sig_w = max_ch.max(1);
-        let channels0 = arrays.first().map_or(0, LayerArray::channels);
+        // First array's incoming head is silence of its accumulator width (`head_in`).
+        let head_in0 = arrays.first().map_or(0, LayerArray::head_in);
 
         Ok(Self {
             arrays,
             head_scale,
             receptive_field: receptive_field(cfg),
-            channels0,
+            head_in0,
             head_a: vec![0.0; head_w],
             head_b: vec![0.0; head_w],
             sig_a: vec![0.0; sig_w],
@@ -174,15 +180,16 @@ impl WaveNet {
         self.cond_blk[..n].copy_from_slice(chunk);
 
         // First array: input and condition are the mono signal; the incoming head is
-        // silence of the array's channel width.
-        self.head_a_blk[..self.channels0 * n].fill(0.0);
+        // silence of the array's head-accumulator width (`head_in`).
+        self.head_a_blk[..self.head_in0 * n].fill(0.0);
         {
+            let hin = self.arrays[0].head_in();
             let ch = self.arrays[0].channels();
             let hs = self.arrays[0].head_size();
             self.arrays[0].process_block(
                 &self.cond_blk[..n],
                 &self.cond_blk[..n],
-                &self.head_a_blk[..ch * n],
+                &self.head_a_blk[..hin * n],
                 &mut self.head_b_blk[..hs * n],
                 &mut self.sig_b_blk[..ch * n],
                 n,
@@ -193,12 +200,13 @@ impl WaveNet {
 
         for i in 1..self.arrays.len() {
             let in_w = self.arrays[i - 1].channels();
+            let hin = self.arrays[i].head_in();
             let ch = self.arrays[i].channels();
             let hs = self.arrays[i].head_size();
             self.arrays[i].process_block(
                 &self.sig_a_blk[..in_w * n],
                 &self.cond_blk[..n],
-                &self.head_a_blk[..ch * n],
+                &self.head_a_blk[..hin * n],
                 &mut self.head_b_blk[..hs * n],
                 &mut self.sig_b_blk[..ch * n],
                 n,
@@ -226,15 +234,16 @@ impl WaveNet {
         }
 
         // First array: input and condition are the mono sample; the incoming head
-        // is silence of the array's channel width.
-        self.head_a[..self.channels0].fill(0.0);
+        // is silence of the array's head-accumulator width (`head_in`).
+        self.head_a[..self.head_in0].fill(0.0);
         {
+            let hin = self.arrays[0].head_in();
             let ch = self.arrays[0].channels();
             let hs = self.arrays[0].head_size();
             self.arrays[0].process_sample(
                 &cond,
                 &cond,
-                &self.head_a[..ch],
+                &self.head_a[..hin],
                 &mut self.head_b[..hs],
                 &mut self.sig_b[..ch],
             );
@@ -244,12 +253,13 @@ impl WaveNet {
 
         for i in 1..n {
             let in_w = self.arrays[i - 1].channels();
+            let hin = self.arrays[i].head_in();
             let ch = self.arrays[i].channels();
             let hs = self.arrays[i].head_size();
             self.arrays[i].process_sample(
                 &self.sig_a[..in_w],
                 &cond,
-                &self.head_a[..ch],
+                &self.head_a[..hin],
                 &mut self.head_b[..hs],
                 &mut self.sig_b[..ch],
             );

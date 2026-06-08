@@ -5,7 +5,10 @@
 // (a flat JSON array). NAM_SAMPLE is double by default in NAMCore.
 #include <cmath>
 #include <cstdio>
+#include <exception>
+#include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>

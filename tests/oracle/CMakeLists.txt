@@ -25,7 +25,12 @@ target_include_directories(oracle SYSTEM PRIVATE
 # semantics are exactly the engine we port.
 # (NAM_ENABLE_A2_FAST is left undefined -> generic path.)
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# Pre-GCC-9 keeps <filesystem> in a separate libstdc++fs that must be linked
+# explicitly; GCC 9+ folds it into libstdc++ and the standalone lib is often
+# absent, so linking it unconditionally is a hard error on modern toolchains.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux"
+    AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+    AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
   target_link_libraries(oracle PRIVATE stdc++fs)
 endif()
 target_compile_features(oracle PRIVATE cxx_std_20)

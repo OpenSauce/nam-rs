@@ -297,6 +297,13 @@ pub struct Layer1x1Config {
     pub groups: usize,
 }
 
+/// Read an optional unsigned-int field off a JSON object as `usize`. `None` when
+/// the key is absent or not a non-negative integer. Centralizes the
+/// `get(key).and_then(as_u64).map(as usize)` shape used across the config decoders.
+fn opt_usize(o: &serde_json::Value, key: &str) -> Option<usize> {
+    o.get(key).and_then(|x| x.as_u64()).map(|x| x as usize)
+}
+
 impl Layer1x1Config {
     pub(crate) fn from_json(v: Option<&serde_json::Value>) -> Self {
         match v {
@@ -306,11 +313,7 @@ impl Layer1x1Config {
             },
             Some(o) => Self {
                 active: o.get("active").and_then(|x| x.as_bool()).unwrap_or(true),
-                groups: o
-                    .get("groups")
-                    .and_then(|x| x.as_u64())
-                    .map(|x| x as usize)
-                    .unwrap_or(1),
+                groups: opt_usize(o, "groups").unwrap_or(1),
             },
         }
     }
@@ -339,15 +342,8 @@ impl Head1x1Config {
             },
             Some(o) => Self {
                 active: o.get("active").and_then(|x| x.as_bool()).unwrap_or(false),
-                out_channels: o
-                    .get("out_channels")
-                    .and_then(|x| x.as_u64())
-                    .map(|x| x as usize),
-                groups: o
-                    .get("groups")
-                    .and_then(|x| x.as_u64())
-                    .map(|x| x as usize)
-                    .unwrap_or(1),
+                out_channels: opt_usize(o, "out_channels"),
+                groups: opt_usize(o, "groups").unwrap_or(1),
             },
         }
     }
@@ -380,11 +376,7 @@ impl FilmConfig {
             Some(o) => Self {
                 active: o.get("active").and_then(|x| x.as_bool()).unwrap_or(true),
                 shift: o.get("shift").and_then(|x| x.as_bool()).unwrap_or(true),
-                groups: o
-                    .get("groups")
-                    .and_then(|x| x.as_u64())
-                    .map(|x| x as usize)
-                    .unwrap_or(1),
+                groups: opt_usize(o, "groups").unwrap_or(1),
             },
         }
     }
@@ -562,7 +554,10 @@ impl LayerArrayConfig {
     /// site (which would panic on a directly-constructed empty-vec config, since the
     /// struct is `pub`). Returns [`GatingMode::None`] for an empty list.
     pub fn gating_mode(&self) -> GatingMode {
-        self.gating_modes.first().copied().unwrap_or(GatingMode::None)
+        self.gating_modes
+            .first()
+            .copied()
+            .unwrap_or(GatingMode::None)
     }
 }
 
@@ -647,6 +642,9 @@ impl RawLayerArrayConfig {
 
         let activations = broadcast_activations(&self.activation, n)?;
 
+        // `gating_mode` (A2, per-layer enum) supersedes the legacy boolean `gated`
+        // (A1) when both are present: the richer field wins silently. In practice a
+        // file carries one or the other, so the conflict is theoretical.
         let gating_modes = match (&self.gating_mode, self.gated) {
             (Some(v), _) => broadcast_gating(v, n)?,
             (None, Some(true)) => vec![GatingMode::Gated; n],
@@ -668,6 +666,10 @@ impl RawLayerArrayConfig {
                     .get("kernel_size")
                     .and_then(|x| x.as_u64())
                     .ok_or("layer head missing kernel_size")? as usize;
+                // NAMCore requires `bias` on a nested head object (`.at("bias")`
+                // throws if absent). We're leniently defaulting to `true` — the value
+                // every real exporter writes — so a hand-edited file missing it still
+                // loads with the NAMCore-default behavior rather than erroring.
                 let bias = h.get("bias").and_then(|x| x.as_bool()).unwrap_or(true);
                 (out, k, bias)
             }
@@ -738,79 +740,56 @@ fn default_sigmoid() -> ActivationSpec {
 }
 
 /// Broadcast a single activation or expand a per-layer list to length `n`.
-fn broadcast_activations(v: &serde_json::Value, n: usize) -> Result<Vec<ActivationSpec>, String> {
+/// Expand a per-layer field to length `n`: a JSON array must already be exactly
+/// `n` long (each element parsed by `parse`); any other (scalar) value is parsed
+/// once and broadcast to all `n` layers. `kind` names the field in length errors.
+fn broadcast<T: Clone>(
+    v: &serde_json::Value,
+    n: usize,
+    kind: &str,
+    parse: impl Fn(&serde_json::Value) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
     match v {
         serde_json::Value::Array(items) => {
             if items.len() != n {
                 return Err(format!(
-                    "activation list length {} != number of layers {n}",
+                    "{kind} list length {} != number of layers {n}",
                     items.len()
                 ));
             }
-            items
-                .iter()
-                .map(|e| {
-                    serde_json::from_value::<ActivationSpec>(e.clone()).map_err(|e| e.to_string())
-                })
-                .collect()
+            items.iter().map(&parse).collect()
         }
-        other => {
-            let a = serde_json::from_value::<ActivationSpec>(other.clone())
-                .map_err(|e| e.to_string())?;
-            Ok(vec![a; n])
-        }
+        other => Ok(vec![parse(other)?; n]),
     }
+}
+
+fn parse_activation(e: &serde_json::Value) -> Result<ActivationSpec, String> {
+    serde_json::from_value::<ActivationSpec>(e.clone()).map_err(|e| e.to_string())
+}
+
+fn broadcast_activations(v: &serde_json::Value, n: usize) -> Result<Vec<ActivationSpec>, String> {
+    broadcast(v, n, "activation", parse_activation)
 }
 
 /// Broadcast/expand `secondary_activation`; JSON `null` elements become the
 /// Sigmoid default (NAMCore's default secondary).
 fn broadcast_secondary(v: &serde_json::Value, n: usize) -> Result<Vec<ActivationSpec>, String> {
-    let one = |e: &serde_json::Value| -> Result<ActivationSpec, String> {
+    broadcast(v, n, "secondary_activation", |e| {
         if e.is_null() {
             Ok(default_sigmoid())
         } else {
-            serde_json::from_value::<ActivationSpec>(e.clone()).map_err(|e| e.to_string())
+            parse_activation(e)
         }
-    };
-    match v {
-        serde_json::Value::Array(items) => {
-            if items.len() != n {
-                return Err(format!(
-                    "secondary_activation list length {} != {n}",
-                    items.len()
-                ));
-            }
-            items.iter().map(one).collect()
-        }
-        other => Ok(vec![one(other)?; n]),
-    }
+    })
 }
 
 /// Broadcast a single gating name or expand a per-layer list to length `n`.
 fn broadcast_gating(v: &serde_json::Value, n: usize) -> Result<Vec<GatingMode>, String> {
-    match v {
-        serde_json::Value::String(s) => {
-            let g = GatingMode::from_name(s)?;
-            Ok(vec![g; n])
-        }
-        serde_json::Value::Array(items) => {
-            if items.len() != n {
-                return Err(format!(
-                    "gating_mode list length {} != number of layers {n}",
-                    items.len()
-                ));
-            }
-            items
-                .iter()
-                .map(|e| {
-                    e.as_str()
-                        .ok_or_else(|| "gating_mode entry is not a string".to_string())
-                        .and_then(GatingMode::from_name)
-                })
-                .collect()
-        }
-        _ => Err("gating_mode is neither a string nor a list".into()),
-    }
+    broadcast(v, n, "gating_mode", |e| {
+        e.as_str()
+            .ok_or_else(|| "gating_mode entry is not a string".to_string())
+            .and_then(GatingMode::from_name)
+    })
 }
 
 #[cfg(test)]

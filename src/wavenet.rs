@@ -467,7 +467,9 @@ mod tests {
 
     #[test]
     fn receptive_field_sums_dilated_taps() {
-        // 1 + Σ(k-1)·d. Mirrors the reference model: kernel 3, dilations [1,2] then [8].
+        // rf = 1 + Σ(k-1)·d + Σ(head_kernel_size-1) over all arrays. Here the head
+        // kernel is 1 so its term vanishes; mirrors the reference model: kernel 3,
+        // dilations [1,2] then [8].
         let cfg = WaveNetConfig {
             layers: vec![
                 mk_layer(serde_json::json!({
@@ -655,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn a2_flexible_features_are_cleanly_guarded_not_a_parse_error() {
+    fn a2_leaky_relu_and_conv_head_parse_and_build() {
         // LeakyReLU + multi-tap conv head (kernel_size=16) are now fully supported.
         // Verify the config parses and builds (weight count determines valid input).
         let json = r#"{

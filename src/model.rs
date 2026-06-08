@@ -262,6 +262,106 @@ impl NamModel {
     }
 }
 
+/// Activation gating mode for a WaveNet layer (NAMCore `GatingMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatingMode {
+    /// No gating: `out = activation(z)`.
+    None,
+    /// Gated: `out = primary(z_a) * secondary(z_b)` (classic `tanh*sigmoid`).
+    Gated,
+    /// Blended: `out = α·primary(z_a) + (1-α)·z_a`, `α = secondary(z_b)`.
+    Blended,
+}
+
+impl GatingMode {
+    /// Parse a NAMCore gating-mode name (`"none"`/`"gated"`/`"blended"`).
+    pub(crate) fn from_name(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(Self::None),
+            "gated" => Ok(Self::Gated),
+            "blended" => Ok(Self::Blended),
+            other => Err(format!("unknown gating_mode: {other:?}")),
+        }
+    }
+}
+
+/// A layer's residual 1×1 (`layer1x1`): maps the activated bottleneck back to
+/// `channels`. Active by default (the A1 `_1x1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layer1x1Config {
+    /// Whether the 1×1 is present (inactive ⇒ identity residual, needs bottleneck==channels).
+    pub active: bool,
+    /// Grouped-conv group count (1 = dense).
+    pub groups: usize,
+}
+
+impl Layer1x1Config {
+    pub(crate) fn from_json(v: Option<&serde_json::Value>) -> Self {
+        match v {
+            None => Self { active: true, groups: 1 },
+            Some(o) => Self {
+                active: o.get("active").and_then(|x| x.as_bool()).unwrap_or(true),
+                groups: o.get("groups").and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(1),
+            },
+        }
+    }
+}
+
+/// A layer's head 1×1 (`head1x1`): an optional 1×1 producing this layer's head
+/// contribution. Inactive by default (then the head contribution is the activated
+/// bottleneck directly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Head1x1Config {
+    /// Whether the head 1×1 is present.
+    pub active: bool,
+    /// Output channels (defaults to `channels` when active and unspecified).
+    pub out_channels: Option<usize>,
+    /// Grouped-conv group count.
+    pub groups: usize,
+}
+
+impl Head1x1Config {
+    pub(crate) fn from_json(v: Option<&serde_json::Value>) -> Self {
+        match v {
+            None => Self { active: false, out_channels: None, groups: 1 },
+            Some(o) => Self {
+                active: o.get("active").and_then(|x| x.as_bool()).unwrap_or(false),
+                out_channels: o.get("out_channels").and_then(|x| x.as_u64()).map(|x| x as usize),
+                groups: o.get("groups").and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(1),
+            },
+        }
+    }
+}
+
+/// One FiLM block (`*_pre_film` / `*_post_film`): conditions a scale (+ optional
+/// shift) from the conditioning signal. Absent or `false` ⇒ inactive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilmConfig {
+    /// Whether this FiLM site is applied.
+    pub active: bool,
+    /// Whether it adds a shift term (else scale-only).
+    pub shift: bool,
+    /// Grouped-conv group count for the conditioning 1×1.
+    pub groups: usize,
+}
+
+impl FilmConfig {
+    /// The inactive default (absent key or explicit `false`).
+    pub const INACTIVE: Self = Self { active: false, shift: false, groups: 1 };
+
+    pub(crate) fn from_json(v: Option<&serde_json::Value>) -> Self {
+        match v {
+            None => Self::INACTIVE,
+            Some(serde_json::Value::Bool(false)) => Self::INACTIVE,
+            Some(o) => Self {
+                active: o.get("active").and_then(|x| x.as_bool()).unwrap_or(true),
+                shift: o.get("shift").and_then(|x| x.as_bool()).unwrap_or(true),
+                groups: o.get("groups").and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(1),
+            },
+        }
+    }
+}
+
 /// WaveNet configuration: a sequence of layer-arrays plus a final output scale.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WaveNetConfig {
@@ -308,4 +408,56 @@ pub struct LayerArrayConfig {
     /// training key `slimmable` lives here too and is allowlisted.
     #[serde(flatten)]
     pub(crate) extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[cfg(test)]
+mod a2_subconfig_tests {
+    use super::*;
+
+    #[test]
+    fn gating_mode_from_str() {
+        assert_eq!(GatingMode::from_name("none").unwrap(), GatingMode::None);
+        assert_eq!(GatingMode::from_name("gated").unwrap(), GatingMode::Gated);
+        assert_eq!(GatingMode::from_name("blended").unwrap(), GatingMode::Blended);
+        assert!(GatingMode::from_name("wat").is_err());
+    }
+
+    #[test]
+    fn film_absent_or_false_is_inactive() {
+        assert_eq!(FilmConfig::from_json(None), FilmConfig::INACTIVE);
+        assert_eq!(
+            FilmConfig::from_json(Some(&serde_json::json!(false))),
+            FilmConfig::INACTIVE
+        );
+    }
+
+    #[test]
+    fn film_object_defaults_active_shift_groups() {
+        let v = serde_json::json!({});
+        let f = FilmConfig::from_json(Some(&v));
+        assert_eq!(f, FilmConfig { active: true, shift: true, groups: 1 });
+        let v = serde_json::json!({"active": false, "shift": false, "groups": 2});
+        assert_eq!(
+            FilmConfig::from_json(Some(&v)),
+            FilmConfig { active: false, shift: false, groups: 2 }
+        );
+    }
+
+    #[test]
+    fn layer1x1_defaults_active_true_groups_1() {
+        assert_eq!(Layer1x1Config::from_json(None), Layer1x1Config { active: true, groups: 1 });
+        let v = serde_json::json!({"active": true, "groups": 1});
+        assert_eq!(Layer1x1Config::from_json(Some(&v)), Layer1x1Config { active: true, groups: 1 });
+    }
+
+    #[test]
+    fn head1x1_defaults_inactive() {
+        let h = Head1x1Config::from_json(None);
+        assert_eq!(h, Head1x1Config { active: false, out_channels: None, groups: 1 });
+        let v = serde_json::json!({"active": false, "out_channels": 1, "groups": 1});
+        assert_eq!(
+            Head1x1Config::from_json(Some(&v)),
+            Head1x1Config { active: false, out_channels: Some(1), groups: 1 }
+        );
+    }
 }

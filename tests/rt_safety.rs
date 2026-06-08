@@ -72,6 +72,25 @@ fn post_stack_head_process_buffer_does_not_allocate() {
 }
 
 #[test]
+fn condition_dsp_process_buffer_does_not_allocate() {
+    // The nested condition_dsp model runs on the hot path: its output replaces the
+    // array conditioning. The nested `Model::process_buffer` is RT-safe by contract,
+    // and the parent's feeding scratch (`cond_dsp_out`) is pre-allocated in `new`, so
+    // the whole `process_buffer` must stay alloc-free.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/condition_dsp_mono.nam");
+    let json = std::fs::read_to_string(path).expect("condition_dsp_mono.nam");
+    let model = NamModel::from_json_str(&json).expect("parse model");
+    let mut wn = WaveNet::new(&model).expect("build WaveNet");
+    let mut buffer = vec![0.0_f32; 2100]; // > MAX_BLOCK
+
+    wn.process_buffer(&mut buffer); // warm up off-guard (both nested + outer)
+    assert_no_alloc(|| {
+        wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
 fn a2_synthetic_process_buffer_does_not_allocate() {
     // The richest A2 path: FiLM + BLENDED gating + layer1x1_post_film. Every FiLM owns
     // pre-allocated scratch, Gating is scratchless, and the Layer's `*_blk` buffers are

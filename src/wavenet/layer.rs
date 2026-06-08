@@ -607,6 +607,96 @@ mod tests {
         assert_eq!(layer.head_contrib_width(), 1);
     }
 
+    #[test]
+    fn blended_layer_matches_hand_values() {
+        // channels=1, bottleneck=1 (mid=2), no FiLM, no head1x1, layer1x1 active.
+        // z = [v, g] = [-2.0, 0.0]: conv [out=2][in=1][k=1] = [-2.0, 0.0], bias [0,0],
+        // mix [0,0], input 1.0, cond 0. alpha=sigmoid(0)=0.5;
+        // act = 0.5*relu(-2) + 0.5*(-2) = -1.0. head_accum += -1.0.
+        // residual: out = input + layer1x1(act) = 1.0 + 1.0*(-1.0) = 0.0.
+        let gating = Gating::new(
+            GatingMode::Blended,
+            Activation::Relu,
+            Activation::Sigmoid,
+            1,
+        );
+        let mut layer = Layer::new(
+            LayerDims {
+                channels: 1,
+                bottleneck: 1,
+                condition_size: 1,
+                kernel: 1,
+                dilation: 1,
+                groups_input: 1,
+                groups_input_mixin: 1,
+                layer1x1_groups: 1,
+                head1x1_groups: 1,
+                head1x1_out: None,
+                film_shift: [false; 8],
+                film_groups: [1; 8],
+            },
+            gating,
+            Activation::Relu,
+            LayerWeights {
+                conv_w: vec![-2.0, 0.0],
+                conv_b: vec![0.0, 0.0],
+                mix_w: vec![0.0, 0.0],
+                layer1x1_w: Some(vec![1.0]),
+                layer1x1_b: Some(vec![0.0]),
+                head1x1_w: None,
+                head1x1_b: None,
+                films: [None, None, None, None, None, None, None, None],
+            },
+        );
+        let mut head = vec![0.0];
+        let mut out = vec![0.0];
+        layer.process_sample(&[1.0], &[0.0], &mut head, &mut out);
+        assert!((head[0] - (-1.0)).abs() < 1e-6, "head={}", head[0]);
+        assert!((out[0] - 0.0).abs() < 1e-6, "out={}", out[0]);
+    }
+
+    #[test]
+    fn bottleneck_smaller_than_channels_routes_through_layer1x1() {
+        // channels=2, bottleneck=1, NONE, ReLU. mid=1. layer1x1 maps bn(1)->channels(2).
+        // conv [out=1][in=2][k=1] = [1.0, 0.0] bias [0]; mix [0,0]; input=[3.0, 7.0] cond 0.
+        // z = 1*3 + 0*7 = 3 ; act = relu(3) = 3. layer1x1 W [out=2][in=1] = [2.0, -1.0] b [0,0].
+        // res = [2*3, -1*3] = [6, -3]. out = input + res = [3+6, 7-3] = [9, 4]. head += [3].
+        let gating = Gating::new(GatingMode::None, Activation::Relu, Activation::Sigmoid, 1);
+        let mut layer = Layer::new(
+            LayerDims {
+                channels: 2,
+                bottleneck: 1,
+                condition_size: 1,
+                kernel: 1,
+                dilation: 1,
+                groups_input: 1,
+                groups_input_mixin: 1,
+                layer1x1_groups: 1,
+                head1x1_groups: 1,
+                head1x1_out: None,
+                film_shift: [false; 8],
+                film_groups: [1; 8],
+            },
+            gating,
+            Activation::Relu,
+            LayerWeights {
+                conv_w: vec![1.0, 0.0],
+                conv_b: vec![0.0],
+                mix_w: vec![0.0],
+                layer1x1_w: Some(vec![2.0, -1.0]),
+                layer1x1_b: Some(vec![0.0, 0.0]),
+                head1x1_w: None,
+                head1x1_b: None,
+                films: [None, None, None, None, None, None, None, None],
+            },
+        );
+        let mut head = vec![0.0]; // head_contrib width = bottleneck = 1
+        let mut out = vec![0.0, 0.0];
+        layer.process_sample(&[3.0, 7.0], &[0.0], &mut head, &mut out);
+        assert_eq!(head, vec![3.0]);
+        assert_eq!(out, vec![9.0, 4.0]);
+    }
+
     /// Block path reproduces the per-sample path for a full layer, gated and not,
     /// multi-channel, dilated, with a per-sample head seed carried in planar form.
     #[test]

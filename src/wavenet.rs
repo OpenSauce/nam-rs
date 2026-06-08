@@ -9,7 +9,7 @@
 //! against the reference in `tests/parity.rs`.
 
 use crate::error::Error;
-use crate::model::{LayerArrayConfig, NamModel, WaveNetConfig};
+use crate::model::{GatingMode, LayerArrayConfig, NamModel, WaveNetConfig};
 use crate::reader::Reader;
 
 mod array;
@@ -72,11 +72,33 @@ impl WaveNet {
         for la in &cfg.layers {
             arrays.push(build_array(&mut r, la)?);
         }
+        // Head-carry invariant: each array's head output feeds the next array's head
+        // input, and the per-sample/per-block paths size that carried buffer by the
+        // *consumer's* channel count (`arrays[i].channels()`). So the producer's head
+        // width must match: `arrays[i-1].head_size() == arrays[i].channels()`. Holds
+        // for every real model and the 2-array A1 parity fixture; guard it explicitly
+        // so a future multi-array A2 model that chains mismatched widths fails loudly
+        // here instead of silently reading stale/garbage head rows.
+        for i in 1..arrays.len() {
+            let produced = arrays[i - 1].head_size();
+            let consumed = arrays[i].channels();
+            if produced != consumed {
+                return Err(Error::UnsupportedFeature(format!(
+                    "layer-array head-carry width mismatch: array {} head_size {produced} \
+                     != array {i} channels {consumed}",
+                    i - 1
+                )));
+            }
+        }
+
         let head_scale = r.take(1)[0];
         // The up-front check guarantees `expected == weights.len()`; this asserts the
         // other half of the invariant — that building consumed exactly `expected`, so
         // `expected_weight_count` and the `build_array` consumption order agree.
-        debug_assert_eq!(
+        // A hard assert (not `debug_assert`): if the count formula and the consumption
+        // order ever drift, under-consumption would otherwise leave the model silently
+        // mis-built in release. (Over-consumption already panics in `Reader::take`.)
+        assert_eq!(
             r.remaining(),
             0,
             "build_array consumed fewer weights than expected_weight_count claimed"
@@ -246,69 +268,80 @@ impl WaveNet {
     }
 }
 
-/// Per-layer keys that mark a deferred A2 feature. Present-and-non-null → reject.
-/// (`slimmable` is intentionally absent: it is benign training metadata.
-/// `condition_dsp` is absent too: it is a *top-level* config key, guarded separately
-/// in [`check_unsupported_features`], not a per-layer one.)
-const DEFERRED_LAYER_KEYS: &[&str] = &[
-    "bottleneck",
-    "gating_mode",
-    "groups_input",
-    "groups_input_mixin",
-    "head1x1",
-    "layer1x1",
-    "secondary_activation",
-    "conv_pre_film",
-    "conv_post_film",
-    "input_mixin_pre_film",
-    "input_mixin_post_film",
-    "activation_pre_film",
-    "activation_post_film",
-    "layer1x1_post_film",
-    "head1x1_post_film",
-];
-
-/// Reject the deferred/exotic A2 features this crate does not implement, with a clear
-/// [`Error::UnsupportedFeature`], rather than silently dropping the config key and
-/// mis-running. The weight-count invariant catches features that reshape the flat
-/// blob; this catches the rest (notably `condition_dsp`, which reconciles exactly).
+/// Reject A2 features whose forward pass is not implemented yet, with a clear
+/// [`Error::UnsupportedFeature`] (rather than silently mis-running). This is the
+/// inverse of the old key-denylist: we now check typed fields. Each rejected case
+/// is implemented in a later phase, at which point its check is removed here.
 fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
-    let non_null = |v: &serde_json::Value| !v.is_null();
-
-    if let Some(h) = &cfg.head {
-        if non_null(h) {
-            return Err(Error::UnsupportedFeature(
-                "separate head (config.head); shipped A2 keeps it null".into(),
-            ));
-        }
+    if cfg.post_stack_head.is_some() {
+        return Err(Error::UnsupportedFeature("post-stack head".into()));
     }
-    if cfg.extra.get("condition_dsp").is_some_and(non_null) {
+    if cfg.condition_dsp.is_some() {
         return Err(Error::UnsupportedFeature("condition_dsp".into()));
     }
+    if cfg.in_channels != 1 {
+        return Err(Error::UnsupportedFeature("in_channels != 1".into()));
+    }
     for la in &cfg.layers {
-        for key in DEFERRED_LAYER_KEYS {
-            if la.extra.get(*key).is_some_and(non_null) {
-                return Err(Error::UnsupportedFeature((*key).to_string()));
+        if la.bottleneck != la.channels {
+            return Err(Error::UnsupportedFeature("bottleneck != channels".into()));
+        }
+        if !la.layer1x1.active {
+            return Err(Error::UnsupportedFeature("inactive layer1x1".into()));
+        }
+        if la.layer1x1.groups != 1 {
+            return Err(Error::UnsupportedFeature("grouped layer1x1".into()));
+        }
+        if la.head1x1.active {
+            return Err(Error::UnsupportedFeature("head1x1".into()));
+        }
+        if la.groups_input != 1 || la.groups_input_mixin != 1 {
+            return Err(Error::UnsupportedFeature("grouped input conv".into()));
+        }
+        for f in [
+            &la.conv_pre_film,
+            &la.conv_post_film,
+            &la.input_mixin_pre_film,
+            &la.input_mixin_post_film,
+            &la.activation_pre_film,
+            &la.activation_post_film,
+            &la.layer1x1_post_film,
+            &la.head1x1_post_film,
+        ] {
+            if f.active {
+                return Err(Error::UnsupportedFeature("FiLM".into()));
             }
         }
-        if la.extra.get("head").is_some_and(non_null) {
+        let first = la.gating_mode();
+        if la.gating_modes.iter().any(|&g| g != first) {
+            return Err(Error::UnsupportedFeature("mixed gating modes".into()));
+        }
+        if first == GatingMode::Blended {
+            return Err(Error::UnsupportedFeature("blended gating".into()));
+        }
+        if first == GatingMode::Gated && la.secondary_activations.iter().any(|s| !is_sigmoid(s)) {
             return Err(Error::UnsupportedFeature(
-                "per-layer head (multi-tap); shipped A2 keeps it null".into(),
+                "non-sigmoid secondary activation".into(),
             ));
         }
     }
     Ok(())
 }
 
-/// Receptive field implied by `config`: `1 + Σ (kernel_size - 1) · dilation` over
-/// every dilated layer in every array. The stacked dilated convs compose additively,
-/// so this is the number of past input samples the final output depends on.
+/// True if `spec` is the (default) Sigmoid secondary activation.
+fn is_sigmoid(spec: &crate::model::ActivationSpec) -> bool {
+    matches!(spec, crate::model::ActivationSpec::Named { name, .. } if name == "Sigmoid")
+}
+
+/// Receptive field implied by `config`: per layer `(kernel_size - 1)·dilation`,
+/// plus `(head_kernel_size - 1)` per array for the (possibly multi-tap) head.
 fn receptive_field(cfg: &WaveNetConfig) -> usize {
     let mut rf = 1;
     for la in &cfg.layers {
-        for &d in &la.dilations {
-            rf += (la.kernel_size - 1) * d;
+        for (k, &d) in la.kernel_sizes.iter().zip(&la.dilations) {
+            rf += (k - 1) * d;
         }
+        rf += la.head_kernel_size - 1;
     }
     rf
 }
@@ -319,54 +352,58 @@ fn receptive_field(cfg: &WaveNetConfig) -> usize {
 /// Uses checked arithmetic: an absurd or adversarial config whose dimensions overflow
 /// `usize` returns [`Error::ConfigTooLarge`] rather than panicking (debug) or wrapping
 /// to a wrong, small count (release).
-fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
+/// Number of weights one layer-array consumes from the flat blob, in exactly
+/// [`build_array`]'s `take` order. This is the **single arithmetic source** for the
+/// weight layout: [`expected_weight_count`] sums it across arrays for the up-front
+/// validation, and [`build_array`] asserts it consumes precisely this many, so the
+/// count formula and the consumption order cannot silently drift apart.
+fn array_weight_count(la: &LayerArrayConfig) -> Result<usize, Error> {
     let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(Error::ConfigTooLarge);
     let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
 
+    let mut total = mul(la.channels, la.input_size)?; // rechannel (no bias)
+    let gated = la.gating_mode() == GatingMode::Gated;
+    let mid = if gated {
+        mul(2, la.channels)?
+    } else {
+        la.channels
+    };
+    for &k in &la.kernel_sizes {
+        let conv = add(mul(mul(mid, la.channels)?, k)?, mid)?; // conv weights + bias
+        let mixin = mul(mid, la.condition_size)?; // input mixer (no bias)
+        let one = add(mul(la.channels, la.channels)?, la.channels)?; // 1x1 weights + bias
+        total = add(total, add(add(conv, mixin)?, one)?)?;
+    }
+    total = add(
+        total,
+        mul(mul(la.head_size, la.channels)?, la.head_kernel_size)?,
+    )?; // head rechannel
+    if la.head_bias {
+        total = add(total, la.head_size)?;
+    }
+    Ok(total)
+}
+
+fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
     let mut total = 0usize;
     for la in &cfg.layers {
-        let mid = if la.gated {
-            mul(2, la.channels)?
-        } else {
-            la.channels
-        };
-        total = add(total, mul(la.channels, la.input_size)?)?; // rechannel (no bias)
-
-        let per_layer = add(
-            add(
-                add(
-                    add(
-                        mul(mul(mid, la.channels)?, la.kernel_size)?, // conv weights
-                        mid,                                          // conv bias
-                    )?,
-                    mul(mid, la.condition_size)?, // input mixer (no bias)
-                )?,
-                mul(la.channels, la.channels)?, // 1x1 weights
-            )?,
-            la.channels, // 1x1 bias
-        )?;
-        total = add(total, mul(la.dilations.len(), per_layer)?)?;
-
-        total = add(total, mul(la.head_size, la.channels)?)?; // head rechannel weights
-        if la.head_bias {
-            total = add(total, la.head_size)?;
-        }
+        total = add(total, array_weight_count(la)?)?;
     }
     add(total, 1) // head_scale
 }
 
 fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Error> {
-    let activation = Activation::from_spec(&la.activation)?;
-    let mid = if la.gated {
-        2 * la.channels
-    } else {
-        la.channels
-    };
+    let gated = la.gating_mode() == GatingMode::Gated;
+    let mid = if gated { 2 * la.channels } else { la.channels };
 
+    let before = r.remaining();
     let rechannel_w = r.take(la.channels * la.input_size);
     let mut layers = Vec::with_capacity(la.dilations.len());
-    for &d in &la.dilations {
-        let conv_w = r.take(mid * la.channels * la.kernel_size);
+    for (i, &d) in la.dilations.iter().enumerate() {
+        let k = la.kernel_sizes[i];
+        let activation = Activation::from_spec(&la.activations[i])?;
+        let conv_w = r.take(mid * la.channels * k);
         let conv_b = r.take(mid);
         let mix_w = r.take(mid * la.condition_size);
         let one_w = r.take(la.channels * la.channels);
@@ -374,10 +411,10 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
         layers.push(Layer::new(
             la.channels,
             la.condition_size,
-            la.kernel_size,
+            k,
             d,
             activation,
-            la.gated,
+            gated,
             conv_w,
             conv_b,
             mix_w,
@@ -385,17 +422,27 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
             one_b,
         ));
     }
-    let head_w = r.take(la.head_size * la.channels);
+    let head_w = r.take(la.head_size * la.channels * la.head_kernel_size);
     let head_b = if la.head_bias {
         Some(r.take(la.head_size))
     } else {
         None
     };
 
+    // Self-check: this array must have consumed exactly what the single count source
+    // claims. Fires immediately (and locally) if a future edit changes the `take`
+    // order here without updating `array_weight_count`, or vice versa.
+    debug_assert_eq!(
+        before - r.remaining(),
+        array_weight_count(la)?,
+        "build_array consumption drifted from array_weight_count"
+    );
+
     Ok(LayerArray::new(
         la.input_size,
         la.channels,
         la.head_size,
+        la.head_kernel_size,
         rechannel_w,
         layers,
         head_w,
@@ -406,6 +453,12 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Build a normalized LayerArrayConfig for tests via the parser (keeps it honest).
+    fn mk_layer(json: serde_json::Value) -> crate::model::LayerArrayConfig {
+        let raw: crate::model::RawLayerArrayConfig = serde_json::from_value(json).unwrap();
+        raw.normalize().unwrap()
+    }
 
     // 1 array, 1 layer, 1 channel, ReLU. Weight order:
     // rechannel=1, conv_w=2, conv_b=0.5, mix_w=1, one_w=3, one_b=0.1,
@@ -438,27 +491,26 @@ mod tests {
 
     #[test]
     fn receptive_field_sums_dilated_taps() {
-        // 1 + Σ(k-1)·d. Mirrors the reference model: kernel 3, dilations [1,2] then [8].
-        let mk = |dilations: Vec<usize>| LayerArrayConfig {
-            input_size: 1,
-            condition_size: 1,
-            channels: 1,
-            head_size: 1,
-            kernel_size: 3,
-            dilations,
-            activation: crate::model::ActivationSpec::Named {
-                name: "Tanh".into(),
-                negative_slope: None,
-            },
-            gated: false,
-            head_bias: false,
-            extra: Default::default(),
-        };
+        // rf = 1 + Σ(k-1)·d + Σ(head_kernel_size-1) over all arrays. Here the head
+        // kernel is 1 so its term vanishes; mirrors the reference model: kernel 3,
+        // dilations [1,2] then [8].
         let cfg = WaveNetConfig {
-            layers: vec![mk(vec![1, 2]), mk(vec![8])],
-            head: None,
+            layers: vec![
+                mk_layer(serde_json::json!({
+                    "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+                    "kernel_size": 3, "dilations": [1, 2], "activation": "Tanh",
+                    "gated": false, "head_bias": false
+                })),
+                mk_layer(serde_json::json!({
+                    "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+                    "kernel_size": 3, "dilations": [8], "activation": "Tanh",
+                    "gated": false, "head_bias": false
+                })),
+            ],
+            post_stack_head: None,
             head_scale: 1.0,
-            extra: Default::default(),
+            in_channels: 1,
+            condition_dsp: None,
         };
         // (3-1)*1 + (3-1)*2 + (3-1)*8 = 2 + 4 + 16 = 22, + 1 = 23.
         assert_eq!(receptive_field(&cfg), 23);
@@ -511,45 +563,50 @@ mod tests {
     /// if consumption drifts below it); one fewer / one more is a count mismatch.
     #[test]
     fn weight_count_matches_consumption_across_shapes() {
-        #[allow(clippy::too_many_arguments)]
-        let mk = |input_size,
-                  channels,
-                  head_size,
-                  kernel_size,
-                  dilations: Vec<usize>,
-                  gated,
-                  head_bias| LayerArrayConfig {
-            input_size,
-            condition_size: 1,
-            channels,
-            head_size,
-            kernel_size,
-            dilations,
-            activation: crate::model::ActivationSpec::Named {
-                name: "Tanh".into(),
-                negative_slope: None,
-            },
-            gated,
-            head_bias,
-            extra: Default::default(),
-        };
-        let layer_sets = vec![
-            vec![mk(1, 1, 1, 1, vec![1], false, false)],
-            vec![mk(1, 2, 1, 3, vec![1, 2], false, false)],
-            vec![mk(1, 4, 2, 3, vec![1, 2, 4], true, false)], // gated
-            vec![mk(1, 3, 1, 3, vec![1], false, true)],       // head_bias
-            // two arrays: the second takes the first's channels as its input_size.
+        let layer_sets: Vec<Vec<crate::model::LayerArrayConfig>> = vec![
+            vec![mk_layer(serde_json::json!({
+                "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+                "kernel_size": 1, "dilations": [1], "activation": "Tanh",
+                "gated": false, "head_bias": false
+            }))],
+            vec![mk_layer(serde_json::json!({
+                "input_size": 1, "condition_size": 1, "channels": 2, "head_size": 1,
+                "kernel_size": 3, "dilations": [1, 2], "activation": "Tanh",
+                "gated": false, "head_bias": false
+            }))],
+            vec![mk_layer(serde_json::json!({
+                "input_size": 1, "condition_size": 1, "channels": 4, "head_size": 2,
+                "kernel_size": 3, "dilations": [1, 2, 4], "activation": "Tanh",
+                "gated": true, "head_bias": false
+            }))], // gated
+            vec![mk_layer(serde_json::json!({
+                "input_size": 1, "condition_size": 1, "channels": 3, "head_size": 1,
+                "kernel_size": 3, "dilations": [1], "activation": "Tanh",
+                "gated": false, "head_bias": true
+            }))], // head_bias
+            // two arrays: the second takes the first's channels as its input_size,
+            // and the first's head_size must equal the second's channels (the
+            // head-carry invariant guarded in `WaveNet::new`).
             vec![
-                mk(1, 4, 1, 3, vec![1, 2], false, false),
-                mk(4, 2, 1, 3, vec![1], true, true),
+                mk_layer(serde_json::json!({
+                    "input_size": 1, "condition_size": 1, "channels": 4, "head_size": 2,
+                    "kernel_size": 3, "dilations": [1, 2], "activation": "Tanh",
+                    "gated": false, "head_bias": false
+                })),
+                mk_layer(serde_json::json!({
+                    "input_size": 4, "condition_size": 1, "channels": 2, "head_size": 1,
+                    "kernel_size": 3, "dilations": [1], "activation": "Tanh",
+                    "gated": true, "head_bias": true
+                })),
             ],
         ];
         for layers in layer_sets {
             let cfg = WaveNetConfig {
                 layers,
-                head: None,
+                post_stack_head: None,
                 head_scale: 1.0,
-                extra: Default::default(),
+                in_channels: 1,
+                condition_dsp: None,
             };
             let n = expected_weight_count(&cfg).unwrap();
             let mk_model = |count: usize| NamModel {
@@ -623,6 +680,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a2_leaky_relu_and_conv_head_parse_and_build() {
+        // LeakyReLU + multi-tap conv head (kernel_size=16) are now fully supported.
+        // Verify the config parses and builds (weight count determines valid input).
+        let json = r#"{
+            "version":"0.7.0","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":2,"bottleneck":2,
+                    "dilations":[1,2],"kernel_sizes":[3,3],
+                    "activation":[{"type":"LeakyReLU"},{"type":"LeakyReLU"}],
+                    "head":{"out_channels":1,"kernel_size":16,"bias":true},
+                    "layer1x1":{"active":true,"groups":1},
+                    "gating_mode":["none","none"]}],
+                "head":null,"head_scale":0.5},
+            "weights":[]}"#;
+        let model0 = NamModel::from_json_str(json).expect("parses cleanly now");
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n = expected_weight_count(cfg).unwrap();
+        let model = NamModel {
+            version: "0.7.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights: vec![0.0; n],
+            sample_rate: None,
+            metadata: None,
+        };
+        assert!(
+            WaveNet::new(&model).is_ok(),
+            "LeakyReLU + multi-tap conv head should now build"
+        );
+    }
+
+    #[test]
+    fn a1_still_builds_and_runs_after_typed_config() {
+        let model = NamModel::from_json_str(TINY).unwrap();
+        let mut wn = WaveNet::new(&model).unwrap();
+        let mut buf = [0.5_f32];
+        wn.process_buffer(&mut buf);
+        assert!((buf[0] - 10.0).abs() < 1e-5, "got {}", buf[0]);
+    }
+
     /// Non-power-of-2 and out-of-order dilations with kernel 6 must size buffers
     /// correctly: receptive field is order-independent, and the block path equals the
     /// per-sample path. Mirrors A2's `[1,5,29,97,227]`-style dilations.
@@ -670,6 +770,52 @@ mod tests {
             assert!(
                 (g - w).abs() < 1e-5,
                 "sample {i}: block {g}, per-sample {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn multitap_head_config_now_builds() {
+        // Weight count: rechannel 2 + 2 layers*(conv 2*2*3+2=14, mix 2, one 2*2+2=6 =>22)
+        // + head(1*2*4=8 + bias 1 =9) + head_scale 1 = 56.
+        let json = r#"{
+            "version":"0.7.0","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":2,"bottleneck":2,
+                    "dilations":[1,2],"kernel_sizes":[3,3],
+                    "activation":[{"type":"ReLU"},{"type":"ReLU"}],
+                    "head":{"out_channels":1,"kernel_size":4,"bias":true},
+                    "layer1x1":{"active":true,"groups":1},
+                    "gating_mode":["none","none"]}],
+                "head":null,"head_scale":0.5},
+            "weights":[]}"#;
+        let model0 = NamModel::from_json_str(json).unwrap();
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n = expected_weight_count(cfg).unwrap();
+        assert_eq!(n, 56, "expected 56 weights for this conv-head config");
+        let weights: Vec<f32> = (0..n).map(|i| ((i % 5) as f32 - 2.0) * 0.1).collect();
+        let model = NamModel {
+            version: "0.7.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights,
+            sample_rate: None,
+            metadata: None,
+        };
+        let mut wn = WaveNet::new(&model).expect("conv-head model builds");
+        let signal: Vec<f32> = (0..256).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+        let want: Vec<f32> = {
+            let mut w = WaveNet::new(&model).unwrap();
+            signal.iter().map(|&x| w.process_sample(x)).collect()
+        };
+        let mut got = signal.clone();
+        wn.process_buffer(&mut got);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-5,
+                "sample {i}: block {g} vs per-sample {w}"
             );
         }
     }

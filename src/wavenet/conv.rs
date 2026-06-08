@@ -122,16 +122,22 @@ impl Conv1d {
         let base = self.pos * self.in_ch;
         self.ring[base..base + self.in_ch].copy_from_slice(input);
 
+        let opg = self.out_per_group;
+        let ipg = self.in_per_group;
         for o in 0..self.out_ch {
             let mut acc = self.bias.as_ref().map_or(0.0, |b| b[o]);
-            let wo = o * self.in_ch * self.kernel;
+            let g = o / opg;
+            let in_base = g * ipg; // first input channel of this output's group
+            // Start of output o's rows in the compact buffer.
+            let wo = (g * opg + (o - g * opg)) * ipg * self.kernel;
             for k in 0..self.kernel {
-                // Tap k reads the input at time offset -(kernel-1-k)*dilation.
                 let back = (self.kernel - 1 - k) * self.dilation;
                 let col = (self.pos + self.ring_len - back) % self.ring_len;
                 let rbase = col * self.in_ch;
-                for j in 0..self.in_ch {
-                    acc += self.weights[wo + j * self.kernel + k] * self.ring[rbase + j];
+                for jl in 0..ipg {
+                    // jl is the local (in-group) input index; jl*kernel+k walks taps.
+                    acc += self.weights[wo + jl * self.kernel + k]
+                        * self.ring[rbase + in_base + jl];
                 }
             }
             out[o] = acc;
@@ -396,6 +402,45 @@ mod tests {
         let w: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let conv = Conv1d::new_grouped(4, 4, 2, 1, 2, w, Some(vec![0.0; 4]));
         assert_eq!(conv.out_ch(), 4);
+    }
+
+    #[test]
+    fn grouped_1x1_is_block_diagonal_matmul() {
+        // in=4, out=4, kernel=1, groups=2. out_per_group = in_per_group = 2.
+        // Block-diagonal: out[0,1] read in[0,1]; out[2,3] read in[2,3].
+        // Compact weights (group-major, out_pg, in_pg, tap):
+        //   g0: W[[1,2],[3,4]]   g1: W[[5,6],[7,8]]
+        let w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let bias = vec![10.0, 20.0, 30.0, 40.0];
+        let mut conv = Conv1d::new_grouped(4, 4, 1, 1, 2, w, Some(bias));
+        let mut out = vec![0.0; 4];
+        conv.process_sample(&[1.0, 1.0, 1.0, 1.0], &mut out);
+        // out0 = 1*1 + 2*1 + 10 = 13 ; out1 = 3*1 + 4*1 + 20 = 27
+        // out2 = 5*1 + 6*1 + 30 = 41 ; out3 = 7*1 + 8*1 + 40 = 55
+        assert_eq!(out, vec![13.0, 27.0, 41.0, 55.0]);
+
+        // Cross-group isolation: perturbing in[2,3] must not change out[0,1].
+        let mut out2 = vec![0.0; 4];
+        conv.reset();
+        conv.process_sample(&[1.0, 1.0, 9.0, -9.0], &mut out2);
+        assert_eq!(out2[0], 13.0);
+        assert_eq!(out2[1], 27.0);
+    }
+
+    #[test]
+    fn grouped_depthwise_kernel2() {
+        // Depthwise: in=out=groups=2, kernel=2 -> out_per_group=in_per_group=1.
+        // Channel 0 weights {1,2}; channel 1 weights {10,20}. No bias.
+        // Compact order: g0(i0,j0): taps {1,2}; g1(i0,j0): taps {10,20}.
+        let w = vec![1.0, 2.0, 10.0, 20.0];
+        let mut conv = Conv1d::new_grouped(2, 2, 2, 1, 2, w, None);
+        let mut out = vec![0.0; 2];
+        // t=0, history silent: ch0 = 2*1 = 2 ; ch1 = 20*3 = 60
+        conv.process_sample(&[1.0, 3.0], &mut out);
+        assert_eq!(out, vec![2.0, 60.0]);
+        // t=1: ch0 = 1*1 + 2*5 = 11 ; ch1 = 10*3 + 20*7 = 170
+        conv.process_sample(&[5.0, 7.0], &mut out);
+        assert_eq!(out, vec![11.0, 170.0]);
     }
 
     #[test]

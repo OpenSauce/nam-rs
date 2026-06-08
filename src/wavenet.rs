@@ -365,23 +365,74 @@ fn array_weight_count(la: &LayerArrayConfig) -> Result<usize, Error> {
     let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(Error::ConfigTooLarge);
     let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
 
-    let mut total = mul(la.channels, la.input_size)?; // rechannel (no bias)
-    let gated = la.gating_mode() == GatingMode::Gated;
+    let gated = la.gating_mode() != GatingMode::None;
     let mid = if gated {
-        mul(2, la.channels)?
+        mul(2, la.bottleneck)?
     } else {
-        la.channels
+        la.bottleneck
     };
+    let head1x1_out = la.head1x1.out_channels.unwrap_or(la.channels);
+    let cond = la.condition_size;
+
+    // Grouped Conv1d weight count: out*in*kernel/groups (compact). Caller adds bias.
+    let conv_w = |out: usize, in_ch: usize, k: usize, groups: usize| -> Result<usize, Error> {
+        Ok(mul(mul(out, in_ch)?, k)? / groups) // dims validated divisible at build
+    };
+    // FiLM: out_rows = (shift?2:1)*input_dim; weights out_rows*cond/groups + out_rows bias.
+    let film = |f: &crate::model::FilmConfig, input_dim: usize| -> Result<usize, Error> {
+        if !f.active {
+            return Ok(0);
+        }
+        let out_rows = if f.shift {
+            mul(2, input_dim)?
+        } else {
+            input_dim
+        };
+        add(conv_w(out_rows, cond, 1, f.groups)?, out_rows)
+    };
+
+    let mut total = mul(la.channels, la.input_size)?; // rechannel (no bias)
+
     for &k in &la.kernel_sizes {
-        let conv = add(mul(mul(mid, la.channels)?, k)?, mid)?; // conv weights + bias
-        let mixin = mul(mid, la.condition_size)?; // input mixer (no bias)
-        let one = add(mul(la.channels, la.channels)?, la.channels)?; // 1x1 weights + bias
-        total = add(total, add(add(conv, mixin)?, one)?)?;
+        let conv = add(conv_w(mid, la.channels, k, la.groups_input)?, mid)?;
+        let mixin = conv_w(mid, cond, 1, la.groups_input_mixin)?; // no bias
+        let mut layer = add(conv, mixin)?;
+        if la.layer1x1.active {
+            let l = add(
+                conv_w(la.channels, la.bottleneck, 1, la.layer1x1.groups)?,
+                la.channels,
+            )?;
+            layer = add(layer, l)?;
+        }
+        if la.head1x1.active {
+            let h = add(
+                conv_w(head1x1_out, la.bottleneck, 1, la.head1x1.groups)?,
+                head1x1_out,
+            )?;
+            layer = add(layer, h)?;
+        }
+        // 8 FiLMs in NAMCore order.
+        layer = add(layer, film(&la.conv_pre_film, la.channels)?)?;
+        layer = add(layer, film(&la.conv_post_film, mid)?)?;
+        layer = add(layer, film(&la.input_mixin_pre_film, cond)?)?;
+        layer = add(layer, film(&la.input_mixin_post_film, mid)?)?;
+        layer = add(layer, film(&la.activation_pre_film, mid)?)?;
+        layer = add(layer, film(&la.activation_post_film, la.bottleneck)?)?;
+        layer = add(layer, film(&la.layer1x1_post_film, la.channels)?)?;
+        layer = add(layer, film(&la.head1x1_post_film, head1x1_out)?)?;
+        total = add(total, layer)?;
     }
+
+    // head rechannel reads head_in rows.
+    let head_in = if la.head1x1.active {
+        head1x1_out
+    } else {
+        la.bottleneck
+    };
     total = add(
         total,
-        mul(mul(la.head_size, la.channels)?, la.head_kernel_size)?,
-    )?; // head rechannel
+        mul(mul(la.head_size, head_in)?, la.head_kernel_size)?,
+    )?;
     if la.head_bias {
         total = add(total, la.head_size)?;
     }
@@ -491,6 +542,35 @@ mod tests {
         let mut buf = [0.5_f32];
         wn.process_buffer(&mut buf);
         assert!((buf[0] - 10.0).abs() < 1e-5, "got {}", buf[0]);
+    }
+
+    #[test]
+    fn array_weight_count_includes_a2_subblocks() {
+        // channels=4, bottleneck=2, condition=1, GATED (mid=2*bn=4), kernel 3 x1 layer,
+        // head_size=1 head_kernel=1 no head_bias, groups all 1, head1x1 active out=3,
+        // layer1x1 active, conv_post_film (shift) + activation_post_film (no shift) active.
+        // Per-layer weights (NAMCore order):
+        //   conv:     mid*channels*k + mid          = 4*4*3 + 4   = 52
+        //   mixin:    mid*condition                 = 4*1         = 4
+        //   layer1x1: channels*bottleneck + channels= 4*2 + 4     = 12
+        //   head1x1:  head1x1_out*bottleneck + out   = 3*2 + 3     = 9
+        //   conv_post_film: shift -> out_rows=2*mid=8; 8*condition + 8 = 8+8 = 16
+        //   activation_post_film: no shift -> out_rows=bottleneck=2; 2*1 + 2 = 4
+        // rechannel: channels*input = 4*1 = 4
+        // head_rechannel: head_size*head_in*head_k = 1*3*1 = 3 (head_in=head1x1_out=3, no bias)
+        // array total = 4 + (52+4+12+9+16+4) + 3 = 4 + 97 + 3 = 104
+        let la = mk_layer(serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 4, "bottleneck": 2,
+            "kernel_sizes": [3], "dilations": [1],
+            "activation": [{"type":"Tanh"}],
+            "gating_mode": ["gated"],
+            "layer1x1": {"active": true, "groups": 1},
+            "head1x1": {"active": true, "out_channels": 3, "groups": 1},
+            "head": {"out_channels": 1, "kernel_size": 1, "bias": false},
+            "conv_post_film": {"active": true, "shift": true, "groups": 1},
+            "activation_post_film": {"active": true, "shift": false, "groups": 1}
+        }));
+        assert_eq!(array_weight_count(&la).unwrap(), 104);
     }
 
     #[test]

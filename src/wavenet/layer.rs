@@ -11,60 +11,8 @@
 //! out  = one_by_one(post) + x          // residual to the next layer
 //! ```
 
+use super::activation::Activation;
 use super::conv::{Conv1d, MAX_BLOCK};
-use crate::error::Error;
-
-/// Pointwise activation applied after the dilated conv + mix-in.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum Activation {
-    Tanh,
-    Relu,
-    Sigmoid,
-    /// LeakyReLU with the given negative slope (`x > 0 ? x : slope*x`).
-    LeakyRelu(f32),
-}
-
-impl Activation {
-    pub(super) fn from_spec(spec: &crate::model::ActivationSpec) -> Result<Self, Error> {
-        use crate::model::ActivationSpec;
-        match spec {
-            ActivationSpec::Named {
-                name,
-                negative_slope,
-            } => match name.as_str() {
-                "Tanh" => Ok(Self::Tanh),
-                "ReLU" => Ok(Self::Relu),
-                "Sigmoid" => Ok(Self::Sigmoid),
-                "LeakyReLU" => Ok(Self::LeakyRelu(negative_slope.unwrap_or(0.01))),
-                other => Err(Error::UnsupportedActivation(other.to_string())),
-            },
-            ActivationSpec::Unsupported(v) => {
-                Err(Error::UnsupportedFeature(format!("activation: {v}")))
-            }
-        }
-    }
-
-    #[inline]
-    fn apply(self, x: f32) -> f32 {
-        match self {
-            Self::Tanh => x.tanh(),
-            Self::Relu => x.max(0.0),
-            Self::Sigmoid => sigmoid(x),
-            Self::LeakyRelu(slope) => {
-                if x > 0.0 {
-                    x
-                } else {
-                    slope * x
-                }
-            }
-        }
-    }
-}
-
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
 
 /// One dilated WaveNet layer with all scratch buffers pre-allocated.
 #[derive(Debug, Clone)]
@@ -147,7 +95,7 @@ impl Layer {
         if self.gated {
             for c in 0..self.channels {
                 let a = self.activation.apply(self.block[c]);
-                let g = sigmoid(self.block[c + self.channels]);
+                let g = Activation::Sigmoid.apply(self.block[c + self.channels]);
                 self.post[c] = a * g;
             }
         } else {
@@ -195,7 +143,7 @@ impl Layer {
                 let (vrow, grow) = (c * n, (c + self.channels) * n);
                 for t in 0..n {
                     let a = self.activation.apply(block[vrow + t]);
-                    let g = sigmoid(block[grow + t]);
+                    let g = Activation::Sigmoid.apply(block[grow + t]);
                     post[c * n + t] = a * g;
                 }
             }
@@ -417,66 +365,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn from_spec_resolves_named_activations() {
-        use crate::model::ActivationSpec;
-        let named = |n: &str| ActivationSpec::Named {
-            name: n.into(),
-            negative_slope: None,
-        };
-        assert_eq!(
-            Activation::from_spec(&named("Tanh")).unwrap(),
-            Activation::Tanh
-        );
-        assert_eq!(
-            Activation::from_spec(&named("ReLU")).unwrap(),
-            Activation::Relu
-        );
-        assert_eq!(
-            Activation::from_spec(&named("Sigmoid")).unwrap(),
-            Activation::Sigmoid
-        );
-        // LeakyReLU with no slope -> default 0.01.
-        assert_eq!(
-            Activation::from_spec(&named("LeakyReLU")).unwrap(),
-            Activation::LeakyRelu(0.01)
-        );
-        // explicit slope is carried through.
-        assert_eq!(
-            Activation::from_spec(&ActivationSpec::Named {
-                name: "LeakyReLU".into(),
-                negative_slope: Some(0.2)
-            })
-            .unwrap(),
-            Activation::LeakyRelu(0.2)
-        );
-    }
-
-    #[test]
-    fn from_spec_rejects_unknown_and_unsupported() {
-        use crate::model::ActivationSpec;
-        let bad_name = ActivationSpec::Named {
-            name: "Softsign".into(),
-            negative_slope: None,
-        };
-        assert!(matches!(
-            Activation::from_spec(&bad_name),
-            Err(crate::Error::UnsupportedActivation(_))
-        ));
-        let list = ActivationSpec::Unsupported(serde_json::json!(["ReLU", "Tanh"]));
-        assert!(matches!(
-            Activation::from_spec(&list),
-            Err(crate::Error::UnsupportedFeature(_))
-        ));
-    }
-
-    #[test]
-    fn leaky_relu_applies_slope() {
-        let a = Activation::LeakyRelu(0.01);
-        assert_eq!(a.apply(2.0), 2.0);
-        assert!((a.apply(-2.0) - (-0.02)).abs() < 1e-9);
-        assert_eq!(a.apply(0.0), 0.0);
     }
 }

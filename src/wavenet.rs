@@ -12,14 +12,16 @@ use crate::error::Error;
 use crate::model::{GatingMode, LayerArrayConfig, NamModel, WaveNetConfig};
 use crate::reader::Reader;
 
+mod activation;
 mod array;
 mod conv;
 mod film;
 mod layer;
 
+use activation::Activation;
 use array::LayerArray;
 use conv::MAX_BLOCK;
-use layer::{Activation, Layer};
+use layer::Layer;
 
 /// A ready-to-run WaveNet, with all scratch buffers pre-allocated.
 #[derive(Debug)]

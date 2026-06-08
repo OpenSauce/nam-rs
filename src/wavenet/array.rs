@@ -151,7 +151,8 @@ impl LayerArray {
 
 #[cfg(test)]
 mod tests {
-    use super::super::layer::{Activation, Layer};
+    use super::super::activation::Activation;
+    use super::super::layer::Layer;
     use super::*;
 
     fn relu_layer(

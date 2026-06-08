@@ -411,13 +411,24 @@ impl WaveNet {
 /// gating, non-sigmoid secondaries, inactive layer1x1) are fully supported by
 /// [`Layer`], and the two top-level features — the post-stack head and a (mono)
 /// `condition_dsp` — are now supported (their build paths consume/own their weights
-/// and run on the hot path). The remaining unsupported cases are multi-channel input
-/// (`in_channels != 1`) and the within-array mixed-gating case; a multi-channel-output
-/// `condition_dsp` or a post-stack head with `out_channels != 1` are rejected at their
-/// respective build sites.
+/// and run on the hot path). The remaining unsupported cases, all rejected here or at
+/// their build site: multi-channel input (`in_channels != 1`); within-array mixed
+/// gating; a multi-channel-output `condition_dsp` (any `condition_size != 1`, rejected
+/// here); and a post-stack head with `out_channels != 1` (rejected in its builder).
 fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
     if cfg.in_channels != 1 {
         return Err(Error::UnsupportedFeature("in_channels != 1".into()));
+    }
+    // This engine is mono: a `condition_dsp` (a standalone `Model`) outputs a single
+    // channel, so it can only feed arrays whose `condition_size == 1`. NAMCore asserts
+    // `condition_size == condition_dsp->NumOutputChannels()` (model.cpp); the multi-output
+    // case (e.g. the `wavenet_condition_dsp.nam` example, `condition_size == 3`) is not yet
+    // runnable here. Reject it at build time with a clear error rather than letting the
+    // mixin conv slice out of bounds on the audio thread.
+    if cfg.condition_dsp.is_some() && cfg.layers.iter().any(|la| la.condition_size != 1) {
+        return Err(Error::UnsupportedFeature(
+            "multi-channel-output condition_dsp (condition_size != 1)".into(),
+        ));
     }
     for la in &cfg.layers {
         // The array builds one `Gating` from the uniform `gating_mode()`; a layer-array
@@ -849,16 +860,23 @@ mod tests {
     }
 
     #[test]
-    fn condition_dsp_no_longer_rejected() {
+    fn multi_channel_condition_dsp_rejected_cleanly_not_panicking() {
+        // The `wavenet_condition_dsp.nam` example feeds arrays with `condition_size == 3`.
+        // This engine is mono (condition_dsp outputs one channel), so it cannot run — but
+        // it MUST reject at build time with a clear error, never build an unrunnable model
+        // that panics out-of-bounds in the mixin conv on the audio thread. (The supported
+        // mono case is covered by `condition_dsp_mono_builds_and_runs` / the parity suite.)
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/wavenet_condition_dsp.nam");
         let json = std::fs::read_to_string(path).expect("wavenet_condition_dsp.nam");
         let model = NamModel::from_json_str(&json).expect("parse condition_dsp model");
         match WaveNet::new(&model) {
-            Err(Error::UnsupportedFeature(f)) if f.contains("condition_dsp") => {
-                panic!("condition_dsp should no longer be guarded");
-            }
-            _ => {} // builds, or fails for another reason until Tasks 9-11
+            Err(Error::UnsupportedFeature(f)) => assert!(
+                f.contains("condition_dsp") || f.contains("condition_size"),
+                "expected a condition_dsp/condition_size rejection, got {f:?}"
+            ),
+            Err(Error::UnsupportedActivation(_)) => {} // also a clean rejection
+            other => panic!("expected a clean build-time rejection, got {other:?}"),
         }
     }
 

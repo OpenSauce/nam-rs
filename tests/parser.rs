@@ -25,15 +25,34 @@ fn a2_max_features_are_rejected_not_run() {
 }
 
 #[test]
-fn condition_dsp_no_longer_rejected_by_guard() {
-    // condition_dsp is no longer a hard-guarded unsupported feature: it must not error
-    // with `UnsupportedFeature("condition_dsp")`. (Full forward parity is covered by
-    // the parity suite's `condition_dsp_matches_namcore_oracle`.)
+fn mono_condition_dsp_is_supported_not_blanket_guarded() {
+    // condition_dsp is no longer a blanket-guarded feature. A *mono* condition_dsp
+    // (`condition_size == 1`) builds and runs — full forward parity is covered by the
+    // parity suite's `condition_dsp_matches_namcore_oracle`. So the generic
+    // `UnsupportedFeature("condition_dsp")` rejection must be gone.
+    if let Err(Error::UnsupportedFeature(msg)) = build_fixture("condition_dsp_mono.nam") {
+        assert!(
+            !msg.contains("condition_dsp"),
+            "mono condition_dsp must build, got UnsupportedFeature({msg:?})"
+        );
+    }
+}
+
+#[test]
+fn multi_channel_condition_dsp_is_cleanly_rejected_not_panicking() {
+    // This engine is mono, so a condition_dsp feeding arrays with `condition_size != 1`
+    // (the NAMCore `wavenet_condition_dsp.nam` example uses `condition_size == 3`) cannot
+    // run. It MUST be rejected at build time with a clear `UnsupportedFeature` — never
+    // build and then panic out-of-bounds in the mixin conv on the audio thread.
     match build_fixture("wavenet_condition_dsp.nam") {
-        Err(Error::UnsupportedFeature(msg)) if msg.contains("condition_dsp") => {
-            panic!("condition_dsp should no longer be guarded");
-        }
-        _ => {}
+        Err(Error::UnsupportedFeature(msg)) => assert!(
+            msg.contains("condition_dsp") || msg.contains("condition_size"),
+            "expected a condition_dsp/condition_size rejection, got {msg:?}"
+        ),
+        // A different clean rejection (e.g. an exotic activation in the example) is also
+        // acceptable — what must NOT happen is a successful build of an unrunnable model.
+        Err(Error::UnsupportedActivation(_)) => {}
+        other => panic!("expected a clean build-time rejection, got {other:?}"),
     }
 }
 

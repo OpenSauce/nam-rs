@@ -45,9 +45,7 @@ pub struct WaveNet {
     /// `Model → WaveNet → Model` type cycle. Mono-in/mono-out for this phase.
     condition_dsp: Option<Box<crate::Model>>,
     /// Pre-allocated `MAX_BLOCK` scratch holding `condition_dsp(input)`; reused each
-    /// chunk so the hot path allocates nothing. Consumed by the forward pass once the
-    /// conditioning replacement is wired (next task).
-    #[allow(dead_code)]
+    /// chunk so the hot path allocates nothing.
     cond_dsp_out: Vec<f32>,
     head_scale: f32,
     /// Samples of input history the deepest dilated tap reaches back over; equals
@@ -228,19 +226,36 @@ impl WaveNet {
     /// Run one `n <= MAX_BLOCK` chunk through every array via the planar block path.
     /// `chunk` is the mono input and is overwritten with the output.
     fn process_chunk(&mut self, chunk: &mut [f32], n: usize) {
-        // The conditioning is the mono input; copy it out before we overwrite `chunk`.
+        // The raw mono input drives the first array's *layer input* and (when there's
+        // no condition_dsp) the conditioning; copy it out before we overwrite `chunk`.
         self.cond_blk[..n].copy_from_slice(chunk);
 
-        // First array: input and condition are the mono signal; the incoming head is
-        // silence of the array's head-accumulator width (`head_in`).
+        // The conditioning fed to every array is `condition_dsp(input)` when present,
+        // else the raw input (NAMCore `_process_condition`). condition_dsp is
+        // mono-in/mono-out here, so its output is one row of `n` samples.
+        let use_cdsp = if let Some(cdsp) = &mut self.condition_dsp {
+            self.cond_dsp_out[..n].copy_from_slice(&self.cond_blk[..n]);
+            cdsp.process_buffer(&mut self.cond_dsp_out[..n]);
+            true
+        } else {
+            false
+        };
+
+        // First array: layer input is the raw signal; condition is the chosen
+        // conditioning slice; the incoming head is silence (`head_in`-wide).
         self.head_a_blk[..self.head_in0 * n].fill(0.0);
         {
             let hin = self.arrays[0].head_in();
             let ch = self.arrays[0].channels();
             let hs = self.arrays[0].head_size();
+            let cond: &[f32] = if use_cdsp {
+                &self.cond_dsp_out[..n]
+            } else {
+                &self.cond_blk[..n]
+            };
             self.arrays[0].process_block(
                 &self.cond_blk[..n],
-                &self.cond_blk[..n],
+                cond,
                 &self.head_a_blk[..hin * n],
                 &mut self.head_b_blk[..hs * n],
                 &mut self.sig_b_blk[..ch * n],
@@ -255,9 +270,14 @@ impl WaveNet {
             let hin = self.arrays[i].head_in();
             let ch = self.arrays[i].channels();
             let hs = self.arrays[i].head_size();
+            let cond: &[f32] = if use_cdsp {
+                &self.cond_dsp_out[..n]
+            } else {
+                &self.cond_blk[..n]
+            };
             self.arrays[i].process_block(
                 &self.sig_a_blk[..in_w * n],
-                &self.cond_blk[..n],
+                cond,
                 &self.head_a_blk[..hin * n],
                 &mut self.head_b_blk[..hs * n],
                 &mut self.sig_b_blk[..ch * n],
@@ -296,21 +316,27 @@ impl WaveNet {
     /// Equivalent to a one-element [`Self::process_buffer`]; convenient for
     /// callers that are not buffer-oriented. Allocation-free.
     pub fn process_sample(&mut self, x: f32) -> f32 {
-        let cond = [x];
+        // `input` is the raw mono sample (first array's layer input); `cond` is the
+        // conditioning: `condition_dsp(x)` when present, else `x` (NAMCore semantics).
+        let input = [x];
+        let cond = match &mut self.condition_dsp {
+            Some(cdsp) => [cdsp.process_sample(x)],
+            None => [x],
+        };
         let n = self.arrays.len();
         if n == 0 {
             return self.head_scale * x;
         }
 
-        // First array: input and condition are the mono sample; the incoming head
-        // is silence of the array's head-accumulator width (`head_in`).
+        // First array: layer input is the raw sample, condition is `cond`; the
+        // incoming head is silence of the array's head-accumulator width (`head_in`).
         self.head_a[..self.head_in0].fill(0.0);
         {
             let hin = self.arrays[0].head_in();
             let ch = self.arrays[0].channels();
             let hs = self.arrays[0].head_size();
             self.arrays[0].process_sample(
-                &cond,
+                &input,
                 &cond,
                 &self.head_a[..hin],
                 &mut self.head_b[..hs],
@@ -740,6 +766,35 @@ mod tests {
             "head":{"channels":1,"out_channels":1,"kernel_sizes":[1],"activation":"ReLU"},
             "head_scale":2.0},
         "weights":[]}"#;
+
+    #[test]
+    fn condition_dsp_block_equals_per_sample() {
+        // The mono condition_dsp fixture: block path must equal the per-sample path,
+        // proving the conditioning replacement is applied consistently across both.
+        // Absolute parity is covered by the parity suite.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/condition_dsp_mono.nam");
+        let json = std::fs::read_to_string(path).expect("condition_dsp_mono.nam");
+        let model = NamModel::from_json_str(&json).expect("parse");
+
+        let len = MAX_BLOCK + 173;
+        let signal: Vec<f32> = (0..len).map(|i| (i as f32 * 0.017).sin() * 0.4).collect();
+
+        let mut per_sample = WaveNet::new(&model).unwrap();
+        let want: Vec<f32> = signal
+            .iter()
+            .map(|&x| per_sample.process_sample(x))
+            .collect();
+        let mut block = WaveNet::new(&model).unwrap();
+        let mut got = signal.clone();
+        block.process_buffer(&mut got);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-5,
+                "sample {i}: block {g}, per-sample {w}"
+            );
+        }
+    }
 
     #[test]
     fn condition_dsp_model_builds() {

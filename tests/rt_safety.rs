@@ -54,6 +54,24 @@ fn conv_head_process_buffer_does_not_allocate() {
 }
 
 #[test]
+fn post_stack_head_process_buffer_does_not_allocate() {
+    // The post-stack head (an `activation -> Conv1d` chain after the arrays) runs on
+    // the hot path. Its convs and the `head_scale` scaling scratch are pre-allocated
+    // in `new`, so `process_buffer` must stay alloc-free — pin it here.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/post_stack_head.nam");
+    let json = std::fs::read_to_string(path).expect("post_stack_head.nam");
+    let model = NamModel::from_json_str(&json).expect("parse model");
+    let mut wn = WaveNet::new(&model).expect("build WaveNet");
+    let mut buffer = vec![0.0_f32; 2100]; // > MAX_BLOCK
+
+    wn.process_buffer(&mut buffer); // warm up off-guard
+    assert_no_alloc(|| {
+        wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
 fn a2_synthetic_process_buffer_does_not_allocate() {
     // The richest A2 path: FiLM + BLENDED gating + layer1x1_post_film. Every FiLM owns
     // pre-allocated scratch, Gating is scratchless, and the Layer's `*_blk` buffers are

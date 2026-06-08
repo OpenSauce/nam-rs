@@ -168,6 +168,31 @@ fn conv_head_matches_namcore_oracle() {
     );
 }
 
+/// The post-stack head matches NAMCore: a committed, oracle-generated fixture run
+/// through nam-rs must equal NAMCore's output in steady state within TOLERANCE.
+#[test]
+fn post_stack_head_matches_namcore_oracle() {
+    let json = std::fs::read_to_string(fixture("post_stack_head.nam"))
+        .unwrap_or_else(|e| panic!("missing fixture post_stack_head.nam: {e}"));
+    let model = NamModel::from_json_str(&json).expect("parse post-stack-head model");
+    let mut net = Model::from_nam(&model).expect("post-stack-head model builds");
+    let input = load_samples("input_post_stack_head.json");
+    let expected = load_samples("expected_post_stack_head.json");
+    assert_eq!(input.len(), expected.len());
+    let rf = net.receptive_field();
+    let mut signal = input.clone();
+    net.process_buffer(&mut signal);
+    let max_err = signal[rf..]
+        .iter()
+        .zip(&expected[rf..])
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_err <= TOLERANCE,
+        "post-stack-head max steady-state error {max_err} > {TOLERANCE}"
+    );
+}
+
 /// End-to-end parity for the committed synthetic A2 fixtures: each `a2_*.nam` run
 /// through nam-rs must equal the NAMCore oracle output in steady state within
 /// TOLERANCE. CI-safe (committed fixtures; skips cleanly if any are absent).

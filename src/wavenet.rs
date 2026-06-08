@@ -373,6 +373,11 @@ fn receptive_field(cfg: &WaveNetConfig) -> usize {
         }
         rf += la.head_kernel_size - 1;
     }
+    if let Some(head) = &cfg.post_stack_head {
+        for &k in &head.kernel_sizes {
+            rf += k - 1;
+        }
+    }
     rf
 }
 
@@ -743,6 +748,36 @@ mod tests {
             }
             _ => {} // ok (builds, or fails for another reason until Tasks 3-5 land)
         }
+    }
+
+    #[test]
+    fn receptive_field_includes_post_stack_head_kernels() {
+        // Array: kernel 3, dilations [1,2] -> array rf-term = (3-1)*1+(3-1)*2 = 6.
+        // head kernel 1 -> +0. Post-stack head kernels [16, 1] -> +15+0 = 15.
+        // total rf = 1 + 6 + 0 + 15 = 22.
+        let json = r#"{
+            "version":"0.6.0","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":1,"head_size":1,
+                    "kernel_size":3,"dilations":[1,2],"activation":"ReLU",
+                    "gated":false,"head_bias":false}],
+                "head":{"channels":2,"out_channels":1,"kernel_sizes":[16,1],"activation":"ReLU"},
+                "head_scale":1.0},
+            "weights":[]}"#;
+        let model0 = NamModel::from_json_str(json).unwrap();
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n = expected_weight_count(cfg).unwrap();
+        let model = NamModel {
+            version: "0.6.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights: vec![0.0; n],
+            sample_rate: None,
+            metadata: None,
+        };
+        assert_eq!(WaveNet::new(&model).unwrap().receptive_field(), 22);
     }
 
     #[test]

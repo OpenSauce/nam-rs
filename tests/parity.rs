@@ -142,6 +142,107 @@ fn matches_reference_leaky_wavenet() {
     );
 }
 
+/// The multi-tap conv head matches NAMCore: a committed, oracle-generated fixture
+/// run through nam-rs must equal NAMCore's output in steady state within TOLERANCE.
+/// CI-safe (no oracle/real files needed at test time).
+#[test]
+fn conv_head_matches_namcore_oracle() {
+    let json = std::fs::read_to_string(fixture("conv_head.nam"))
+        .unwrap_or_else(|e| panic!("missing fixture conv_head.nam: {e}"));
+    let model = NamModel::from_json_str(&json).expect("parse conv-head model");
+    let mut net = Model::from_nam(&model).expect("conv-head model builds");
+    let input = load_samples("input_conv_head.json");
+    let expected = load_samples("expected_conv_head.json");
+    assert_eq!(input.len(), expected.len());
+    let rf = net.receptive_field();
+    let mut signal = input.clone();
+    net.process_buffer(&mut signal);
+    let max_err = signal[rf..]
+        .iter()
+        .zip(&expected[rf..])
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_err <= TOLERANCE,
+        "conv-head max steady-state error {max_err} > {TOLERANCE}"
+    );
+}
+
+/// End-to-end parity for the real A2 captures (gitignored). For each file, compare
+/// nam-rs against the NAMCore oracle binary on the same input, in steady state.
+/// Skips when the oracle binary or the capture files are absent (e.g. CI).
+#[test]
+fn real_a2_captures_match_namcore_oracle() {
+    use std::process::Command;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let oracle = root.join("tests/oracle/build/oracle");
+    let examples = root.join("tests/examples");
+    if !oracle.exists() {
+        eprintln!("skip: oracle binary not built ({oracle:?})");
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&examples) else {
+        eprintln!("skip: no tests/examples dir");
+        return;
+    };
+
+    let n = 8192usize;
+    let signal: Vec<f32> = (0..n)
+        .map(|i| (i as f32 * 0.019).sin() * 0.5 + (i as f32 * 0.0031).sin() * 0.2)
+        .collect();
+
+    let mut checked = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("nam") {
+            continue;
+        }
+        let json = std::fs::read_to_string(&path).unwrap();
+        let model = NamModel::from_json_str(&json).unwrap();
+        let mut net = Model::from_nam(&model)
+            .unwrap_or_else(|e| panic!("{:?}: build failed {e:?}", path.file_name().unwrap()));
+        let mut got = signal.clone();
+        net.process_buffer(&mut got);
+
+        let tmp = std::env::temp_dir();
+        let in_path = tmp.join("nam_in.json");
+        let out_path = tmp.join("nam_out.json");
+        std::fs::write(&in_path, serde_json::to_string(&signal).unwrap()).unwrap();
+        let status = Command::new(&oracle)
+            .arg(&path)
+            .arg(&in_path)
+            .arg(&out_path)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "oracle failed on {:?}",
+            path.file_name().unwrap()
+        );
+        let want: Vec<f32> =
+            serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+
+        let rf = net.receptive_field();
+        let max_err = got[rf..]
+            .iter()
+            .zip(&want[rf..])
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0_f32, f32::max);
+        eprintln!(
+            "{:?}: max steady-state err {max_err:.2e}",
+            path.file_name().unwrap()
+        );
+        assert!(
+            max_err <= TOLERANCE,
+            "{:?}: max steady-state error {max_err} > {TOLERANCE}",
+            path.file_name().unwrap()
+        );
+        checked += 1;
+    }
+    eprintln!("real A2 capture parity: checked {checked} file(s)");
+}
+
 /// Load `model_file`, run `input_file` through it, and assert steady-state parity
 /// against `expected_file` within [`TOLERANCE`].
 fn assert_parity(model_file: &str, input_file: &str, expected_file: &str) {

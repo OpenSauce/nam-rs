@@ -14,6 +14,7 @@ use crate::reader::Reader;
 
 mod array;
 mod conv;
+mod film;
 mod layer;
 
 use array::LayerArray;

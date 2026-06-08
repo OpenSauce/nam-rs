@@ -1,83 +1,235 @@
-//! A single WaveNet layer: dilated conv + conditioning mix-in, an activation,
-//! a residual 1x1, and a head contribution.
+//! A single WaveNet layer: a faithful port of NeuralAmpModelerCore v0.5.3
+//! `detail::Layer::Process` (cross-checked against NAM's Python `_Layer`).
 //!
-//! Ported from NeuralAudio `WaveNetLayerT` (and cross-checked against NAM's
-//! Python `_Layer`). For input `x` and conditioning `c`:
+//! The pipeline, in NAMCore's exact order, for input `x` and conditioning `c`:
 //!
 //! ```text
-//! z    = conv(x) + input_mixin(c)
-//! post = activation(z)                 // gated: tanh(z_a) * sigmoid(z_b)
-//! head_accum += post                   // accumulated for the head path
-//! out  = one_by_one(post) + x          // residual to the next layer
+//! conv_in = conv_pre_film?(x, c) ?? x
+//! conv_out = conv(conv_in) ; conv_post_film_?(conv_out, c)           // mid rows
+//! mix_in  = input_mixin_pre_film?(c, c) ?? c
+//! mix     = mixin(mix_in) ; input_mixin_post_film_?(mix, c)          // mid rows
+//! z       = conv_out + mix ; activation_pre_film_?(z, c)             // mid rows
+//! act     = gating(z) ; activation_post_film(act, c)                 // bottleneck rows
+//! head_contrib = head1x1?(act) (+ head1x1_post_film_) ?? act
+//! head_accum += head_contrib
+//! res     = layer1x1?(act) (+ layer1x1_post_film_, BLENDED only) ; out = x + res
+//!           // or, if layer1x1 inactive: out = x  (requires bottleneck == channels)
 //! ```
+//!
+//! `mid = gating.input_rows()` (= `bottleneck` for NONE, `2·bottleneck` for
+//! GATED/BLENDED). All scratch is pre-allocated in [`Layer::new`]; the `process_*`
+//! methods never allocate.
 
 use super::activation::Activation;
 use super::conv::{Conv1d, MAX_BLOCK};
+use super::film::FiLM;
+use super::gating::Gating;
+use crate::model::GatingMode;
+
+/// Per-layer dimensions and grouping, resolved from the typed config.
+pub(super) struct LayerDims {
+    pub channels: usize,
+    pub bottleneck: usize,
+    pub condition_size: usize,
+    pub kernel: usize,
+    pub dilation: usize,
+    pub groups_input: usize,
+    pub groups_input_mixin: usize,
+    pub layer1x1_groups: usize,
+    pub head1x1_groups: usize,
+    /// `Some(out)` ⇒ head1x1 active with `out` output channels; `None` ⇒ inactive.
+    pub head1x1_out: Option<usize>,
+    pub film_shift: [bool; 8],
+    pub film_groups: [usize; 8],
+}
+
+/// Raw weight tensors for one layer, consumed in NAMCore order.
+pub(super) struct LayerWeights {
+    pub conv_w: Vec<f32>,
+    pub conv_b: Vec<f32>,
+    pub mix_w: Vec<f32>,
+    pub layer1x1_w: Option<Vec<f32>>,
+    pub layer1x1_b: Option<Vec<f32>>,
+    pub head1x1_w: Option<Vec<f32>>,
+    pub head1x1_b: Option<Vec<f32>>,
+    /// FiLM weights `(w, b)` per site, in NAMCore order; `None` when inactive.
+    pub films: [Option<(Vec<f32>, Vec<f32>)>; 8],
+}
 
 /// One dilated WaveNet layer with all scratch buffers pre-allocated.
 #[derive(Debug, Clone)]
 pub(super) struct Layer {
     conv: Conv1d,
     mixin: Conv1d,
-    one_by_one: Conv1d,
-    activation: Activation,
-    gated: bool,
+    layer1x1: Option<Conv1d>,
+    head1x1: Option<Conv1d>,
+    /// 8 FiLM sites, in NAMCore order: conv_pre, conv_post, input_mixin_pre,
+    /// input_mixin_post, activation_pre, activation_post, layer1x1_post, head1x1_post.
+    films: [Option<FiLM>; 8],
+    gating: Gating,
+    mode: GatingMode,
     channels: usize,
-    /// `mid`-wide scratch: dilated-conv output, then `+= mix`.
-    block: Vec<f32>,
-    /// `mid`-wide scratch: input-mixer output.
-    mix: Vec<f32>,
-    /// `channels`-wide scratch: post-activation value.
-    post: Vec<f32>,
-    /// Planar block-path scratch: `[mid][MAX_BLOCK]` twins of `block`/`mix`, and
-    /// `[channels][MAX_BLOCK]` for `post`.
-    block_blk: Vec<f32>,
+    bottleneck: usize,
+    head_contrib_width: usize,
+
+    // Per-sample scratch.
+    conv_pre: Vec<f32>,     // channels
+    conv_out: Vec<f32>,     // mid
+    mix: Vec<f32>,          // mid
+    mix_pre: Vec<f32>,      // condition_size
+    z: Vec<f32>,            // mid
+    act: Vec<f32>,          // bottleneck
+    act_film: Vec<f32>,     // bottleneck (out-of-place activation_post_film scratch)
+    head_contrib: Vec<f32>, // head_contrib_width
+    res: Vec<f32>,          // channels
+
+    // Planar block-path twins.
+    conv_pre_blk: Vec<f32>,
+    conv_out_blk: Vec<f32>,
     mix_blk: Vec<f32>,
-    post_blk: Vec<f32>,
+    mix_pre_blk: Vec<f32>,
+    z_blk: Vec<f32>,
+    act_blk: Vec<f32>,
+    act_film_blk: Vec<f32>,
+    head_contrib_blk: Vec<f32>,
+    res_blk: Vec<f32>,
 }
 
 impl Layer {
-    /// Build a layer from its (already de-interleaved) weight tensors.
-    ///
-    /// When `gated`, the dilated conv produces `2 * channels` outputs (the conv
-    /// and input-mixer weight tensors must be sized accordingly).
-    #[allow(clippy::too_many_arguments)]
+    /// Build a layer from typed dims, a [`Gating`] value, the primary activation,
+    /// and the raw weight tensors (already split per sub-block in NAMCore order).
     pub(super) fn new(
-        channels: usize,
-        condition_size: usize,
-        kernel: usize,
-        dilation: usize,
-        activation: Activation,
-        gated: bool,
-        conv_w: Vec<f32>,
-        conv_b: Vec<f32>,
-        mix_w: Vec<f32>,
-        one_w: Vec<f32>,
-        one_b: Vec<f32>,
+        dims: LayerDims,
+        gating: Gating,
+        _primary: Activation,
+        w: LayerWeights,
     ) -> Self {
-        let mid = if gated { 2 * channels } else { channels };
-        Self {
-            conv: Conv1d::new(channels, mid, kernel, dilation, conv_w, Some(conv_b)),
-            mixin: Conv1d::new(condition_size, mid, 1, 1, mix_w, None),
-            one_by_one: Conv1d::new(channels, channels, 1, 1, one_w, Some(one_b)),
-            activation,
-            gated,
-            channels,
-            block: vec![0.0; mid],
-            mix: vec![0.0; mid],
-            post: vec![0.0; channels],
-            block_blk: vec![0.0; mid * MAX_BLOCK],
-            mix_blk: vec![0.0; mid * MAX_BLOCK],
-            post_blk: vec![0.0; channels * MAX_BLOCK],
+        // `mid` is the conv/mixin output width; derive it from the Gating contract so
+        // it cannot drift from the gating module.
+        let mid = gating.input_rows();
+        let mode = gating.mode();
+
+        let conv = Conv1d::new_grouped(
+            dims.channels,
+            mid,
+            dims.kernel,
+            dims.dilation,
+            dims.groups_input,
+            w.conv_w,
+            Some(w.conv_b),
+        );
+        let mixin = Conv1d::new_grouped(
+            dims.condition_size,
+            mid,
+            1,
+            1,
+            dims.groups_input_mixin,
+            w.mix_w,
+            None,
+        );
+
+        let layer1x1 = match (w.layer1x1_w, w.layer1x1_b) {
+            (Some(lw), lb) => Some(Conv1d::new_grouped(
+                dims.bottleneck,
+                dims.channels,
+                1,
+                1,
+                dims.layer1x1_groups,
+                lw,
+                lb,
+            )),
+            _ => None,
+        };
+
+        let head1x1_out = dims.head1x1_out.unwrap_or(dims.channels);
+        let head1x1 = match (dims.head1x1_out, w.head1x1_w, w.head1x1_b) {
+            (Some(out), Some(hw), hb) => Some(Conv1d::new_grouped(
+                dims.bottleneck,
+                out,
+                1,
+                1,
+                dims.head1x1_groups,
+                hw,
+                hb,
+            )),
+            _ => None,
+        };
+
+        let head_contrib_width = if head1x1.is_some() {
+            head1x1_out
+        } else {
+            dims.bottleneck
+        };
+
+        // FiLM input_dim per site (the dim table).
+        let film_input_dim = [
+            dims.channels,       // conv_pre
+            mid,                 // conv_post
+            dims.condition_size, // input_mixin_pre
+            mid,                 // input_mixin_post
+            mid,                 // activation_pre
+            dims.bottleneck,     // activation_post
+            dims.channels,       // layer1x1_post
+            head1x1_out,         // head1x1_post
+        ];
+        let mut films: [Option<FiLM>; 8] = Default::default();
+        for (i, slot) in w.films.into_iter().enumerate() {
+            if let Some((fw, fb)) = slot {
+                films[i] = Some(FiLM::new(
+                    dims.condition_size,
+                    film_input_dim[i],
+                    dims.film_shift[i],
+                    dims.film_groups[i],
+                    fw,
+                    fb,
+                ));
+            }
         }
+
+        Self {
+            conv,
+            mixin,
+            layer1x1,
+            head1x1,
+            films,
+            gating,
+            mode,
+            channels: dims.channels,
+            bottleneck: dims.bottleneck,
+            head_contrib_width,
+            conv_pre: vec![0.0; dims.channels],
+            conv_out: vec![0.0; mid],
+            mix: vec![0.0; mid],
+            mix_pre: vec![0.0; dims.condition_size],
+            z: vec![0.0; mid],
+            act: vec![0.0; dims.bottleneck],
+            act_film: vec![0.0; dims.bottleneck],
+            head_contrib: vec![0.0; head_contrib_width],
+            res: vec![0.0; dims.channels],
+            conv_pre_blk: vec![0.0; dims.channels * MAX_BLOCK],
+            conv_out_blk: vec![0.0; mid * MAX_BLOCK],
+            mix_blk: vec![0.0; mid * MAX_BLOCK],
+            mix_pre_blk: vec![0.0; dims.condition_size * MAX_BLOCK],
+            z_blk: vec![0.0; mid * MAX_BLOCK],
+            act_blk: vec![0.0; dims.bottleneck * MAX_BLOCK],
+            act_film_blk: vec![0.0; dims.bottleneck * MAX_BLOCK],
+            head_contrib_blk: vec![0.0; head_contrib_width * MAX_BLOCK],
+            res_blk: vec![0.0; dims.channels * MAX_BLOCK],
+        }
+    }
+
+    /// Width of this layer's head contribution: `head1x1_out` when head1x1 is
+    /// active, else `bottleneck`.
+    pub(super) fn head_contrib_width(&self) -> usize {
+        self.head_contrib_width
     }
 
     /// Process one sample.
     ///
     /// - `input`: this layer's input, `channels` wide.
     /// - `condition`: the conditioning signal, `condition_size` wide.
-    /// - `head_accum`: `channels`-wide head accumulator; the post-activation is
-    ///   *added* to it.
+    /// - `head_accum`: `head_contrib_width`-wide head accumulator; the head
+    ///   contribution is *added* to it.
     /// - `out`: `channels`-wide residual output for the next layer.
     pub(super) fn process_sample(
         &mut self,
@@ -86,37 +238,83 @@ impl Layer {
         head_accum: &mut [f32],
         out: &mut [f32],
     ) {
-        self.conv.process_sample(input, &mut self.block);
-        self.mixin.process_sample(condition, &mut self.mix);
-        for (b, m) in self.block.iter_mut().zip(&self.mix) {
-            *b += *m;
+        // 1. conv (with optional pre/post FiLM).
+        let conv_in: &[f32] = if let Some(f) = &mut self.films[0] {
+            f.process_sample(input, condition, &mut self.conv_pre);
+            &self.conv_pre
+        } else {
+            input
+        };
+        self.conv.process_sample(conv_in, &mut self.conv_out);
+        if let Some(f) = &mut self.films[1] {
+            f.process_sample_(&mut self.conv_out, condition);
         }
 
-        if self.gated {
-            for c in 0..self.channels {
-                let a = self.activation.apply(self.block[c]);
-                let g = Activation::Sigmoid.apply(self.block[c + self.channels]);
-                self.post[c] = a * g;
+        // 2. mixin (with optional pre/post FiLM).
+        let mix_in: &[f32] = if let Some(f) = &mut self.films[2] {
+            f.process_sample(condition, condition, &mut self.mix_pre);
+            &self.mix_pre
+        } else {
+            condition
+        };
+        self.mixin.process_sample(mix_in, &mut self.mix);
+        if let Some(f) = &mut self.films[3] {
+            f.process_sample_(&mut self.mix, condition);
+        }
+
+        // 3. z = conv_out + mix (with optional activation_pre FiLM).
+        for (zi, (c, m)) in self.z.iter_mut().zip(self.conv_out.iter().zip(&self.mix)) {
+            *zi = *c + *m;
+        }
+        if let Some(f) = &mut self.films[4] {
+            f.process_sample_(&mut self.z, condition);
+        }
+
+        // 4. activation / gating into `act` (bottleneck rows), then activation_post FiLM.
+        self.gating.process_sample(&self.z, &mut self.act);
+        if let Some(f) = &mut self.films[5] {
+            if self.mode == GatingMode::None {
+                f.process_sample_(&mut self.act, condition);
+            } else {
+                // GATED/BLENDED: NAMCore applies this out-of-place then copies back.
+                f.process_sample(&self.act, condition, &mut self.act_film);
+                self.act.copy_from_slice(&self.act_film);
+            }
+        }
+
+        // 5. head contribution.
+        if let Some(h) = &mut self.head1x1 {
+            h.process_sample(&self.act, &mut self.head_contrib);
+            if let Some(f) = &mut self.films[7] {
+                f.process_sample_(&mut self.head_contrib, condition);
             }
         } else {
-            for c in 0..self.channels {
-                self.post[c] = self.activation.apply(self.block[c]);
+            self.head_contrib.copy_from_slice(&self.act);
+        }
+        for (a, c) in head_accum.iter_mut().zip(&self.head_contrib) {
+            *a += *c;
+        }
+
+        // 6. residual.
+        if let Some(l) = &mut self.layer1x1 {
+            l.process_sample(&self.act, &mut self.res);
+            if self.mode == GatingMode::Blended {
+                if let Some(f) = &mut self.films[6] {
+                    f.process_sample_(&mut self.res, condition);
+                }
             }
-        }
-
-        for (h, p) in head_accum.iter_mut().zip(&self.post) {
-            *h += *p;
-        }
-
-        self.one_by_one.process_sample(&self.post, out);
-        for (o, x) in out.iter_mut().zip(input) {
-            *o += *x;
+            for (o, (r, x)) in out.iter_mut().zip(self.res.iter().zip(input)) {
+                *o = *r + *x;
+            }
+        } else {
+            out.copy_from_slice(input);
         }
     }
 
-    /// Block twin of [`Self::process_sample`]. All slices are **planar** `[ch][t]`,
-    /// `n <= MAX_BLOCK`: `input`/`out`/`head_accum` are `channels * n`, `condition`
-    /// is `condition_size * n`. Equivalent to `n` per-sample calls; allocation-free.
+    /// Block twin of [`Self::process_sample`]. All slices are **planar** `[row][t]`,
+    /// `n <= MAX_BLOCK`: `input`/`out` are `channels * n`, `condition` is
+    /// `condition_size * n`, `head_accum` is `head_contrib_width * n`. Equivalent to
+    /// `n` per-sample calls; allocation-free.
     pub(super) fn process_block(
         &mut self,
         input: &[f32],
@@ -125,69 +323,182 @@ impl Layer {
         out: &mut [f32],
         n: usize,
     ) {
-        let mid = self.block.len();
-        let block = &mut self.block_blk[..mid * n];
-        let mix = &mut self.mix_blk[..mid * n];
-        let post = &mut self.post_blk[..self.channels * n];
+        let mid = self.conv_out.len();
+        let ch = self.channels;
+        let bn = self.bottleneck;
+        let hcw = self.head_contrib_width;
 
-        self.conv.process_block(input, block, n);
-        self.mixin.process_block(condition, mix, n);
-        for (b, m) in block.iter_mut().zip(mix.iter()) {
-            *b += *m;
+        // 1. conv.
+        let conv_in: &[f32] = if let Some(f) = &mut self.films[0] {
+            let buf = &mut self.conv_pre_blk[..ch * n];
+            f.process_block(input, condition, buf, n);
+            &self.conv_pre_blk[..ch * n]
+        } else {
+            input
+        };
+        let conv_out = &mut self.conv_out_blk[..mid * n];
+        self.conv.process_block(conv_in, conv_out, n);
+        if let Some(f) = &mut self.films[1] {
+            f.process_block_(&mut self.conv_out_blk[..mid * n], condition, n);
         }
 
-        // Planar rows: value branch is channel `c` at `c*n`, gate branch (if gated)
-        // is channel `c + channels` at `(c + channels)*n`.
-        if self.gated {
-            for c in 0..self.channels {
-                let (vrow, grow) = (c * n, (c + self.channels) * n);
-                for t in 0..n {
-                    let a = self.activation.apply(block[vrow + t]);
-                    let g = Activation::Sigmoid.apply(block[grow + t]);
-                    post[c * n + t] = a * g;
-                }
+        // 2. mixin.
+        let mix_in: &[f32] = if let Some(f) = &mut self.films[2] {
+            let buf = &mut self.mix_pre_blk[..condition.len()];
+            f.process_block(condition, condition, buf, n);
+            &self.mix_pre_blk[..condition.len()]
+        } else {
+            condition
+        };
+        let mix = &mut self.mix_blk[..mid * n];
+        self.mixin.process_block(mix_in, mix, n);
+        if let Some(f) = &mut self.films[3] {
+            f.process_block_(&mut self.mix_blk[..mid * n], condition, n);
+        }
+
+        // 3. z = conv_out + mix.
+        {
+            let (z, conv_out, mix) = (
+                &mut self.z_blk[..mid * n],
+                &self.conv_out_blk[..mid * n],
+                &self.mix_blk[..mid * n],
+            );
+            for (zi, (c, m)) in z.iter_mut().zip(conv_out.iter().zip(mix)) {
+                *zi = *c + *m;
+            }
+        }
+        if let Some(f) = &mut self.films[4] {
+            f.process_block_(&mut self.z_blk[..mid * n], condition, n);
+        }
+
+        // 4. gating into `act`, then activation_post FiLM.
+        {
+            let (z, act) = (&self.z_blk[..mid * n], &mut self.act_blk[..bn * n]);
+            self.gating.process_block(z, act, n);
+        }
+        if let Some(f) = &mut self.films[5] {
+            if self.mode == GatingMode::None {
+                f.process_block_(&mut self.act_blk[..bn * n], condition, n);
+            } else {
+                let act_film = &mut self.act_film_blk[..bn * n];
+                f.process_block(&self.act_blk[..bn * n], condition, act_film, n);
+                self.act_blk[..bn * n].copy_from_slice(&self.act_film_blk[..bn * n]);
+            }
+        }
+
+        // 5. head contribution.
+        if let Some(h) = &mut self.head1x1 {
+            let (act, hc) = (
+                &self.act_blk[..bn * n],
+                &mut self.head_contrib_blk[..hcw * n],
+            );
+            h.process_block(act, hc, n);
+            if let Some(f) = &mut self.films[7] {
+                f.process_block_(&mut self.head_contrib_blk[..hcw * n], condition, n);
             }
         } else {
-            for c in 0..self.channels {
-                for t in 0..n {
-                    post[c * n + t] = self.activation.apply(block[c * n + t]);
+            self.head_contrib_blk[..hcw * n].copy_from_slice(&self.act_blk[..bn * n]);
+        }
+        for (a, c) in head_accum.iter_mut().zip(&self.head_contrib_blk[..hcw * n]) {
+            *a += *c;
+        }
+
+        // 6. residual.
+        if let Some(l) = &mut self.layer1x1 {
+            l.process_block(&self.act_blk[..bn * n], &mut self.res_blk[..ch * n], n);
+            if self.mode == GatingMode::Blended {
+                if let Some(f) = &mut self.films[6] {
+                    f.process_block_(&mut self.res_blk[..ch * n], condition, n);
                 }
             }
-        }
-
-        for (h, p) in head_accum.iter_mut().zip(post.iter()) {
-            *h += *p;
-        }
-
-        self.one_by_one.process_block(post, out, n);
-        for (o, x) in out.iter_mut().zip(input.iter()) {
-            *o += *x;
+            for (o, (r, x)) in out.iter_mut().zip(self.res_blk[..ch * n].iter().zip(input)) {
+                *o = *r + *x;
+            }
+        } else {
+            out.copy_from_slice(input);
         }
     }
 
     pub(super) fn reset(&mut self) {
         self.conv.reset();
         self.mixin.reset();
-        self.one_by_one.reset();
+        if let Some(l) = &mut self.layer1x1 {
+            l.reset();
+        }
+        if let Some(h) = &mut self.head1x1 {
+            h.reset();
+        }
+        for f in self.films.iter_mut().flatten() {
+            f.reset();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::activation::Activation;
+    use super::super::gating::Gating;
     use super::*;
+    use crate::model::GatingMode;
+
+    // A1-style layer: NONE/GATED gating, no FiLM, no head1x1, layer1x1 active, groups 1.
+    #[allow(clippy::too_many_arguments)]
+    fn a1_layer(
+        channels: usize,
+        condition_size: usize,
+        kernel: usize,
+        dilation: usize,
+        primary: Activation,
+        mode: GatingMode,
+        conv_w: Vec<f32>,
+        conv_b: Vec<f32>,
+        mix_w: Vec<f32>,
+        one_w: Vec<f32>,
+        one_b: Vec<f32>,
+    ) -> Layer {
+        let gating = Gating::new(mode, primary, Activation::Sigmoid, channels);
+        Layer::new(
+            LayerDims {
+                channels,
+                bottleneck: channels,
+                condition_size,
+                kernel,
+                dilation,
+                groups_input: 1,
+                groups_input_mixin: 1,
+                layer1x1_groups: 1,
+                head1x1_groups: 1,
+                head1x1_out: None,
+                film_shift: [false; 8],
+                film_groups: [1; 8],
+            },
+            gating,
+            primary,
+            LayerWeights {
+                conv_w,
+                conv_b,
+                mix_w,
+                layer1x1_w: Some(one_w),
+                layer1x1_b: Some(one_b),
+                head1x1_w: None,
+                head1x1_b: None,
+                films: [None, None, None, None, None, None, None, None],
+            },
+        )
+    }
 
     #[test]
     fn relu_layer_residual_and_head_accumulate() {
         // channels=1, condition=1, kernel=1, dilation=1, ReLU, not gated.
         // conv: block = 2*input + 0.5 ; mixin: mix = 1*condition ; z = block+mix
         // post = relu(z) ; out = 3*post + 0.1 + input (residual) ; head += post
-        let mut layer = Layer::new(
+        let mut layer = a1_layer(
             1,
             1,
             1,
             1,
             Activation::Relu,
-            false,
+            GatingMode::None,
             vec![2.0],
             vec![0.5],
             vec![1.0],
@@ -214,13 +525,13 @@ mod tests {
         // channels=1, gated -> mid=2. Make the gate branch (block[1]) == 0 so
         // sigmoid(0)=0.5 exactly; ReLU on the value branch keeps it exact.
         // conv weights [out=2][in=1][k=1] = [value=2.0, gate=0.0]; bias [0,0].
-        let mut layer = Layer::new(
+        let mut layer = a1_layer(
             1,
             1,
             1,
             1,
             Activation::Relu,
-            true,
+            GatingMode::Gated,
             vec![2.0, 0.0],
             vec![0.0, 0.0],
             vec![0.0, 0.0],
@@ -238,13 +549,13 @@ mod tests {
 
     #[test]
     fn tanh_activation_matches_reference_value() {
-        let mut layer = Layer::new(
+        let mut layer = a1_layer(
             1,
             1,
             1,
             1,
             Activation::Tanh,
-            false,
+            GatingMode::None,
             vec![2.0],
             vec![0.5],
             vec![1.0],
@@ -260,16 +571,56 @@ mod tests {
         assert!((out[0] - (3.0 * post + 0.6)).abs() < 1e-6, "out={}", out[0]);
     }
 
+    #[test]
+    fn head_in_width_decouples_from_channels() {
+        // head1x1 active out=1 with channels=2, bottleneck=2: head contribution is
+        // width 1, decoupled from channels=2.
+        let gating = Gating::new(GatingMode::None, Activation::Relu, Activation::Sigmoid, 2);
+        let layer = Layer::new(
+            LayerDims {
+                channels: 2,
+                bottleneck: 2,
+                condition_size: 1,
+                kernel: 1,
+                dilation: 1,
+                groups_input: 1,
+                groups_input_mixin: 1,
+                layer1x1_groups: 1,
+                head1x1_groups: 1,
+                head1x1_out: Some(1),
+                film_shift: [false; 8],
+                film_groups: [1; 8],
+            },
+            gating,
+            Activation::Relu,
+            LayerWeights {
+                conv_w: vec![1.0, 0.0, 0.0, 1.0],
+                conv_b: vec![0.0, 0.0],
+                mix_w: vec![0.0, 0.0],
+                layer1x1_w: Some(vec![1.0, 0.0, 0.0, 1.0]),
+                layer1x1_b: Some(vec![0.0, 0.0]),
+                head1x1_w: Some(vec![1.0, 1.0]),
+                head1x1_b: Some(vec![0.0]),
+                films: [None, None, None, None, None, None, None, None],
+            },
+        );
+        assert_eq!(layer.head_contrib_width(), 1);
+    }
+
     /// Block path reproduces the per-sample path for a full layer, gated and not,
     /// multi-channel, dilated, with a per-sample head seed carried in planar form.
     #[test]
     fn process_block_equals_process_sample_loop() {
-        for gated in [false, true] {
+        for mode in [GatingMode::None, GatingMode::Gated] {
             let channels = 3usize;
             let cond_sz = 2usize;
             let kernel = 3usize;
             let dilation = 4usize;
-            let mid = if gated { 2 * channels } else { channels };
+            let mid = if mode == GatingMode::None {
+                channels
+            } else {
+                2 * channels
+            };
             let mk = |len: usize, salt: usize| -> Vec<f32> {
                 (0..len)
                     .map(|i| (((i * 31 + salt * 7) % 29) as f32 - 14.0) * 0.07)
@@ -301,13 +652,13 @@ mod tests {
                 .collect();
 
             let mk_layer = || {
-                Layer::new(
+                a1_layer(
                     channels,
                     cond_sz,
                     kernel,
                     dilation,
                     Activation::Tanh,
-                    gated,
+                    mode,
                     conv_w.clone(),
                     conv_b.clone(),
                     mix_w.clone(),
@@ -351,13 +702,13 @@ mod tests {
                         let gh = bhead[c * len + lt];
                         assert!(
                             (go - out_ref[lo + lt][c]).abs() < 1e-5,
-                            "gated={gated} t{} c{c} out: got {go}, want {}",
+                            "mode={mode:?} t{} c{c} out: got {go}, want {}",
                             lo + lt,
                             out_ref[lo + lt][c]
                         );
                         assert!(
                             (gh - head_ref[lo + lt][c]).abs() < 1e-5,
-                            "gated={gated} t{} c{c} head: got {gh}, want {}",
+                            "mode={mode:?} t{} c{c} head: got {gh}, want {}",
                             lo + lt,
                             head_ref[lo + lt][c]
                         );

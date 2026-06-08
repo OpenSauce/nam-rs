@@ -22,7 +22,8 @@ mod layer;
 use activation::Activation;
 use array::LayerArray;
 use conv::MAX_BLOCK;
-use layer::Layer;
+use gating::Gating;
+use layer::{Layer, LayerDims, LayerWeights};
 
 /// A ready-to-run WaveNet, with all scratch buffers pre-allocated.
 #[derive(Debug)]
@@ -449,35 +450,109 @@ fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
 }
 
 fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Error> {
-    let gated = la.gating_mode() == GatingMode::Gated;
-    let mid = if gated { 2 * la.channels } else { la.channels };
+    let mode = la.gating_mode();
+    let gated = mode != GatingMode::None;
+    let mid = if gated {
+        2 * la.bottleneck
+    } else {
+        la.bottleneck
+    };
+    let head1x1_out = la.head1x1.out_channels.unwrap_or(la.channels);
+    let cond = la.condition_size;
+
+    // FiLM site descriptors in NAMCore order: (config, input_dim).
+    let film_sites = [
+        (&la.conv_pre_film, la.channels),
+        (&la.conv_post_film, mid),
+        (&la.input_mixin_pre_film, cond),
+        (&la.input_mixin_post_film, mid),
+        (&la.activation_pre_film, mid),
+        (&la.activation_post_film, la.bottleneck),
+        (&la.layer1x1_post_film, la.channels),
+        (&la.head1x1_post_film, head1x1_out),
+    ];
+    let film_shift: [bool; 8] = std::array::from_fn(|i| film_sites[i].0.shift);
+    let film_groups: [usize; 8] = std::array::from_fn(|i| film_sites[i].0.groups);
 
     let before = r.remaining();
     let rechannel_w = r.take(la.channels * la.input_size);
     let mut layers = Vec::with_capacity(la.dilations.len());
     for (i, &d) in la.dilations.iter().enumerate() {
         let k = la.kernel_sizes[i];
-        let activation = Activation::from_spec(&la.activations[i])?;
-        let conv_w = r.take(mid * la.channels * k);
+        let primary = Activation::from_spec(&la.activations[i])?;
+        let secondary = Activation::from_spec(&la.secondary_activations[i])?;
+
+        // Per-layer weights, consumed in NAMCore `set_weights_` order.
+        let conv_w = r.take(mid * la.channels * k / la.groups_input);
         let conv_b = r.take(mid);
-        let mix_w = r.take(mid * la.condition_size);
-        let one_w = r.take(la.channels * la.channels);
-        let one_b = r.take(la.channels);
+        let mix_w = r.take(mid * cond / la.groups_input_mixin);
+        let (layer1x1_w, layer1x1_b) = if la.layer1x1.active {
+            let w = r.take(la.channels * la.bottleneck / la.layer1x1.groups);
+            let b = r.take(la.channels);
+            (Some(w), Some(b))
+        } else {
+            (None, None)
+        };
+        let (head1x1_w, head1x1_b) = if la.head1x1.active {
+            let w = r.take(head1x1_out * la.bottleneck / la.head1x1.groups);
+            let b = r.take(head1x1_out);
+            (Some(w), Some(b))
+        } else {
+            (None, None)
+        };
+        let mut films: [Option<(Vec<f32>, Vec<f32>)>; 8] = Default::default();
+        for (j, (f, input_dim)) in film_sites.iter().enumerate() {
+            if f.active {
+                let out_rows = if f.shift { 2 * input_dim } else { *input_dim };
+                let w = r.take(out_rows * cond / f.groups);
+                let b = r.take(out_rows);
+                films[j] = Some((w, b));
+            }
+        }
+
+        let gating = Gating::new(mode, primary, secondary, la.bottleneck);
         layers.push(Layer::new(
-            la.channels,
-            la.condition_size,
-            k,
-            d,
-            activation,
-            gated,
-            conv_w,
-            conv_b,
-            mix_w,
-            one_w,
-            one_b,
+            LayerDims {
+                channels: la.channels,
+                bottleneck: la.bottleneck,
+                condition_size: cond,
+                kernel: k,
+                dilation: d,
+                groups_input: la.groups_input,
+                groups_input_mixin: la.groups_input_mixin,
+                layer1x1_groups: la.layer1x1.groups,
+                head1x1_groups: la.head1x1.groups,
+                head1x1_out: if la.head1x1.active {
+                    Some(head1x1_out)
+                } else {
+                    None
+                },
+                film_shift,
+                film_groups,
+            },
+            gating,
+            primary,
+            LayerWeights {
+                conv_w,
+                conv_b,
+                mix_w,
+                layer1x1_w,
+                layer1x1_b,
+                head1x1_w,
+                head1x1_b,
+                films,
+            },
         ));
     }
-    let head_w = r.take(la.head_size * la.channels * la.head_kernel_size);
+
+    // Head accumulator / head-rechannel input width: uniform across an array's layers.
+    let head_in = layers[0].head_contrib_width();
+    debug_assert!(
+        layers.iter().all(|l| l.head_contrib_width() == head_in),
+        "layers in one array must share head-contribution width"
+    );
+
+    let head_w = r.take(la.head_size * head_in * la.head_kernel_size);
     let head_b = if la.head_bias {
         Some(r.take(la.head_size))
     } else {
@@ -496,7 +571,7 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
     Ok(LayerArray::new(
         la.input_size,
         la.channels,
-        la.channels, // head_in (Task 3 computes the real head-contribution width)
+        head_in,
         la.head_size,
         la.head_kernel_size,
         rechannel_w,

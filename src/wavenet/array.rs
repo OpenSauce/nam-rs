@@ -74,10 +74,6 @@ impl LayerArray {
         self.channels
     }
 
-    pub(super) fn head_in(&self) -> usize {
-        self.head_in
-    }
-
     pub(super) fn head_size(&self) -> usize {
         self.head_size
     }
@@ -164,8 +160,55 @@ impl LayerArray {
 #[cfg(test)]
 mod tests {
     use super::super::activation::Activation;
-    use super::super::layer::Layer;
+    use super::super::gating::Gating;
+    use super::super::layer::{Layer, LayerDims, LayerWeights};
     use super::*;
+    use crate::model::GatingMode;
+
+    // A1-style layer (NONE gating, no FiLM, no head1x1, layer1x1 active, groups 1).
+    #[allow(clippy::too_many_arguments)]
+    fn a1_layer(
+        channels: usize,
+        condition_size: usize,
+        kernel: usize,
+        dilation: usize,
+        primary: Activation,
+        conv_w: Vec<f32>,
+        conv_b: Vec<f32>,
+        mix_w: Vec<f32>,
+        one_w: Vec<f32>,
+        one_b: Vec<f32>,
+    ) -> Layer {
+        let gating = Gating::new(GatingMode::None, primary, Activation::Sigmoid, channels);
+        Layer::new(
+            LayerDims {
+                channels,
+                bottleneck: channels,
+                condition_size,
+                kernel,
+                dilation,
+                groups_input: 1,
+                groups_input_mixin: 1,
+                layer1x1_groups: 1,
+                head1x1_groups: 1,
+                head1x1_out: None,
+                film_shift: [false; 8],
+                film_groups: [1; 8],
+            },
+            gating,
+            primary,
+            LayerWeights {
+                conv_w,
+                conv_b,
+                mix_w,
+                layer1x1_w: Some(one_w),
+                layer1x1_b: Some(one_b),
+                head1x1_w: None,
+                head1x1_b: None,
+                films: [None, None, None, None, None, None, None, None],
+            },
+        )
+    }
 
     fn relu_layer(
         channels: usize,
@@ -175,13 +218,12 @@ mod tests {
         one_w: Vec<f32>,
         one_b: Vec<f32>,
     ) -> Layer {
-        Layer::new(
+        a1_layer(
             channels,
             1,
             1,
             1,
             Activation::Relu,
-            false,
             conv_w,
             conv_b,
             mix_w,
@@ -205,13 +247,12 @@ mod tests {
                 .collect()
         };
         let tanh_layer = |dilation: usize, salt: usize| {
-            Layer::new(
+            a1_layer(
                 channels,
                 cond_sz,
                 kernel,
                 dilation,
                 Activation::Tanh,
-                false,
                 mk(channels * channels * kernel, salt),
                 mk(channels, salt + 1),
                 mk(channels * cond_sz, salt + 2),
@@ -387,19 +428,7 @@ mod tests {
         // rechannel is a 2-tap conv over the head-accum time series with weights
         // [w_old, w_cur] = [10, 1]: head_out[t] = 1*acc[t] + 10*acc[t-1].
         // Layer: conv w=1 b=0, ignore cond (mix w=0), 1x1 w=1 b=0, ReLU.
-        let layer = Layer::new(
-            1,
-            1,
-            1,
-            1,
-            Activation::Relu,
-            false,
-            vec![1.0],
-            vec![0.0],
-            vec![0.0],
-            vec![1.0],
-            vec![0.0],
-        );
+        let layer = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
         // head_rechannel weights [out=1][in=1][k=2] = [w@oldest_tap, w@current_tap] = [10, 1].
         let mut array =
             LayerArray::new(1, 1, 1, 1, 2, vec![1.0], vec![layer], vec![10.0, 1.0], None);

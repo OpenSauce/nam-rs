@@ -42,6 +42,11 @@ impl Gating {
         }
     }
 
+    /// The configured gating mode (so callers can branch on NONE/GATED/BLENDED).
+    pub(super) fn mode(&self) -> GatingMode {
+        self.mode
+    }
+
     /// Number of input rows `z` must supply: `None ⇒ bn`, otherwise `2·bn`.
     pub(super) fn input_rows(&self) -> usize {
         match self.mode {

@@ -19,8 +19,8 @@
 use super::conv::{Conv1d, MAX_BLOCK};
 
 /// A FiLM block with all scratch buffers pre-allocated.
-// Fields/methods become used as the per-sample and block paths land in the
-// following tasks; allow dead_code for the skeleton-only state.
+// Exercised only by this module's tests until the Generalized Layer phase wires
+// FiLM into `Layer`; allow dead_code so the un-consumed (but tested) API builds.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(super) struct FiLM {
@@ -159,6 +159,13 @@ impl FiLM {
         }
     }
 
+    /// Clear the internal Conv1x1 history. A `1x1` conv has no cross-sample
+    /// history, so this does not affect outputs; provided for symmetry with the
+    /// other primitives and so `Layer::reset` can call it uniformly.
+    pub(super) fn reset(&mut self) {
+        self.cond_to_scale_shift.reset();
+    }
+
     /// Rows the internal Conv1x1 emits: `(shift ? 2 : 1) * input_dim`.
     #[cfg(test)]
     pub(super) fn out_rows(&self) -> usize {
@@ -255,5 +262,100 @@ mod tests {
         let mut buf = vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0];
         f.process_block_(&mut buf, &cond, n);
         assert_eq!(buf, vec![8.0, 16.0, 4.0, 14.0, 28.0, 7.0]);
+    }
+
+    #[test]
+    fn reset_is_a_noop_for_outputs_but_callable() {
+        // A Conv1x1 (ring_len 1) carries no cross-sample history, so reset cannot
+        // change a result; this test just pins that reset exists and is harmless.
+        let mut f = FiLM::new(1, 1, false, 1, vec![2.0], vec![0.0]);
+        let mut a = vec![5.0];
+        f.process_sample_(&mut a, &[3.0]);
+        f.reset();
+        let mut b = vec![5.0];
+        f.process_sample_(&mut b, &[3.0]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn process_block_equals_process_sample_loop() {
+        // (condition_dim, input_dim, groups) — all divisible by groups where grouped.
+        // shift toggled across both values. Conv1x1 internally (kernel=1, dilation=1).
+        let cases = [
+            (1usize, 1usize, 1usize),
+            (3, 2, 1),
+            (4, 4, 2), // grouped: cond_dim 4, scale rows = input_dim 4, groups 2
+            (4, 2, 2), // grouped, shift doubles out rows to 4 (4 % 2 == 0)
+            (6, 3, 3), // grouped depthwise-ish
+        ];
+        for (cond_dim, input_dim, groups) in cases {
+            for shift in [false, true] {
+                let out_rows = if shift { 2 * input_dim } else { input_dim };
+                // Compact grouped weight count: out_rows * cond_dim * 1 / groups.
+                let wlen = out_rows * cond_dim / groups;
+                let w: Vec<f32> = (0..wlen)
+                    .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.1)
+                    .collect();
+                let bias: Vec<f32> = (0..out_rows).map(|o| (o as f32 + 1.0) * 0.05).collect();
+
+                let total = 200usize;
+                let inp: Vec<Vec<f32>> = (0..total)
+                    .map(|t| {
+                        (0..input_dim)
+                            .map(|c| ((t * input_dim + c) as f32 * 0.31).sin())
+                            .collect()
+                    })
+                    .collect();
+                let cond: Vec<Vec<f32>> = (0..total)
+                    .map(|t| {
+                        (0..cond_dim)
+                            .map(|c| ((t * 5 + c) as f32 * 0.17).cos())
+                            .collect()
+                    })
+                    .collect();
+
+                let mk = || FiLM::new(cond_dim, input_dim, shift, groups, w.clone(), bias.clone());
+
+                // Reference: per-sample, out-of-place.
+                let mut a = mk();
+                let mut want: Vec<Vec<f32>> = Vec::with_capacity(total);
+                let mut o = vec![0.0; input_dim];
+                for t in 0..total {
+                    a.process_sample(&inp[t], &cond[t], &mut o);
+                    want.push(o.clone());
+                }
+
+                // Under test: block path, uneven chunks to exercise conv history.
+                let mut b = mk();
+                let chunks = [50usize, 1, 99, 50];
+                let mut t0 = 0;
+                for &len in &chunks {
+                    let mut bin = vec![0.0; input_dim * len];
+                    let mut bcond = vec![0.0; cond_dim * len];
+                    for lt in 0..len {
+                        for c in 0..input_dim {
+                            bin[c * len + lt] = inp[t0 + lt][c];
+                        }
+                        for c in 0..cond_dim {
+                            bcond[c * len + lt] = cond[t0 + lt][c];
+                        }
+                    }
+                    let mut bout = vec![0.0; input_dim * len];
+                    b.process_block(&bin, &bcond, &mut bout, len);
+                    for lt in 0..len {
+                        for c in 0..input_dim {
+                            let got = bout[c * len + lt];
+                            let exp = want[t0 + lt][c];
+                            assert!(
+                                (got - exp).abs() < 1e-5,
+                                "cond{cond_dim} in{input_dim} g{groups} shift{shift} t{} c{c}: got {got}, want {exp}",
+                                t0 + lt
+                            );
+                        }
+                    }
+                    t0 += len;
+                }
+            }
+        }
     }
 }

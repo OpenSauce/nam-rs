@@ -77,14 +77,14 @@ fn parses_minimal_wavenet_config() {
     assert_eq!(layers.len(), 1);
     let layer = &layers[0];
     assert_eq!(layer.channels, 2);
-    assert_eq!(layer.kernel_size, 3);
+    assert_eq!(layer.kernel_sizes[0], 3);
     assert_eq!(layer.dilations, vec![1, 2]);
     assert!(
-        matches!(&layer.activation, nam_rs::ActivationSpec::Named { name, negative_slope: None } if name == "Tanh"),
+        matches!(&layer.activations[0], nam_rs::ActivationSpec::Named { name, negative_slope: None } if name == "Tanh"),
         "got {:?}",
-        layer.activation
+        layer.activations[0]
     );
-    assert!(!layer.gated);
+    assert!(!matches!(layer.gating_modes[0], nam_rs::GatingMode::Gated | nam_rs::GatingMode::Blended));
     assert!(!layer.head_bias);
 
     assert!((cfg.head_scale - 0.5).abs() < 1e-9);
@@ -238,7 +238,7 @@ fn wavenet_with_activation(activation_json: &str) -> String {
 fn first_layer_activation(json: &str) -> ActivationSpec {
     let m = NamModel::from_json_str(json).expect("parse");
     match &m.config {
-        ModelConfig::WaveNet(c) => c.layers[0].activation.clone(),
+        ModelConfig::WaveNet(c) => c.layers[0].activations[0].clone(),
         other => panic!("expected WaveNet, got {other:?}"),
     }
 }
@@ -277,9 +277,14 @@ fn activation_dict_explicit_slope_parses() {
 }
 
 #[test]
-fn activation_list_form_parses_as_unsupported() {
-    let a = first_layer_activation(&wavenet_with_activation(r#"["ReLU","Tanh"]"#));
-    assert!(matches!(a, ActivationSpec::Unsupported(_)));
+fn activation_list_form_broadcasts_per_layer() {
+    // A per-layer activation list (length == dilations.len()) now parses successfully.
+    // `wavenet_with_activation` has one dilation, so a one-element list is valid.
+    let a = first_layer_activation(&wavenet_with_activation(r#"["ReLU"]"#));
+    assert!(
+        matches!(a, ActivationSpec::Named { ref name, .. } if name == "ReLU"),
+        "got {a:?}"
+    );
 }
 
 #[test]

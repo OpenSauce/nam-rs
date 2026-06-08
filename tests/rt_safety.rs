@@ -34,6 +34,26 @@ fn process_buffer_does_not_allocate() {
 }
 
 #[test]
+fn conv_head_process_buffer_does_not_allocate() {
+    // The multi-tap convolutional head (A2) takes a different build path than the
+    // 1-tap A1 head (a per-array `Conv1d` ring instead of a plain rechannel). Its
+    // ring is pre-allocated in `new`, so the hot path must still be alloc-free —
+    // pin that here so a future head-path change can't regress it unnoticed.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/conv_head.nam");
+    let json = std::fs::read_to_string(path).expect("conv_head.nam");
+    let model = NamModel::from_json_str(&json).expect("parse model");
+    let mut wn = WaveNet::new(&model).expect("build WaveNet");
+    // Longer than MAX_BLOCK (1024) so the multi-chunk loop runs under the guard.
+    let mut buffer = vec![0.0_f32; 2100];
+
+    wn.process_buffer(&mut buffer); // warm up off-guard
+    assert_no_alloc(|| {
+        wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
 fn lstm_process_buffer_does_not_allocate() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference_lstm.nam");

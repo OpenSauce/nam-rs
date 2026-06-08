@@ -300,10 +300,17 @@ pub struct Layer1x1Config {
 impl Layer1x1Config {
     pub(crate) fn from_json(v: Option<&serde_json::Value>) -> Self {
         match v {
-            None => Self { active: true, groups: 1 },
+            None => Self {
+                active: true,
+                groups: 1,
+            },
             Some(o) => Self {
                 active: o.get("active").and_then(|x| x.as_bool()).unwrap_or(true),
-                groups: o.get("groups").and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(1),
+                groups: o
+                    .get("groups")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize)
+                    .unwrap_or(1),
             },
         }
     }
@@ -325,11 +332,22 @@ pub struct Head1x1Config {
 impl Head1x1Config {
     pub(crate) fn from_json(v: Option<&serde_json::Value>) -> Self {
         match v {
-            None => Self { active: false, out_channels: None, groups: 1 },
+            None => Self {
+                active: false,
+                out_channels: None,
+                groups: 1,
+            },
             Some(o) => Self {
                 active: o.get("active").and_then(|x| x.as_bool()).unwrap_or(false),
-                out_channels: o.get("out_channels").and_then(|x| x.as_u64()).map(|x| x as usize),
-                groups: o.get("groups").and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(1),
+                out_channels: o
+                    .get("out_channels")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize),
+                groups: o
+                    .get("groups")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize)
+                    .unwrap_or(1),
             },
         }
     }
@@ -349,7 +367,11 @@ pub struct FilmConfig {
 
 impl FilmConfig {
     /// The inactive default (absent key or explicit `false`).
-    pub const INACTIVE: Self = Self { active: false, shift: false, groups: 1 };
+    pub const INACTIVE: Self = Self {
+        active: false,
+        shift: false,
+        groups: 1,
+    };
 
     pub(crate) fn from_json(v: Option<&serde_json::Value>) -> Self {
         match v {
@@ -358,7 +380,11 @@ impl FilmConfig {
             Some(o) => Self {
                 active: o.get("active").and_then(|x| x.as_bool()).unwrap_or(true),
                 shift: o.get("shift").and_then(|x| x.as_bool()).unwrap_or(true),
-                groups: o.get("groups").and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(1),
+                groups: o
+                    .get("groups")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize)
+                    .unwrap_or(1),
             },
         }
     }
@@ -416,14 +442,15 @@ impl RawWaveNetConfig {
 
         let post_stack_head = match self.head {
             Some(h) if !h.is_null() => {
-                let channels = h
-                    .get("channels")
-                    .and_then(|x| x.as_u64())
-                    .ok_or("post-stack head missing channels")? as usize;
+                let channels =
+                    h.get("channels")
+                        .and_then(|x| x.as_u64())
+                        .ok_or("post-stack head missing channels")? as usize;
                 let out_channels = h
                     .get("out_channels")
                     .and_then(|x| x.as_u64())
-                    .ok_or("post-stack head missing out_channels")? as usize;
+                    .ok_or("post-stack head missing out_channels")?
+                    as usize;
                 let kernel_sizes: Vec<usize> = h
                     .get("kernel_sizes")
                     .and_then(|x| x.as_array())
@@ -436,7 +463,9 @@ impl RawWaveNetConfig {
                     })
                     .collect::<Result<_, _>>()?;
                 let activation = serde_json::from_value::<ActivationSpec>(
-                    h.get("activation").cloned().unwrap_or(serde_json::Value::Null),
+                    h.get("activation")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
                 )
                 .map_err(|e| e.to_string())?;
                 Some(PostStackHeadConfig {
@@ -691,7 +720,8 @@ fn broadcast_activations(v: &serde_json::Value, n: usize) -> Result<Vec<Activati
                 .collect()
         }
         other => {
-            let a = serde_json::from_value::<ActivationSpec>(other.clone()).map_err(|e| e.to_string())?;
+            let a = serde_json::from_value::<ActivationSpec>(other.clone())
+                .map_err(|e| e.to_string())?;
             Ok(vec![a; n])
         }
     }
@@ -819,7 +849,8 @@ mod layer_array_normalize_tests {
             "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
             "kernel_size": 3, "kernel_sizes": [3], "dilations": [1],
             "activation": "Tanh", "gated": false, "head_bias": false
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(raw.normalize().is_err());
     }
 
@@ -829,7 +860,8 @@ mod layer_array_normalize_tests {
             "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
             "kernel_sizes": [3, 3], "dilations": [1],
             "activation": "Tanh", "gated": false, "head_bias": false
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(raw.normalize().is_err());
     }
 
@@ -839,7 +871,8 @@ mod layer_array_normalize_tests {
             "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
             "kernel_size": 3, "dilations": [1, 2],
             "activation": ["Tanh"], "gated": false, "head_bias": false
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(raw.normalize().is_err());
     }
 }
@@ -852,7 +885,10 @@ mod a2_subconfig_tests {
     fn gating_mode_from_str() {
         assert_eq!(GatingMode::from_name("none").unwrap(), GatingMode::None);
         assert_eq!(GatingMode::from_name("gated").unwrap(), GatingMode::Gated);
-        assert_eq!(GatingMode::from_name("blended").unwrap(), GatingMode::Blended);
+        assert_eq!(
+            GatingMode::from_name("blended").unwrap(),
+            GatingMode::Blended
+        );
         assert!(GatingMode::from_name("wat").is_err());
     }
 
@@ -869,29 +905,63 @@ mod a2_subconfig_tests {
     fn film_object_defaults_active_shift_groups() {
         let v = serde_json::json!({});
         let f = FilmConfig::from_json(Some(&v));
-        assert_eq!(f, FilmConfig { active: true, shift: true, groups: 1 });
+        assert_eq!(
+            f,
+            FilmConfig {
+                active: true,
+                shift: true,
+                groups: 1
+            }
+        );
         let v = serde_json::json!({"active": false, "shift": false, "groups": 2});
         assert_eq!(
             FilmConfig::from_json(Some(&v)),
-            FilmConfig { active: false, shift: false, groups: 2 }
+            FilmConfig {
+                active: false,
+                shift: false,
+                groups: 2
+            }
         );
     }
 
     #[test]
     fn layer1x1_defaults_active_true_groups_1() {
-        assert_eq!(Layer1x1Config::from_json(None), Layer1x1Config { active: true, groups: 1 });
+        assert_eq!(
+            Layer1x1Config::from_json(None),
+            Layer1x1Config {
+                active: true,
+                groups: 1
+            }
+        );
         let v = serde_json::json!({"active": true, "groups": 1});
-        assert_eq!(Layer1x1Config::from_json(Some(&v)), Layer1x1Config { active: true, groups: 1 });
+        assert_eq!(
+            Layer1x1Config::from_json(Some(&v)),
+            Layer1x1Config {
+                active: true,
+                groups: 1
+            }
+        );
     }
 
     #[test]
     fn head1x1_defaults_inactive() {
         let h = Head1x1Config::from_json(None);
-        assert_eq!(h, Head1x1Config { active: false, out_channels: None, groups: 1 });
+        assert_eq!(
+            h,
+            Head1x1Config {
+                active: false,
+                out_channels: None,
+                groups: 1
+            }
+        );
         let v = serde_json::json!({"active": false, "out_channels": 1, "groups": 1});
         assert_eq!(
             Head1x1Config::from_json(Some(&v)),
-            Head1x1Config { active: false, out_channels: Some(1), groups: 1 }
+            Head1x1Config {
+                active: false,
+                out_channels: Some(1),
+                groups: 1
+            }
         );
     }
 }
@@ -909,13 +979,15 @@ mod wavenet_config_tests {
 
     #[test]
     fn a1_config_parses_unchanged() {
-        let c = parse(r#"{
+        let c = parse(
+            r#"{
             "version":"0.5.4","architecture":"WaveNet","config":{
                 "layers":[{"input_size":1,"condition_size":1,"channels":2,"head_size":1,
                     "kernel_size":3,"dilations":[1,2],"activation":"Tanh",
                     "gated":false,"head_bias":false}],
                 "head":null,"head_scale":2.0},
-            "weights":[]}"#);
+            "weights":[]}"#,
+        );
         assert_eq!(c.layers.len(), 1);
         assert_eq!(c.head_scale, 2.0);
         assert!(c.post_stack_head.is_none());
@@ -925,7 +997,8 @@ mod wavenet_config_tests {
 
     #[test]
     fn a2_flexible_container_submodel_config_parses() {
-        let c = parse(r#"{
+        let c = parse(
+            r#"{
             "version":"0.7.0","architecture":"WaveNet","config":{
                 "layers":[{"input_size":1,"condition_size":1,"channels":3,"bottleneck":3,
                     "dilations":[1,3,7],"kernel_sizes":[6,6,15],
@@ -934,7 +1007,8 @@ mod wavenet_config_tests {
                     "head1x1":{"active":false},"layer1x1":{"active":true,"groups":1},
                     "gating_mode":["none","none","none"]}],
                 "head":null,"head_scale":0.5},
-            "weights":[]}"#);
+            "weights":[]}"#,
+        );
         assert_eq!(c.layers[0].head_kernel_size, 16);
         assert_eq!(c.layers[0].kernel_sizes, vec![6, 6, 15]);
         assert!(c.post_stack_head.is_none());
@@ -942,14 +1016,16 @@ mod wavenet_config_tests {
 
     #[test]
     fn post_stack_head_parses() {
-        let c = parse(r#"{
+        let c = parse(
+            r#"{
             "version":"0.6.0","architecture":"WaveNet","config":{
                 "layers":[{"input_size":1,"condition_size":1,"channels":2,"head_size":2,
                     "kernel_size":3,"dilations":[1],"activation":"Tanh",
                     "gated":false,"head_bias":false}],
                 "head":{"channels":4,"out_channels":1,"kernel_sizes":[1,1],"activation":"ReLU"},
                 "head_scale":1.0},
-            "weights":[]}"#);
+            "weights":[]}"#,
+        );
         let h = c.post_stack_head.expect("post-stack head present");
         assert_eq!(h.channels, 4);
         assert_eq!(h.out_channels, 1);
@@ -958,7 +1034,8 @@ mod wavenet_config_tests {
 
     #[test]
     fn condition_dsp_parses_as_nested_model() {
-        let c = parse(r#"{
+        let c = parse(
+            r#"{
             "version":"0.6.0","architecture":"WaveNet","config":{
                 "layers":[{"input_size":1,"condition_size":1,"channels":2,"head_size":1,
                     "kernel_size":3,"dilations":[1],"activation":"Tanh",
@@ -969,7 +1046,8 @@ mod wavenet_config_tests {
                         "kernel_size":1,"dilations":[1],"activation":"Tanh",
                         "gated":false,"head_bias":false}],
                     "head":null,"head_scale":1.0},"weights":[]}},
-            "weights":[]}"#);
+            "weights":[]}"#,
+        );
         let dsp = c.condition_dsp.expect("condition_dsp present");
         assert_eq!(dsp.architecture, "WaveNet");
     }

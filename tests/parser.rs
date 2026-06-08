@@ -84,7 +84,10 @@ fn parses_minimal_wavenet_config() {
         "got {:?}",
         layer.activations[0]
     );
-    assert!(!matches!(layer.gating_modes[0], nam_rs::GatingMode::Gated | nam_rs::GatingMode::Blended));
+    assert!(!matches!(
+        layer.gating_modes[0],
+        nam_rs::GatingMode::Gated | nam_rs::GatingMode::Blended
+    ));
     assert!(!layer.head_bias);
 
     assert!((cfg.head_scale - 0.5).abs() < 1e-9);
@@ -335,4 +338,36 @@ fn parses_slimmable_container() {
     assert_eq!(cfg.submodels[0].model.architecture, "LSTM");
     assert_eq!(cfg.submodels[1].model.architecture, "WaveNet");
     assert_eq!(cfg.submodels[2].model.architecture, "WaveNet");
+}
+
+/// The real downloaded A2 captures (gitignored for licensing) must now PARSE
+/// cleanly (the `missing field head_size` bug is fixed) and, until the forward-pass
+/// phases land, be rejected at build time with a clear UnsupportedFeature — never a
+/// parse error, never a panic. Skips when the files are absent (e.g. CI).
+#[test]
+fn real_a2_captures_parse_and_are_cleanly_guarded() {
+    use nam_rs::{Error, Model, NamModel};
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/examples");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut checked = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("nam") {
+            continue;
+        }
+        let json = std::fs::read_to_string(&path).unwrap();
+        let model = NamModel::from_json_str(&json)
+            .unwrap_or_else(|e| panic!("{:?} failed to PARSE: {e}", path.file_name().unwrap()));
+        match Model::from_nam(&model) {
+            Ok(_) | Err(Error::UnsupportedFeature(_)) => {}
+            Err(other) => panic!(
+                "{:?}: unexpected error {other:?}",
+                path.file_name().unwrap()
+            ),
+        }
+        checked += 1;
+    }
+    eprintln!("real A2 capture smoke: checked {checked} file(s)");
 }

@@ -343,14 +343,21 @@ fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
     for la in &cfg.layers {
         total = add(total, mul(la.channels, la.input_size)?)?; // rechannel (no bias)
         let gated = la.gating_modes[0] == GatingMode::Gated;
-        let mid = if gated { mul(2, la.channels)? } else { la.channels };
+        let mid = if gated {
+            mul(2, la.channels)?
+        } else {
+            la.channels
+        };
         for &k in &la.kernel_sizes {
             let conv = add(mul(mul(mid, la.channels)?, k)?, mid)?; // conv weights + bias
             let mixin = mul(mid, la.condition_size)?; // input mixer (no bias)
             let one = add(mul(la.channels, la.channels)?, la.channels)?; // 1x1 weights + bias
             total = add(total, add(add(conv, mixin)?, one)?)?;
         }
-        total = add(total, mul(mul(la.head_size, la.channels)?, la.head_kernel_size)?)?; // head rechannel
+        total = add(
+            total,
+            mul(mul(la.head_size, la.channels)?, la.head_kernel_size)?,
+        )?; // head rechannel
         if la.head_bias {
             total = add(total, la.head_size)?;
         }

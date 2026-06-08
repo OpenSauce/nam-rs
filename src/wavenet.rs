@@ -261,11 +261,6 @@ fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
         return Err(Error::UnsupportedFeature("in_channels != 1".into()));
     }
     for la in &cfg.layers {
-        if la.head_kernel_size != 1 {
-            return Err(Error::UnsupportedFeature(
-                "multi-tap conv head (head.kernel_size > 1)".into(),
-            ));
-        }
         if la.bottleneck != la.channels {
             return Err(Error::UnsupportedFeature("bottleneck != channels".into()));
         }
@@ -393,7 +388,7 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
             one_b,
         ));
     }
-    let head_w = r.take(la.head_size * la.channels); // head_kernel_size == 1 here (guarded)
+    let head_w = r.take(la.head_size * la.channels * la.head_kernel_size);
     let head_b = if la.head_bias {
         Some(r.take(la.head_size))
     } else {
@@ -404,6 +399,7 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
         la.input_size,
         la.channels,
         la.head_size,
+        la.head_kernel_size,
         rechannel_w,
         layers,
         head_w,
@@ -639,6 +635,8 @@ mod tests {
 
     #[test]
     fn a2_flexible_features_are_cleanly_guarded_not_a_parse_error() {
+        // LeakyReLU + multi-tap conv head (kernel_size=16) are now fully supported.
+        // Verify the config parses and builds (weight count determines valid input).
         let json = r#"{
             "version":"0.7.0","architecture":"WaveNet","config":{
                 "layers":[{"input_size":1,"condition_size":1,"channels":2,"bottleneck":2,
@@ -649,11 +647,24 @@ mod tests {
                     "gating_mode":["none","none"]}],
                 "head":null,"head_scale":0.5},
             "weights":[]}"#;
-        let model = NamModel::from_json_str(json).expect("parses cleanly now");
-        assert!(matches!(
-            WaveNet::new(&model),
-            Err(Error::UnsupportedFeature(_))
-        ));
+        let model0 = NamModel::from_json_str(json).expect("parses cleanly now");
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n = expected_weight_count(cfg).unwrap();
+        let model = NamModel {
+            version: "0.7.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights: vec![0.0; n],
+            sample_rate: None,
+            metadata: None,
+        };
+        assert!(
+            WaveNet::new(&model).is_ok(),
+            "LeakyReLU + multi-tap conv head should now build"
+        );
     }
 
     #[test]
@@ -713,6 +724,49 @@ mod tests {
                 (g - w).abs() < 1e-5,
                 "sample {i}: block {g}, per-sample {w}"
             );
+        }
+    }
+
+    #[test]
+    fn multitap_head_config_now_builds() {
+        // Weight count: rechannel 2 + 2 layers*(conv 2*2*3+2=14, mix 2, one 2*2+2=6 =>22)
+        // + head(1*2*4=8 + bias 1 =9) + head_scale 1 = 56.
+        let json = r#"{
+            "version":"0.7.0","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":2,"bottleneck":2,
+                    "dilations":[1,2],"kernel_sizes":[3,3],
+                    "activation":[{"type":"ReLU"},{"type":"ReLU"}],
+                    "head":{"out_channels":1,"kernel_size":4,"bias":true},
+                    "layer1x1":{"active":true,"groups":1},
+                    "gating_mode":["none","none"]}],
+                "head":null,"head_scale":0.5},
+            "weights":[]}"#;
+        let model0 = NamModel::from_json_str(json).unwrap();
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n = expected_weight_count(cfg).unwrap();
+        assert_eq!(n, 56, "expected 56 weights for this conv-head config");
+        let weights: Vec<f32> = (0..n).map(|i| ((i % 5) as f32 - 2.0) * 0.1).collect();
+        let model = NamModel {
+            version: "0.7.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights,
+            sample_rate: None,
+            metadata: None,
+        };
+        let mut wn = WaveNet::new(&model).expect("conv-head model builds");
+        let signal: Vec<f32> = (0..256).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+        let want: Vec<f32> = {
+            let mut w = WaveNet::new(&model).unwrap();
+            signal.iter().map(|&x| w.process_sample(x)).collect()
+        };
+        let mut got = signal.clone();
+        wn.process_buffer(&mut got);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() < 1e-5, "sample {i}: block {g} vs per-sample {w}");
         }
     }
 }

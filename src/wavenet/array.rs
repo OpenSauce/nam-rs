@@ -37,10 +37,12 @@ pub(super) struct LayerArray {
 }
 
 impl LayerArray {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         input_size: usize,
         channels: usize,
         head_size: usize,
+        head_kernel_size: usize,
         rechannel_w: Vec<f32>,
         layers: Vec<Layer>,
         head_w: Vec<f32>,
@@ -49,7 +51,7 @@ impl LayerArray {
         Self {
             rechannel: Conv1d::new(input_size, channels, 1, 1, rechannel_w, None),
             layers,
-            head_rechannel: Conv1d::new(channels, head_size, 1, 1, head_w, head_b),
+            head_rechannel: Conv1d::new(channels, head_size, head_kernel_size, 1, head_w, head_b),
             channels,
             head_size,
             cur: vec![0.0; channels],
@@ -209,6 +211,7 @@ mod tests {
                 input_size,
                 channels,
                 head_size,
+                1,
                 mk(channels * input_size, 20),
                 vec![tanh_layer(1, 30), tanh_layer(2, 40), tanh_layer(4, 50)],
                 mk(head_size * channels, 60),
@@ -301,7 +304,7 @@ mod tests {
         // rechannel r=1 ; layer: z=2*x+0.5+cond ; relu ; out=3*post+0.1+x ;
         // head_rechannel h=0.5, no bias ; head_in = silence.
         let layer = relu_layer(1, vec![2.0], vec![0.5], vec![1.0], vec![3.0], vec![0.1]);
-        let mut array = LayerArray::new(1, 1, 1, vec![1.0], vec![layer], vec![0.5], None);
+        let mut array = LayerArray::new(1, 1, 1, 1, vec![1.0], vec![layer], vec![0.5], None);
 
         let mut head_out = vec![0.0];
         let mut array_out = vec![0.0];
@@ -318,7 +321,7 @@ mod tests {
         // rechannel=1 ; head_rechannel=1, no bias ; head_in=silence.
         let l0 = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
         let l1 = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
-        let mut array = LayerArray::new(1, 1, 1, vec![1.0], vec![l0, l1], vec![1.0], None);
+        let mut array = LayerArray::new(1, 1, 1, 1, vec![1.0], vec![l0, l1], vec![1.0], None);
 
         let mut head_out = vec![0.0];
         let mut array_out = vec![0.0];
@@ -335,7 +338,7 @@ mod tests {
         // head_rechannel weight=2, bias=[1] -> head_out = 2*10 + 1 = 21.
         let layer = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
         let mut array =
-            LayerArray::new(1, 1, 1, vec![1.0], vec![layer], vec![2.0], Some(vec![1.0]));
+            LayerArray::new(1, 1, 1, 1, vec![1.0], vec![layer], vec![2.0], Some(vec![1.0]));
 
         let mut head_out = vec![0.0];
         let mut array_out = vec![0.0];
@@ -349,8 +352,30 @@ mod tests {
     #[test]
     fn channels_and_head_size_reported() {
         let layer = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
-        let array = LayerArray::new(1, 1, 2, vec![1.0], vec![layer], vec![1.0, 1.0], None);
+        let array = LayerArray::new(1, 1, 2, 1, vec![1.0], vec![layer], vec![1.0, 1.0], None);
         assert_eq!(array.channels(), 1);
         assert_eq!(array.head_size(), 2);
+    }
+
+    #[test]
+    fn multitap_head_convolves_accumulated_head_over_time() {
+        // channels=1, head_size=1, head_kernel_size=2, no head bias. One identity-ish
+        // layer so the head accumulator each sample equals relu(input). The head
+        // rechannel is a 2-tap conv over the head-accum time series with weights
+        // [w_old, w_cur] = [10, 1]: head_out[t] = 1*acc[t] + 10*acc[t-1].
+        // Layer: conv w=1 b=0, ignore cond (mix w=0), 1x1 w=1 b=0, ReLU.
+        let layer = Layer::new(1, 1, 1, 1, Activation::Relu, false,
+            vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
+        // head_rechannel weights [out=1][in=1][k=2] = [w@oldest_tap, w@current_tap] = [10, 1].
+        let mut array = LayerArray::new(1, 1, 1, 2, vec![1.0], vec![layer], vec![10.0, 1.0], None);
+
+        let mut head_out = vec![0.0];
+        let mut array_out = vec![0.0];
+        // t0: input=2 -> acc=2 ; head = 1*2 + 10*0(silence) = 2
+        array.process_sample(&[2.0], &[0.0], &[0.0], &mut head_out, &mut array_out);
+        assert!((head_out[0] - 2.0).abs() < 1e-6, "t0 head={}", head_out[0]);
+        // t1: input=3 -> acc=3 ; head = 1*3 + 10*2 = 23
+        array.process_sample(&[3.0], &[0.0], &[0.0], &mut head_out, &mut array_out);
+        assert!((head_out[0] - 23.0).abs() < 1e-6, "t1 head={}", head_out[0]);
     }
 }

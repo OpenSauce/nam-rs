@@ -203,7 +203,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            primary,
             LayerWeights {
                 conv_w,
                 conv_b,

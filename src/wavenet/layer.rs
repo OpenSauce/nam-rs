@@ -20,7 +20,6 @@
 //! GATED/BLENDED). All scratch is pre-allocated in [`Layer::new`]; the `process_*`
 //! methods never allocate.
 
-use super::activation::Activation;
 use super::conv::{Conv1d, MAX_BLOCK};
 use super::film::FiLM;
 use super::gating::Gating;
@@ -96,14 +95,9 @@ pub(super) struct Layer {
 }
 
 impl Layer {
-    /// Build a layer from typed dims, a [`Gating`] value, the primary activation,
-    /// and the raw weight tensors (already split per sub-block in NAMCore order).
-    pub(super) fn new(
-        dims: LayerDims,
-        gating: Gating,
-        _primary: Activation,
-        w: LayerWeights,
-    ) -> Self {
+    /// Build a layer from typed dims, a [`Gating`] value (which owns the primary
+    /// activation), and the raw weight tensors (split per sub-block in NAMCore order).
+    pub(super) fn new(dims: LayerDims, gating: Gating, w: LayerWeights) -> Self {
         // `mid` is the conv/mixin output width; derive it from the Gating contract so
         // it cannot drift from the gating module.
         let mid = gating.input_rows();
@@ -327,6 +321,8 @@ impl Layer {
         let ch = self.channels;
         let bn = self.bottleneck;
         let hcw = self.head_contrib_width;
+        // Conditioning width: `condition_size * n` (mix_pre is one `condition_size` row).
+        let cond_w = self.mix_pre.len() * n;
 
         // 1. conv.
         let conv_in: &[f32] = if let Some(f) = &mut self.films[0] {
@@ -344,9 +340,9 @@ impl Layer {
 
         // 2. mixin.
         let mix_in: &[f32] = if let Some(f) = &mut self.films[2] {
-            let buf = &mut self.mix_pre_blk[..condition.len()];
+            let buf = &mut self.mix_pre_blk[..cond_w];
             f.process_block(condition, condition, buf, n);
-            &self.mix_pre_blk[..condition.len()]
+            &self.mix_pre_blk[..cond_w]
         } else {
             condition
         };
@@ -473,7 +469,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            primary,
             LayerWeights {
                 conv_w,
                 conv_b,
@@ -592,7 +587,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            Activation::Relu,
             LayerWeights {
                 conv_w: vec![1.0, 0.0, 0.0, 1.0],
                 conv_b: vec![0.0, 0.0],
@@ -636,7 +630,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            Activation::Relu,
             LayerWeights {
                 conv_w: vec![-2.0, 0.0],
                 conv_b: vec![0.0, 0.0],
@@ -678,7 +671,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            Activation::Relu,
             LayerWeights {
                 conv_w: vec![1.0, 0.0],
                 conv_b: vec![0.0],
@@ -721,7 +713,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            Activation::Relu,
             LayerWeights {
                 conv_w: vec![1.0, 0.0, 0.0, 1.0],
                 conv_b: vec![0.0, 0.0],
@@ -764,7 +755,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            Activation::Relu,
             LayerWeights {
                 conv_w: vec![1.0, 0.0, 0.0, 1.0],
                 conv_b: vec![0.0, 0.0],
@@ -809,7 +799,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            Activation::Relu,
             LayerWeights {
                 conv_w: vec![2.0],
                 conv_b: vec![0.0],
@@ -855,7 +844,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            Activation::Relu,
             LayerWeights {
                 conv_w: vec![0.0],
                 conv_b: vec![0.0],
@@ -905,7 +893,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating,
-            Activation::Relu,
             LayerWeights {
                 conv_w: vec![-2.0, 0.0],
                 conv_b: vec![0.0, 0.0],
@@ -944,7 +931,6 @@ mod tests {
                 film_groups: [1; 8],
             },
             gating_n,
-            Activation::Relu,
             LayerWeights {
                 conv_w: vec![3.0],
                 conv_b: vec![0.0],
@@ -1013,7 +999,6 @@ mod tests {
                     film_groups: [1; 8],
                 },
                 gating,
-                Activation::Tanh,
                 LayerWeights {
                     conv_w: mk(mid * channels * kernel, 1),
                     conv_b: mk(mid, 2),
@@ -1262,7 +1247,6 @@ mod tests {
                                     film_groups: [1; 8],
                                 },
                                 gating,
-                                Activation::Tanh,
                                 LayerWeights {
                                     conv_w: conv_w.clone(),
                                     conv_b: conv_b.clone(),

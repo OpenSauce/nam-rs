@@ -709,7 +709,6 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
                 film_groups,
             },
             gating,
-            primary,
             LayerWeights {
                 conv_w,
                 conv_b,

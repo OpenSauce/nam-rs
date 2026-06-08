@@ -25,9 +25,6 @@ pub(super) struct PostStackHead {
     sample_in: Vec<f32>,
 }
 
-// Wired into `WaveNet` over the following tasks; until then the type and its
-// methods are exercised only by this module's unit tests.
-#[allow(dead_code)]
 impl PostStackHead {
     pub(super) fn new(
         convs: Vec<(Activation, Conv1d)>,
@@ -63,7 +60,9 @@ impl PostStackHead {
     }
 
     /// Receptive field: `1 + Σ(kernel − 1)` over the chain (NAMCore
-    /// `Head::receptive_field`).
+    /// `Head::receptive_field`). The top-level [`WaveNet`](crate::WaveNet) receptive
+    /// field is computed from the config directly, so this is only a cross-check.
+    #[cfg(test)]
     pub(super) fn receptive_field(&self) -> usize {
         let mut rf = 1;
         for (_, c) in &self.convs {

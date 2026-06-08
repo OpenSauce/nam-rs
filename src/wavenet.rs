@@ -291,9 +291,6 @@ impl WaveNet {
 /// condition DSP, multi-channel input) and the within-array mixed-gating case remain
 /// unsupported.
 fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
-    if cfg.post_stack_head.is_some() {
-        return Err(Error::UnsupportedFeature("post-stack head".into()));
-    }
     if cfg.condition_dsp.is_some() {
         return Err(Error::UnsupportedFeature("condition_dsp".into()));
     }
@@ -580,6 +577,41 @@ mod tests {
         },
         "weights": [1.0, 2.0, 0.5, 1.0, 3.0, 0.1, 0.5, 10.0]
     }"#;
+
+    const TINY_HEAD: &str = r#"{
+        "version":"0.6.0","architecture":"WaveNet","config":{
+            "layers":[{"input_size":1,"condition_size":1,"channels":1,"head_size":1,
+                "kernel_size":1,"dilations":[1],"activation":"ReLU",
+                "gated":false,"head_bias":false}],
+            "head":{"channels":1,"out_channels":1,"kernel_sizes":[1],"activation":"ReLU"},
+            "head_scale":2.0},
+        "weights":[]}"#;
+
+    #[test]
+    fn post_stack_head_no_longer_rejected() {
+        let model0 = NamModel::from_json_str(TINY_HEAD).unwrap();
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        // Fill exact weight count (computed by expected_weight_count after Task 4).
+        let n = expected_weight_count(cfg).unwrap();
+        let model = NamModel {
+            version: "0.6.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights: vec![0.0; n],
+            sample_rate: None,
+            metadata: None,
+        };
+        // The build must NOT fail with the old post-stack-head guard.
+        match WaveNet::new(&model) {
+            Err(Error::UnsupportedFeature(f)) if f.contains("post-stack head") => {
+                panic!("post-stack head should no longer be guarded");
+            }
+            _ => {} // ok (builds, or fails for another reason until Tasks 3-5 land)
+        }
+    }
 
     #[test]
     fn default_path_unchanged_baseline() {

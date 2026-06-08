@@ -130,10 +130,11 @@ impl Conv1d {
         let ipg = self.in_per_group;
         for o in 0..self.out_ch {
             let mut acc = self.bias.as_ref().map_or(0.0, |b| b[o]);
+            // `in_base` = first input channel of this output's group; `wo` = start of
+            // output o's rows in the compact buffer (same offset the block path uses).
             let g = o / opg;
-            let in_base = g * ipg; // first input channel of this output's group
-                                   // Start of output o's rows in the compact buffer.
-            let wo = (g * opg + (o - g * opg)) * ipg * self.kernel;
+            let in_base = g * ipg;
+            let wo = o * ipg * self.kernel;
             for k in 0..self.kernel {
                 let back = (self.kernel - 1 - k) * self.dilation;
                 let col = (self.pos + self.ring_len - back) % self.ring_len;

@@ -346,9 +346,6 @@ impl WaveNet {
 /// condition DSP, multi-channel input) and the within-array mixed-gating case remain
 /// unsupported.
 fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
-    if cfg.condition_dsp.is_some() {
-        return Err(Error::UnsupportedFeature("condition_dsp".into()));
-    }
     if cfg.in_channels != 1 {
         return Err(Error::UnsupportedFeature("in_channels != 1".into()));
     }
@@ -713,6 +710,20 @@ mod tests {
             "head":{"channels":1,"out_channels":1,"kernel_sizes":[1],"activation":"ReLU"},
             "head_scale":2.0},
         "weights":[]}"#;
+
+    #[test]
+    fn condition_dsp_no_longer_rejected() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/wavenet_condition_dsp.nam");
+        let json = std::fs::read_to_string(path).expect("wavenet_condition_dsp.nam");
+        let model = NamModel::from_json_str(&json).expect("parse condition_dsp model");
+        match WaveNet::new(&model) {
+            Err(Error::UnsupportedFeature(f)) if f.contains("condition_dsp") => {
+                panic!("condition_dsp should no longer be guarded");
+            }
+            _ => {} // builds, or fails for another reason until Tasks 9-11
+        }
+    }
 
     #[test]
     fn weight_count_includes_post_stack_head() {

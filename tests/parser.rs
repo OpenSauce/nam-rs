@@ -17,17 +17,23 @@ fn a2_max_features_are_rejected_not_run() {
     // wavenet_a2_max.nam carries bottleneck/FiLM/groups/dict-activation etc.
     // It must error cleanly (UnsupportedFeature or WeightCountMismatch), never panic.
     match build_fixture("wavenet_a2_max.nam") {
-        Err(Error::UnsupportedFeature(_)) | Err(Error::WeightCountMismatch { .. }) => {}
+        Err(Error::UnsupportedFeature(_))
+        | Err(Error::WeightCountMismatch { .. })
+        | Err(Error::UnsupportedActivation(_)) => {}
         other => panic!("expected a clean rejection, got {other:?}"),
     }
 }
 
 #[test]
-fn condition_dsp_is_rejected_not_run() {
-    // 147 == 147 reconciles, so the weight-count check passes; the guard must catch it.
+fn condition_dsp_no_longer_rejected_by_guard() {
+    // condition_dsp is no longer a hard-guarded unsupported feature: it must not error
+    // with `UnsupportedFeature("condition_dsp")`. (Full forward parity is covered by
+    // the parity suite's `condition_dsp_matches_namcore_oracle`.)
     match build_fixture("wavenet_condition_dsp.nam") {
-        Err(Error::UnsupportedFeature(msg)) => assert!(msg.contains("condition_dsp"), "{msg}"),
-        other => panic!("expected UnsupportedFeature(condition_dsp), got {other:?}"),
+        Err(Error::UnsupportedFeature(msg)) if msg.contains("condition_dsp") => {
+            panic!("condition_dsp should no longer be guarded");
+        }
+        _ => {}
     }
 }
 

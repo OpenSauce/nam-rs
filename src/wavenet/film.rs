@@ -79,6 +79,25 @@ impl FiLM {
         }
     }
 
+    /// In-place: `buf = buf ⊙ scale (+ shift)`. `buf` is `input_dim` wide,
+    /// `condition` is `condition_dim` wide.
+    pub(super) fn process_sample_(&mut self, buf: &mut [f32], condition: &[f32]) {
+        debug_assert_eq!(buf.len(), self.input_dim);
+        self.cond_to_scale_shift
+            .process_sample(condition, &mut self.ss);
+        let d = self.input_dim;
+        if self.shift {
+            let (scale, sh) = self.ss.split_at(d);
+            for ((b, &s), &h) in buf.iter_mut().zip(scale).zip(sh) {
+                *b = *b * s + h;
+            }
+        } else {
+            for (b, &s) in buf.iter_mut().zip(&self.ss) {
+                *b *= s;
+            }
+        }
+    }
+
     /// Rows the internal Conv1x1 emits: `(shift ? 2 : 1) * input_dim`.
     #[cfg(test)]
     pub(super) fn out_rows(&self) -> usize {
@@ -123,5 +142,25 @@ mod tests {
         let mut out = vec![0.0; 2];
         f.process_sample(&[1.0, 1.0], &[2.0], &mut out);
         assert_eq!(out, vec![16.0, 20.0]);
+    }
+
+    #[test]
+    fn process_sample_in_place_matches_out_of_place() {
+        // Same params as scale_and_shift, applied in place.
+        // ss = [6,8,10,12]; buf=[1,1] -> [16, 20].
+        let mut f = FiLM::new(1, 2, true, 1, vec![3.0, 4.0, 5.0, 6.0], vec![0.0; 4]);
+        let mut buf = vec![1.0, 1.0];
+        f.process_sample_(&mut buf, &[2.0]);
+        assert_eq!(buf, vec![16.0, 20.0]);
+    }
+
+    #[test]
+    fn process_sample_in_place_scale_only_uses_old_input() {
+        // Guard the read-then-write order: scale-only, input_dim=1.
+        // W=[2.0] bias=[0], cond=[3] -> scale=6; buf=5 -> 30.
+        let mut f = FiLM::new(1, 1, false, 1, vec![2.0], vec![0.0]);
+        let mut buf = vec![5.0];
+        f.process_sample_(&mut buf, &[3.0]);
+        assert_eq!(buf, vec![30.0]);
     }
 }

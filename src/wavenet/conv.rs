@@ -29,6 +29,10 @@ pub(super) struct Conv1d {
     kernel: usize,
     dilation: usize,
     /// Number of convolution groups (block-diagonal). `1` is the dense fast path.
+    /// Retained as the canonical group count; the forward paths derive their
+    /// iteration from `out_per_group`/`in_per_group`, and the Generalized Layer
+    /// phase reads it when wiring grouped layers.
+    #[allow(dead_code)]
     groups: usize,
     /// `out_ch / groups`.
     out_per_group: usize,
@@ -128,7 +132,7 @@ impl Conv1d {
             let mut acc = self.bias.as_ref().map_or(0.0, |b| b[o]);
             let g = o / opg;
             let in_base = g * ipg; // first input channel of this output's group
-            // Start of output o's rows in the compact buffer.
+                                   // Start of output o's rows in the compact buffer.
             let wo = (g * opg + (o - g * opg)) * ipg * self.kernel;
             for k in 0..self.kernel {
                 let back = (self.kernel - 1 - k) * self.dilation;
@@ -136,8 +140,8 @@ impl Conv1d {
                 let rbase = col * self.in_ch;
                 for jl in 0..ipg {
                     // jl is the local (in-group) input index; jl*kernel+k walks taps.
-                    acc += self.weights[wo + jl * self.kernel + k]
-                        * self.ring[rbase + in_base + jl];
+                    acc +=
+                        self.weights[wo + jl * self.kernel + k] * self.ring[rbase + in_base + jl];
                 }
             }
             out[o] = acc;
@@ -413,10 +417,10 @@ mod tests {
         // (in_ch, out_ch, kernel, dilation, groups) — all divisible by groups.
         let cases = [
             (4_usize, 4_usize, 1_usize, 1_usize, 2_usize),
-            (4, 4, 2, 2, 2),      // grouped, dilated
-            (4, 4, 3, 1, 4),      // depthwise (groups == in == out)
-            (6, 4, 2, 1, 2),      // out_per_group=2, in_per_group=3
-            (4, 6, 2, 3, 2),      // out_per_group=3, in_per_group=2, dilation wraps
+            (4, 4, 2, 2, 2), // grouped, dilated
+            (4, 4, 3, 1, 4), // depthwise (groups == in == out)
+            (6, 4, 2, 1, 2), // out_per_group=2, in_per_group=3
+            (4, 6, 2, 3, 2), // out_per_group=3, in_per_group=2, dilation wraps
         ];
         for (in_ch, out_ch, kernel, dilation, groups) in cases {
             let wlen = out_ch * in_ch * kernel / groups;
@@ -434,8 +438,15 @@ mod tests {
                 .collect();
 
             // Reference: per-sample.
-            let mut a =
-                Conv1d::new_grouped(in_ch, out_ch, kernel, dilation, groups, w.clone(), Some(bias.clone()));
+            let mut a = Conv1d::new_grouped(
+                in_ch,
+                out_ch,
+                kernel,
+                dilation,
+                groups,
+                w.clone(),
+                Some(bias.clone()),
+            );
             let mut want = vec![0.0; out_ch];
             let want_all: Vec<Vec<f32>> = xs
                 .iter()

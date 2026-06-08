@@ -54,7 +54,6 @@ impl PostStackHead {
         self.in_channels
     }
 
-    #[cfg(test)]
     pub(super) fn out_channels(&self) -> usize {
         self.out_channels
     }

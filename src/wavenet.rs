@@ -13,7 +13,10 @@
 //! `head_scale` scaling its input; its output is the model output) and an optional
 //! **`condition_dsp`** (a nested standalone [`crate::Model`] whose output replaces the
 //! raw mono input as the conditioning fed to every array — the raw input still drives
-//! the first array's layer input, matching NAM Core).
+//! the first array's layer input, matching NAM Core). The `condition_dsp` may emit
+//! several output channels, producing an N-wide planar conditioning fed to every array
+//! (`condition_size` must equal that channel count); the outer WaveNet stays
+//! mono-output.
 
 use crate::error::Error;
 use crate::model::{GatingMode, LayerArrayConfig, NamModel, WaveNetConfig};
@@ -49,10 +52,17 @@ pub struct WaveNet {
     /// Optional nested `condition_dsp` model. When present, its output replaces the
     /// raw mono input as the conditioning fed to every array; the raw input still
     /// drives the first array's layer input (NAMCore semantics). Boxed to break the
-    /// `Model → WaveNet → Model` type cycle. Mono-in/mono-out for this phase.
+    /// `Model → WaveNet → Model` type cycle. It is mono-in but may emit several output
+    /// channels (`cond_out_ch`), which become the N-wide conditioning fed to the arrays.
     condition_dsp: Option<Box<crate::Model>>,
-    /// Pre-allocated `MAX_BLOCK` scratch holding `condition_dsp(input)`; reused each
-    /// chunk so the hot path allocates nothing.
+    /// Conditioning width fed to every array: `condition_dsp.num_output_channels()`
+    /// when a `condition_dsp` is present, else `1` (the raw mono input). Every array's
+    /// `condition_size` must equal this (validated in [`WaveNet::new`], mirroring
+    /// NAMCore's assert).
+    cond_out_ch: usize,
+    /// Pre-allocated `cond_out_ch × MAX_BLOCK` planar `[ch][t]` scratch holding the
+    /// conditioning (`condition_dsp(input)`, or a mirror of the raw input when there's
+    /// no `condition_dsp`); reused each chunk so the hot path allocates nothing.
     cond_dsp_out: Vec<f32>,
     head_scale: f32,
     /// Samples of input history the deepest dilated tap reaches back over; equals
@@ -99,6 +109,26 @@ impl WaveNet {
             Some(nested) => Some(Box::new(crate::Model::from_nam(nested)?)),
             None => None,
         };
+
+        // Conditioning width: the condition_dsp's output-channel count (else mono).
+        // NAMCore-parity validation (model.cpp ~line 594): every array's
+        // `condition_size` must match the condition_dsp's output channels, else the
+        // mixin conv would read the wrong number of conditioning rows. This is a
+        // build-time check (off the audio thread), mirroring NAMCore's assert.
+        let cond_out_ch = condition_dsp
+            .as_ref()
+            .map_or(1, |m| m.num_output_channels());
+        if let Some(cdsp) = &condition_dsp {
+            let n_out = cdsp.num_output_channels();
+            for (i, la) in cfg.layers.iter().enumerate() {
+                if la.condition_size != n_out {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "condition_size of layer {i} ({}) != condition_dsp output channels ({n_out})",
+                        la.condition_size
+                    )));
+                }
+            }
+        }
 
         let expected = expected_weight_count(cfg)?;
         if expected != model.weights.len() {
@@ -178,7 +208,8 @@ impl WaveNet {
             post_stack_head,
             head_scale_scratch: vec![0.0; head_in_channels * MAX_BLOCK],
             condition_dsp,
-            cond_dsp_out: vec![0.0; MAX_BLOCK],
+            cond_out_ch,
+            cond_dsp_out: vec![0.0; cond_out_ch * MAX_BLOCK],
             head_scale,
             receptive_field: receptive_field(cfg, rf_base),
             head_in0,
@@ -234,39 +265,48 @@ impl WaveNet {
         }
     }
 
-    /// Run one `n <= MAX_BLOCK` chunk through every array via the planar block path.
-    /// `chunk` is the mono input and is overwritten with the output.
-    fn process_chunk(&mut self, chunk: &mut [f32], n: usize) {
-        // The raw mono input drives the first array's *layer input* and (when there's
-        // no condition_dsp) the conditioning; copy it out before we overwrite `chunk`.
-        self.cond_blk[..n].copy_from_slice(chunk);
+    /// Number of output channels this WaveNet emits, matching NAMCore
+    /// (`WaveNet::NumOutputChannels`): the post-stack head's `out_channels` when a head
+    /// is present, else the last layer-array's `head_size`. The outer model is mono
+    /// (`1`); this is consulted when this WaveNet is a nested `condition_dsp` whose
+    /// rows become the parent's N-wide conditioning.
+    pub(crate) fn num_output_channels(&self) -> usize {
+        match &self.post_stack_head {
+            Some(h) => h.out_channels(),
+            None => self.arrays.last().map_or(1, LayerArray::head_size),
+        }
+    }
 
+    /// Run one `n <= MAX_BLOCK` chunk through every array via the planar block path,
+    /// leaving the last array's head output in `head_a_blk` (`last_head_size × n`,
+    /// planar). **Requires** `self.cond_blk[..n]` to already hold the mono layer input.
+    /// Shared by the mono `process_chunk` and the multi-channel `process_block_multi`.
+    fn run_arrays_block(&mut self, n: usize) {
         // The conditioning fed to every array is `condition_dsp(input)` when present,
-        // else the raw input (NAMCore `_process_condition`). condition_dsp is
-        // mono-in/mono-out here, so its output is one row of `n` samples.
-        let use_cdsp = if let Some(cdsp) = &mut self.condition_dsp {
-            self.cond_dsp_out[..n].copy_from_slice(&self.cond_blk[..n]);
-            cdsp.process_buffer(&mut self.cond_dsp_out[..n]);
-            true
+        // else the raw input (NAMCore `_process_condition`). Fill it uniformly into
+        // `cond_dsp_out` so the array loop always reads the same `cond_ch × n` planar
+        // slice — the condition_dsp may emit several rows (`cond_ch`).
+        let cond_ch = self.cond_out_ch;
+        if let Some(cdsp) = &mut self.condition_dsp {
+            cdsp.process_block_multi(
+                &self.cond_blk[..n],
+                &mut self.cond_dsp_out[..cond_ch * n],
+                n,
+            );
         } else {
-            false
-        };
+            self.cond_dsp_out[..n].copy_from_slice(&self.cond_blk[..n]); // cond_ch == 1
+        }
 
-        // First array: layer input is the raw signal; condition is the chosen
-        // conditioning slice; the incoming head is silence (`head_in`-wide).
+        // First array: layer input is the raw signal; condition is the `cond_ch × n`
+        // conditioning; the incoming head is silence (`head_in`-wide).
         self.head_a_blk[..self.head_in0 * n].fill(0.0);
         {
             let hin = self.arrays[0].head_in();
             let ch = self.arrays[0].channels();
             let hs = self.arrays[0].head_size();
-            let cond: &[f32] = if use_cdsp {
-                &self.cond_dsp_out[..n]
-            } else {
-                &self.cond_blk[..n]
-            };
             self.arrays[0].process_block(
                 &self.cond_blk[..n],
-                cond,
+                &self.cond_dsp_out[..cond_ch * n],
                 &self.head_a_blk[..hin * n],
                 &mut self.head_b_blk[..hs * n],
                 &mut self.sig_b_blk[..ch * n],
@@ -281,14 +321,9 @@ impl WaveNet {
             let hin = self.arrays[i].head_in();
             let ch = self.arrays[i].channels();
             let hs = self.arrays[i].head_size();
-            let cond: &[f32] = if use_cdsp {
-                &self.cond_dsp_out[..n]
-            } else {
-                &self.cond_blk[..n]
-            };
             self.arrays[i].process_block(
                 &self.sig_a_blk[..in_w * n],
-                cond,
+                &self.cond_dsp_out[..cond_ch * n],
                 &self.head_a_blk[..hin * n],
                 &mut self.head_b_blk[..hs * n],
                 &mut self.sig_b_blk[..ch * n],
@@ -297,6 +332,19 @@ impl WaveNet {
             std::mem::swap(&mut self.head_a_blk, &mut self.head_b_blk);
             std::mem::swap(&mut self.sig_a_blk, &mut self.sig_b_blk);
         }
+    }
+
+    /// Run one `n <= MAX_BLOCK` chunk through every array via the planar block path.
+    /// `chunk` is the mono input and is overwritten with the (mono) output.
+    ///
+    /// This is the in-place, mono-output specialization of [`Self::process_block_multi`]
+    /// (the outer model's final head is one channel); it shares the array stack via
+    /// [`Self::run_arrays_block`] and only the final emit differs.
+    fn process_chunk(&mut self, chunk: &mut [f32], n: usize) {
+        // The raw mono input drives the first array's *layer input* and (when there's
+        // no condition_dsp) the conditioning; copy it out before we overwrite `chunk`.
+        self.cond_blk[..n].copy_from_slice(chunk);
+        self.run_arrays_block(n);
 
         // After the final swap, head_a_blk holds the last array's head output.
         match &mut self.post_stack_head {
@@ -322,25 +370,72 @@ impl WaveNet {
         }
     }
 
+    /// Run one `n <= MAX_BLOCK` chunk through every array, emitting
+    /// `num_output_channels() × n` planar `[ch][t]` into `out` from mono `input[..n]`.
+    ///
+    /// This is the multi-channel-output twin of [`Self::process_chunk`]: used when this
+    /// WaveNet is a nested `condition_dsp` whose rows become the parent's conditioning
+    /// (the outer model emits one channel and uses the mono path). Allocation-free.
+    pub(crate) fn process_block_multi(&mut self, input: &[f32], out: &mut [f32], n: usize) {
+        if self.arrays.is_empty() {
+            // No arrays: output = head_scale · input, mono (n_out == 1).
+            for (o, &x) in out[..n].iter_mut().zip(&input[..n]) {
+                *o = self.head_scale * x;
+            }
+            return;
+        }
+        self.cond_blk[..n].copy_from_slice(&input[..n]);
+        self.run_arrays_block(n);
+
+        // After the final swap, head_a_blk holds the last array's head output.
+        match &mut self.post_stack_head {
+            None => {
+                // No post-stack head: output = head_scale · final head, all `oc` rows.
+                let oc = self.arrays.last().map_or(1, LayerArray::head_size);
+                for (o, &h) in out[..oc * n].iter_mut().zip(&self.head_a_blk[..oc * n]) {
+                    *o = self.head_scale * h;
+                }
+            }
+            Some(head) => {
+                // head_scale scales the head's INPUT; the chain runs and its full
+                // `out_channels × n` output is the conditioning rows.
+                let in_ch = head.in_channels();
+                let scaled = &mut self.head_scale_scratch[..in_ch * n];
+                for (s, &h) in scaled.iter_mut().zip(&self.head_a_blk[..in_ch * n]) {
+                    *s = self.head_scale * h;
+                }
+                let oc = head.out_channels();
+                let produced = head.process_block(scaled, n); // [out_channels][n]
+                out[..oc * n].copy_from_slice(&produced[..oc * n]);
+            }
+        }
+    }
+
     /// Process a single mono sample, returning one output sample.
     ///
     /// Equivalent to a one-element [`Self::process_buffer`]; convenient for
     /// callers that are not buffer-oriented. Allocation-free.
     pub fn process_sample(&mut self, x: f32) -> f32 {
-        // `input` is the raw mono sample (first array's layer input); `cond` is the
-        // conditioning: `condition_dsp(x)` when present, else `x` (NAMCore semantics).
+        // `input` is the raw mono sample (first array's layer input). The conditioning
+        // is `condition_dsp(x)` when present, else `x` (NAMCore semantics). Route it
+        // through the same `process_block_multi(n=1)` path the block kernel uses, so
+        // per-sample ≡ block for the condition_dsp too; the (possibly multi-row,
+        // `cond_ch`-wide) result lives in `cond_dsp_out`.
         let input = [x];
-        let cond = match &mut self.condition_dsp {
-            Some(cdsp) => [cdsp.process_sample(x)],
-            None => [x],
-        };
+        let cond_ch = self.cond_out_ch;
+        if let Some(cdsp) = &mut self.condition_dsp {
+            cdsp.process_block_multi(&input, &mut self.cond_dsp_out[..cond_ch], 1);
+        } else {
+            self.cond_dsp_out[0] = x;
+        }
         let n = self.arrays.len();
         if n == 0 {
             return self.head_scale * x;
         }
 
-        // First array: layer input is the raw sample, condition is `cond`; the
-        // incoming head is silence of the array's head-accumulator width (`head_in`).
+        // First array: layer input is the raw sample, condition is the `cond_ch`-wide
+        // conditioning; the incoming head is silence of the array's head-accumulator
+        // width (`head_in`).
         self.head_a[..self.head_in0].fill(0.0);
         {
             let hin = self.arrays[0].head_in();
@@ -348,7 +443,7 @@ impl WaveNet {
             let hs = self.arrays[0].head_size();
             self.arrays[0].process_sample(
                 &input,
-                &cond,
+                &self.cond_dsp_out[..cond_ch],
                 &self.head_a[..hin],
                 &mut self.head_b[..hs],
                 &mut self.sig_b[..ch],
@@ -364,7 +459,7 @@ impl WaveNet {
             let hs = self.arrays[i].head_size();
             self.arrays[i].process_sample(
                 &self.sig_a[..in_w],
-                &cond,
+                &self.cond_dsp_out[..cond_ch],
                 &self.head_a[..hin],
                 &mut self.head_b[..hs],
                 &mut self.sig_b[..ch],
@@ -409,26 +504,17 @@ impl WaveNet {
 /// [`Error::UnsupportedFeature`] (rather than silently mis-running). The per-layer A2
 /// features (grouped convs, head1x1, bottleneck≠channels, all 8 FiLM sites, BLENDED
 /// gating, non-sigmoid secondaries, inactive layer1x1) are fully supported by
-/// [`Layer`], and the two top-level features — the post-stack head and a (mono)
-/// `condition_dsp` — are now supported (their build paths consume/own their weights
-/// and run on the hot path). The remaining unsupported cases, all rejected here or at
-/// their build site: multi-channel input (`in_channels != 1`); within-array mixed
-/// gating; a multi-channel-output `condition_dsp` (any `condition_size != 1`, rejected
-/// here); and a post-stack head with `out_channels != 1` (rejected in its builder).
+/// [`Layer`], and the two top-level features — the post-stack head and the
+/// `condition_dsp` (incl. a multi-channel-output one feeding `condition_size > 1`
+/// arrays) — are now supported (their build paths consume/own their weights and run on
+/// the hot path). The remaining unsupported cases, all rejected here or at their build
+/// site: multi-channel input (`in_channels != 1`); within-array mixed gating; and a
+/// post-stack head with `out_channels != 1` (rejected in its builder). The
+/// `condition_size == condition_dsp` output-channel match is validated post-build in
+/// [`WaveNet::new`] (it needs the built nested model's channel count).
 fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
     if cfg.in_channels != 1 {
         return Err(Error::UnsupportedFeature("in_channels != 1".into()));
-    }
-    // This engine is mono: a `condition_dsp` (a standalone `Model`) outputs a single
-    // channel, so it can only feed arrays whose `condition_size == 1`. NAMCore asserts
-    // `condition_size == condition_dsp->NumOutputChannels()` (model.cpp); the multi-output
-    // case (e.g. the `wavenet_condition_dsp.nam` example, `condition_size == 3`) is not yet
-    // runnable here. Reject it at build time with a clear error rather than letting the
-    // mixin conv slice out of bounds on the audio thread.
-    if cfg.condition_dsp.is_some() && cfg.layers.iter().any(|la| la.condition_size != 1) {
-        return Err(Error::UnsupportedFeature(
-            "multi-channel-output condition_dsp (condition_size != 1)".into(),
-        ));
     }
     for la in &cfg.layers {
         // The array builds one `Gating` from the uniform `gating_mode()`; a layer-array
@@ -859,23 +945,34 @@ mod tests {
     }
 
     #[test]
-    fn multi_channel_condition_dsp_rejected_cleanly_not_panicking() {
-        // The `wavenet_condition_dsp.nam` example feeds arrays with `condition_size == 3`.
-        // This engine is mono (condition_dsp outputs one channel), so it cannot run — but
-        // it MUST reject at build time with a clear error, never build an unrunnable model
-        // that panics out-of-bounds in the mixin conv on the audio thread. (The supported
-        // mono case is covered by `condition_dsp_mono_builds_and_runs` / the parity suite.)
+    fn multi_channel_condition_dsp_builds_and_block_equals_per_sample() {
+        // The `wavenet_condition_dsp.nam` example feeds arrays with `condition_size == 3`,
+        // fed by a nested WaveNet emitting 3 output channels. It MUST build (no rejection)
+        // and the block path must equal the per-sample path, proving the N-wide
+        // conditioning is applied consistently across both. Absolute parity vs the oracle
+        // is covered by the parity suite.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/wavenet_condition_dsp.nam");
         let json = std::fs::read_to_string(path).expect("wavenet_condition_dsp.nam");
         let model = NamModel::from_json_str(&json).expect("parse condition_dsp model");
-        match WaveNet::new(&model) {
-            Err(Error::UnsupportedFeature(f)) => assert!(
-                f.contains("condition_dsp") || f.contains("condition_size"),
-                "expected a condition_dsp/condition_size rejection, got {f:?}"
-            ),
-            Err(Error::UnsupportedActivation(_)) => {} // also a clean rejection
-            other => panic!("expected a clean build-time rejection, got {other:?}"),
+
+        let len = MAX_BLOCK + 173;
+        let signal: Vec<f32> = (0..len).map(|i| (i as f32 * 0.017).sin() * 0.4).collect();
+
+        let mut per_sample = WaveNet::new(&model).expect("multi-channel condition_dsp builds");
+        assert!(per_sample.has_condition_dsp());
+        let want: Vec<f32> = signal
+            .iter()
+            .map(|&x| per_sample.process_sample(x))
+            .collect();
+        let mut block = WaveNet::new(&model).unwrap();
+        let mut got = signal.clone();
+        block.process_buffer(&mut got);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-5,
+                "sample {i}: block {g}, per-sample {w}"
+            );
         }
     }
 

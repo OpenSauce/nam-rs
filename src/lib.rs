@@ -21,10 +21,11 @@
 //! The A2 feature set is supported: FiLM, gating, bottleneck, grouped convs, the
 //! per-array head (incl. multi-tap conv heads), the optional post-stack head
 //! (`activation → Conv1d` chain run after the arrays, with `head_scale` scaling its
-//! input), and a (mono) `condition_dsp` (a nested model whose output replaces the
-//! conditioning fed to every array). The remaining restrictions — multi-channel input
-//! (`in_channels != 1`), a multi-channel-output `condition_dsp` or a post-stack head
-//! with `out_channels != 1`, mixed gating modes within one array, and exotic
+//! input), and a `condition_dsp` (a nested model whose output replaces the
+//! conditioning fed to every array — including a multi-channel-output one, whose N rows
+//! become the N-wide conditioning fed to every array). The remaining restrictions —
+//! multi-channel input (`in_channels != 1`), a post-stack head with `out_channels != 1`,
+//! mixed gating modes within one array, and exotic
 //! activations — are **rejected** with [`Error::UnsupportedFeature`] (or
 //! [`Error::UnsupportedActivation`]) rather than silently mis-run.
 //!

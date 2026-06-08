@@ -142,6 +142,32 @@ impl Model {
         }
     }
 
+    /// Number of output channels this model emits, matching NAM Core. WaveNet defers to
+    /// its post-stack head / last layer-array; LSTM is always mono. Used when this model
+    /// is a nested `condition_dsp` whose rows become the parent's N-wide conditioning.
+    pub(crate) fn num_output_channels(&self) -> usize {
+        match self {
+            Model::WaveNet(w) => w.num_output_channels(),
+            Model::Lstm(_) => 1,
+            Model::Slimmable(s) => s.submodels[s.active].num_output_channels(),
+        }
+    }
+
+    /// Run a mono `input[..n]` chunk, writing `num_output_channels() × n` planar
+    /// `[ch][t]` into `out`. Allocation-free; used to produce a nested `condition_dsp`'s
+    /// multi-channel conditioning for the parent WaveNet.
+    pub(crate) fn process_block_multi(&mut self, input: &[f32], out: &mut [f32], n: usize) {
+        match self {
+            Model::WaveNet(w) => w.process_block_multi(input, out, n),
+            Model::Lstm(l) => {
+                // LSTM is always mono-out: copy the input into `out` and run in place.
+                out[..n].copy_from_slice(&input[..n]);
+                l.process_buffer(&mut out[..n]);
+            }
+            Model::Slimmable(s) => s.submodels[s.active].process_block_multi(input, out, n),
+        }
+    }
+
     /// The width-selectable container, if this model is one. Use it to drive the
     /// slim dial ([`Slimmable::select`] / [`Slimmable::set_slim_size`]); plain
     /// WaveNet/LSTM models return `None`.

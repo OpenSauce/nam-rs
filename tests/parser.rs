@@ -39,21 +39,16 @@ fn mono_condition_dsp_is_supported_not_blanket_guarded() {
 }
 
 #[test]
-fn multi_channel_condition_dsp_is_cleanly_rejected_not_panicking() {
-    // This engine is mono, so a condition_dsp feeding arrays with `condition_size != 1`
-    // (the NAMCore `wavenet_condition_dsp.nam` example uses `condition_size == 3`) cannot
-    // run. It MUST be rejected at build time with a clear `UnsupportedFeature` — never
-    // build and then panic out-of-bounds in the mixin conv on the audio thread.
-    match build_fixture("wavenet_condition_dsp.nam") {
-        Err(Error::UnsupportedFeature(msg)) => assert!(
-            msg.contains("condition_dsp") || msg.contains("condition_size"),
-            "expected a condition_dsp/condition_size rejection, got {msg:?}"
-        ),
-        // A different clean rejection (e.g. an exotic activation in the example) is also
-        // acceptable — what must NOT happen is a successful build of an unrunnable model.
-        Err(Error::UnsupportedActivation(_)) => {}
-        other => panic!("expected a clean build-time rejection, got {other:?}"),
-    }
+fn multi_channel_condition_dsp_builds_and_runs() {
+    // A multi-channel-output condition_dsp is now supported: the NAMCore
+    // `wavenet_condition_dsp.nam` example feeds arrays with `condition_size == 3`, fed by
+    // a nested WaveNet emitting 3 output channels. It must BUILD and RUN (the N rows of
+    // the nested model become the N-wide conditioning) — never reject, never panic.
+    // Steady-state parity vs the oracle is covered by the parity suite.
+    let mut m =
+        build_fixture("wavenet_condition_dsp.nam").expect("multi-channel condition_dsp must build");
+    let mut buf = vec![0.1_f32; 256];
+    m.process_buffer(&mut buf); // must not panic
 }
 
 #[test]

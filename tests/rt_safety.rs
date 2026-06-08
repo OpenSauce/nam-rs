@@ -91,6 +91,26 @@ fn condition_dsp_process_buffer_does_not_allocate() {
 }
 
 #[test]
+fn multi_channel_condition_dsp_process_buffer_does_not_allocate() {
+    // A multi-channel-output condition_dsp (the `wavenet_condition_dsp.nam` example,
+    // `condition_size == 3`) runs the nested model via `process_block_multi`, writing
+    // its 3 output rows into the parent's pre-allocated `cond_dsp_out` (sized
+    // `cond_out_ch × MAX_BLOCK` in `new`). The nested `Model::process_block_multi` is
+    // RT-safe by contract, so the whole `process_buffer` must stay alloc-free.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wavenet_condition_dsp.nam");
+    let json = std::fs::read_to_string(path).expect("wavenet_condition_dsp.nam");
+    let model = NamModel::from_json_str(&json).expect("parse model");
+    let mut wn = WaveNet::new(&model).expect("multi-channel condition_dsp builds");
+    let mut buffer = vec![0.0_f32; 2100]; // > MAX_BLOCK
+
+    wn.process_buffer(&mut buffer); // warm up off-guard (both nested + outer)
+    assert_no_alloc(|| {
+        wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
 fn a2_synthetic_process_buffer_does_not_allocate() {
     // The richest A2 path: FiLM + BLENDED gating + layer1x1_post_film. Every FiLM owns
     // pre-allocated scratch, Gating is scratchless, and the Layer's `*_blk` buffers are

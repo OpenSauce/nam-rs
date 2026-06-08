@@ -76,9 +76,10 @@ gain-staging.
 
 The A2 feature set is supported: FiLM, gating, bottleneck, grouped convs, multi-tap conv
 heads, the optional post-stack head (an `activation → Conv1d` chain after the arrays, with
-`head_scale` scaling its input), and a (mono) `condition_dsp` (a nested model whose output
-replaces the conditioning fed to every array). The remaining restrictions — multi-channel
-input, a multi-channel-output `condition_dsp` or post-stack head, mixed gating modes within
+`head_scale` scaling its input), and a `condition_dsp` (a nested model whose output
+replaces the conditioning fed to every array, including a multi-channel-output one whose N
+rows become the N-wide conditioning). The remaining restrictions — multi-channel
+input, a post-stack head with `out_channels != 1`, mixed gating modes within
 one array, and exotic activations — are rejected with a clear `Error::UnsupportedFeature`
 (or `Error::UnsupportedActivation`) rather than silently mis-run.
 

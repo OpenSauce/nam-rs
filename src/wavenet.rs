@@ -72,6 +72,25 @@ impl WaveNet {
         for la in &cfg.layers {
             arrays.push(build_array(&mut r, la)?);
         }
+        // Head-carry invariant: each array's head output feeds the next array's head
+        // input, and the per-sample/per-block paths size that carried buffer by the
+        // *consumer's* channel count (`arrays[i].channels()`). So the producer's head
+        // width must match: `arrays[i-1].head_size() == arrays[i].channels()`. Holds
+        // for every real model and the 2-array A1 parity fixture; guard it explicitly
+        // so a future multi-array A2 model that chains mismatched widths fails loudly
+        // here instead of silently reading stale/garbage head rows.
+        for i in 1..arrays.len() {
+            let produced = arrays[i - 1].head_size();
+            let consumed = arrays[i].channels();
+            if produced != consumed {
+                return Err(Error::UnsupportedFeature(format!(
+                    "layer-array head-carry width mismatch: array {} head_size {produced} \
+                     != array {i} channels {consumed}",
+                    i - 1
+                )));
+            }
+        }
+
         let head_scale = r.take(1)[0];
         // The up-front check guarantees `expected == weights.len()`; this asserts the
         // other half of the invariant — that building consumed exactly `expected`, so
@@ -290,7 +309,7 @@ fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
                 return Err(Error::UnsupportedFeature("FiLM".into()));
             }
         }
-        let first = la.gating_modes[0];
+        let first = la.gating_mode();
         if la.gating_modes.iter().any(|&g| g != first) {
             return Err(Error::UnsupportedFeature("mixed gating modes".into()));
         }
@@ -337,7 +356,7 @@ fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
     let mut total = 0usize;
     for la in &cfg.layers {
         total = add(total, mul(la.channels, la.input_size)?)?; // rechannel (no bias)
-        let gated = la.gating_modes[0] == GatingMode::Gated;
+        let gated = la.gating_mode() == GatingMode::Gated;
         let mid = if gated {
             mul(2, la.channels)?
         } else {
@@ -361,7 +380,7 @@ fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
 }
 
 fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Error> {
-    let gated = la.gating_modes[0] == GatingMode::Gated;
+    let gated = la.gating_mode() == GatingMode::Gated;
     let mid = if gated { 2 * la.channels } else { la.channels };
 
     let rechannel_w = r.take(la.channels * la.input_size);
@@ -539,10 +558,12 @@ mod tests {
                 "kernel_size": 3, "dilations": [1], "activation": "Tanh",
                 "gated": false, "head_bias": true
             }))], // head_bias
-            // two arrays: the second takes the first's channels as its input_size.
+            // two arrays: the second takes the first's channels as its input_size,
+            // and the first's head_size must equal the second's channels (the
+            // head-carry invariant guarded in `WaveNet::new`).
             vec![
                 mk_layer(serde_json::json!({
-                    "input_size": 1, "condition_size": 1, "channels": 4, "head_size": 1,
+                    "input_size": 1, "condition_size": 1, "channels": 4, "head_size": 2,
                     "kernel_size": 3, "dilations": [1, 2], "activation": "Tanh",
                     "gated": false, "head_bias": false
                 })),

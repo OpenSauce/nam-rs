@@ -552,6 +552,20 @@ pub struct LayerArrayConfig {
     pub head1x1_post_film: FilmConfig,
 }
 
+impl LayerArrayConfig {
+    /// The array's uniform gating mode.
+    ///
+    /// `normalize()` produces one `gating_modes` entry per layer, and the runtime
+    /// guards that they are all equal before building (mixed modes are an
+    /// `UnsupportedFeature`). This accessor encapsulates that post-guard invariant
+    /// — the single uniform mode — instead of indexing `gating_modes[0]` at each use
+    /// site (which would panic on a directly-constructed empty-vec config, since the
+    /// struct is `pub`). Returns [`GatingMode::None`] for an empty list.
+    pub fn gating_mode(&self) -> GatingMode {
+        self.gating_modes.first().copied().unwrap_or(GatingMode::None)
+    }
+}
+
 /// On-disk shape of a layer-array config: optional / either-or fields exactly as
 /// NAM writes them. Converted to [`LayerArrayConfig`] by [`Self::normalize`].
 #[derive(Debug, Clone, serde::Deserialize)]

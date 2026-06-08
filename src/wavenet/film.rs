@@ -98,6 +98,41 @@ impl FiLM {
         }
     }
 
+    /// Out-of-place block, planar `[channel * n + t]`. `input`/`out` are
+    /// `input_dim * n`, `condition` is `condition_dim * n`, `n <= MAX_BLOCK`.
+    /// Bit-equivalent to `n` [`Self::process_sample`] calls. `out` must not alias
+    /// `input`.
+    pub(super) fn process_block(
+        &mut self,
+        input: &[f32],
+        condition: &[f32],
+        out: &mut [f32],
+        n: usize,
+    ) {
+        debug_assert!(n <= MAX_BLOCK);
+        debug_assert_eq!(input.len(), self.input_dim * n);
+        debug_assert_eq!(out.len(), self.input_dim * n);
+        let d = self.input_dim;
+        let out_rows = self.ss.len();
+        let ss = &mut self.ss_blk[..out_rows * n];
+        self.cond_to_scale_shift.process_block(condition, ss, n);
+        if self.shift {
+            for i in 0..d {
+                let (srow, hrow, irow, orow) = (i * n, (d + i) * n, i * n, i * n);
+                for t in 0..n {
+                    out[orow + t] = input[irow + t] * ss[srow + t] + ss[hrow + t];
+                }
+            }
+        } else {
+            for i in 0..d {
+                let row = i * n;
+                for t in 0..n {
+                    out[row + t] = input[row + t] * ss[row + t];
+                }
+            }
+        }
+    }
+
     /// Rows the internal Conv1x1 emits: `(shift ? 2 : 1) * input_dim`.
     #[cfg(test)]
     pub(super) fn out_rows(&self) -> usize {
@@ -162,5 +197,26 @@ mod tests {
         let mut buf = vec![5.0];
         f.process_sample_(&mut buf, &[3.0]);
         assert_eq!(buf, vec![30.0]);
+    }
+
+    #[test]
+    fn process_block_scale_and_shift_matches_hand_values() {
+        // input_dim=2, condition_dim=1, shift=true, groups=1, n=3.
+        // W=[3,4,5,6], bias=[0;4]. Conv1x1 over each frame's cond:
+        //   ss[:,t] = [3*c, 4*c, 5*c, 6*c]; scale=ss[0..2], shift=ss[2..4].
+        // cond frames (planar, 1 row): [c0,c1,c2] = [1.0, 2.0, 0.5].
+        // input planar [2 rows][3 frames]:
+        //   row0 = [1, 1, 1], row1 = [2, 2, 2].
+        // t0 c=1: out0 = 1*3 + 5 = 8 ; out1 = 2*4 + 6 = 14
+        // t1 c=2: out0 = 1*6 + 10 = 16 ; out1 = 2*8 + 12 = 28
+        // t2 c=0.5: out0 = 1*1.5 + 2.5 = 4 ; out1 = 2*2 + 3 = 7
+        let mut f = FiLM::new(1, 2, true, 1, vec![3.0, 4.0, 5.0, 6.0], vec![0.0; 4]);
+        let n = 3;
+        let cond = vec![1.0, 2.0, 0.5]; // 1 row * 3
+        let input = vec![1.0, 1.0, 1.0, /* row1 */ 2.0, 2.0, 2.0]; // 2 rows * 3
+        let mut out = vec![0.0; 2 * n];
+        f.process_block(&input, &cond, &mut out, n);
+        // planar [row*n + t]: row0 = [8,16,4], row1 = [14,28,7]
+        assert_eq!(out, vec![8.0, 16.0, 4.0, 14.0, 28.0, 7.0]);
     }
 }

@@ -54,6 +54,29 @@ fn conv_head_process_buffer_does_not_allocate() {
 }
 
 #[test]
+fn a2_synthetic_process_buffer_does_not_allocate() {
+    // The richest A2 path: FiLM + BLENDED gating + layer1x1_post_film. Every FiLM owns
+    // pre-allocated scratch, Gating is scratchless, and the Layer's `*_blk` buffers are
+    // sized in `new`, so the hot path must allocate nothing. Skips if the fixture is
+    // absent (e.g. the oracle could not be built in this environment).
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/a2_blended.nam");
+    if !path.exists() {
+        eprintln!("skip: a2_blended.nam absent");
+        return;
+    }
+    let json = std::fs::read_to_string(&path).unwrap();
+    let model = NamModel::from_json_str(&json).unwrap();
+    let mut wn = WaveNet::new(&model).expect("a2_blended builds");
+    let mut buffer = vec![0.1_f32; 2048];
+
+    wn.process_buffer(&mut buffer); // warm up off-guard
+    assert_no_alloc(|| {
+        wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
 fn lstm_process_buffer_does_not_allocate() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference_lstm.nam");

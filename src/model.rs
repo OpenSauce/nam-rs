@@ -665,6 +665,27 @@ impl RawLayerArrayConfig {
             }
         };
 
+        // Reject zero/degenerate dimensions before they reach the runtime: a
+        // `head_kernel_size == 0` underflows `head_kernel_size - 1` and overflows
+        // the `Conv1d` ring buffer; zero kernel/dilation/channel counts likewise
+        // produce nonsense buffers. NAMCore rejects `head_kernel_size < 1`
+        // (`wavenet/model.cpp`); mirror that here as a clean `Err`, not a panic.
+        if head_kernel_size == 0 {
+            return Err("layer-array head_kernel_size must be >= 1".into());
+        }
+        if self.channels == 0 {
+            return Err("layer-array channels must be >= 1".into());
+        }
+        if head_size == 0 {
+            return Err("layer-array head_size must be >= 1".into());
+        }
+        if kernel_sizes.contains(&0) {
+            return Err("layer-array kernel_sizes entries must be >= 1".into());
+        }
+        if self.dilations.contains(&0) {
+            return Err("layer-array dilations entries must be >= 1".into());
+        }
+
         Ok(LayerArrayConfig {
             input_size: self.input_size,
             condition_size: self.condition_size,
@@ -873,6 +894,60 @@ mod layer_array_normalize_tests {
             "activation": ["Tanh"], "gated": false, "head_bias": false
         }))
         .unwrap();
+        assert!(raw.normalize().is_err());
+    }
+
+    /// Build a minimal-but-valid raw layer-array, then apply `mutate` so each
+    /// degenerate-dimension test only has to express the one field it breaks.
+    fn raw_layer_array(mutate: impl FnOnce(&mut serde_json::Value)) -> RawLayerArrayConfig {
+        let mut v = serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+            "kernel_size": 3, "dilations": [1],
+            "activation": "Tanh", "gated": false, "head_bias": false
+        });
+        mutate(&mut v);
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn baseline_raw_layer_array_normalizes() {
+        // Guard: the helper's unmutated form must be valid, else the negative
+        // tests below would pass for the wrong reason.
+        assert!(raw_layer_array(|_| {}).normalize().is_ok());
+    }
+
+    #[test]
+    fn zero_channels_is_an_error() {
+        let raw = raw_layer_array(|v| v["channels"] = serde_json::json!(0));
+        assert!(raw.normalize().is_err());
+    }
+
+    #[test]
+    fn zero_head_size_is_an_error() {
+        let raw = raw_layer_array(|v| v["head_size"] = serde_json::json!(0));
+        assert!(raw.normalize().is_err());
+    }
+
+    #[test]
+    fn zero_kernel_size_is_an_error() {
+        let raw = raw_layer_array(|v| v["kernel_size"] = serde_json::json!(0));
+        assert!(raw.normalize().is_err());
+    }
+
+    #[test]
+    fn zero_dilation_is_an_error() {
+        let raw = raw_layer_array(|v| v["dilations"] = serde_json::json!([0]));
+        assert!(raw.normalize().is_err());
+    }
+
+    #[test]
+    fn zero_head_kernel_size_is_an_error() {
+        let raw = raw_layer_array(|v| {
+            v.as_object_mut().unwrap().remove("head_size");
+            v["head"] = serde_json::json!({
+                "out_channels": 1, "kernel_size": 0, "activation": "ReLU"
+            });
+        });
         assert!(raw.normalize().is_err());
     }
 }

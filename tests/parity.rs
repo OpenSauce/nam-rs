@@ -205,9 +205,15 @@ fn real_a2_captures_match_namcore_oracle() {
         let mut got = signal.clone();
         net.process_buffer(&mut got);
 
-        let tmp = std::env::temp_dir();
-        let in_path = tmp.join("nam_in.json");
-        let out_path = tmp.join("nam_out.json");
+        // Unique per-iteration scratch paths: keyed by pid + file stem so this test
+        // can never collide with a concurrently-running test (cargo runs test
+        // functions on parallel threads in one process) writing to temp_dir.
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+        let scratch =
+            std::env::temp_dir().join(format!("nam_rs_oracle_{}_{stem}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let in_path = scratch.join("in.json");
+        let out_path = scratch.join("out.json");
         std::fs::write(&in_path, serde_json::to_string(&signal).unwrap()).unwrap();
         let status = Command::new(&oracle)
             .arg(&path)
@@ -222,6 +228,7 @@ fn real_a2_captures_match_namcore_oracle() {
         );
         let want: Vec<f32> =
             serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+        std::fs::remove_dir_all(&scratch).ok();
 
         let rf = net.receptive_field();
         let max_err = got[rf..]

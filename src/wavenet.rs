@@ -34,7 +34,7 @@ pub struct WaveNet {
     /// Optional post-stack head: an `activation → Conv1d` chain run after the arrays.
     /// When present, `head_scale` scales the head's *input* and the chain's output is
     /// the model output; when absent, output = `head_scale · final_head_output`.
-    post_stack_head: Option<PostStackHead>,
+    post_stack_head: Option<Box<PostStackHead>>,
     /// Pre-allocated `[head_in_channels][MAX_BLOCK]` scratch holding the
     /// `head_scale`-scaled final head output fed into `post_stack_head`. Keeps the
     /// hot path allocation-free.
@@ -111,7 +111,7 @@ impl WaveNet {
         let post_stack_head = match &cfg.post_stack_head {
             Some(hc) => {
                 let in_channels = arrays.last().map_or(0, LayerArray::head_size);
-                Some(build_post_stack_head(&mut r, hc, in_channels)?)
+                Some(Box::new(build_post_stack_head(&mut r, hc, in_channels)?))
             }
             None => None,
         };
@@ -141,7 +141,7 @@ impl WaveNet {
 
         let head_in_channels = post_stack_head
             .as_ref()
-            .map_or(0, PostStackHead::in_channels)
+            .map_or(0, |h| h.in_channels())
             .max(1);
 
         Ok(Self {
@@ -240,10 +240,27 @@ impl WaveNet {
             std::mem::swap(&mut self.sig_a_blk, &mut self.sig_b_blk);
         }
 
-        // After the final swap, head_a_blk holds the last array's head output, whose
-        // head_size is 1 — row 0 is the per-sample head signal.
-        for (t, s) in chunk.iter_mut().enumerate() {
-            *s = self.head_scale * self.head_a_blk[t];
+        // After the final swap, head_a_blk holds the last array's head output.
+        match &mut self.post_stack_head {
+            None => {
+                // No post-stack head: output = head_scale · final head (head_size 1,
+                // so row 0 is the per-sample head signal).
+                for (t, s) in chunk.iter_mut().enumerate() {
+                    *s = self.head_scale * self.head_a_blk[t];
+                }
+            }
+            Some(head) => {
+                // head_scale scales the head's INPUT, then the chain runs and its
+                // output is the model output. The final head output is `in_ch × n`,
+                // planar; scale it into pre-allocated scratch, then run the head.
+                let in_ch = head.in_channels();
+                let scaled = &mut self.head_scale_scratch[..in_ch * n];
+                for (s, &h) in scaled.iter_mut().zip(&self.head_a_blk[..in_ch * n]) {
+                    *s = self.head_scale * h;
+                }
+                let out = head.process_block(scaled, n); // [out_channels=1][n]
+                chunk.copy_from_slice(&out[..n]);
+            }
         }
     }
 
@@ -293,7 +310,17 @@ impl WaveNet {
         }
 
         // After the final swap, head_a holds the last array's head output.
-        self.head_scale * self.head_a[0]
+        match &mut self.post_stack_head {
+            None => self.head_scale * self.head_a[0],
+            Some(head) => {
+                let in_ch = head.in_channels();
+                let scaled = &mut self.head_scale_scratch[..in_ch];
+                for (s, &h) in scaled.iter_mut().zip(&self.head_a[..in_ch]) {
+                    *s = self.head_scale * h;
+                }
+                head.process_sample(scaled)[0]
+            }
+        }
     }
 
     /// Reset all internal state (ring buffers) to silence.
@@ -716,6 +743,61 @@ mod tests {
             }
             _ => {} // ok (builds, or fails for another reason until Tasks 3-5 land)
         }
+    }
+
+    #[test]
+    fn post_stack_head_forward_matches_hand_computed() {
+        // TINY array weights produce final_head=1.0 for x=0.5 (see TINY test).
+        // head_scale=2.0 scales head input to 2.0; ReLU head conv w=3,b=0.5 -> 6.5.
+        // Weight blob order: [array(7), post_head_conv_w(1), post_head_conv_b(1), head_scale(1)]
+        let json = r#"{
+            "version":"0.6.0","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":1,"head_size":1,
+                    "kernel_size":1,"dilations":[1],"activation":"ReLU",
+                    "gated":false,"head_bias":false}],
+                "head":{"channels":1,"out_channels":1,"kernel_sizes":[1],"activation":"ReLU"},
+                "head_scale":2.0},
+            "weights":[1.0, 2.0, 0.5, 1.0, 3.0, 0.1, 0.5, 3.0, 0.5, 2.0]}"#;
+        let model = NamModel::from_json_str(json).unwrap();
+        let mut wn = WaveNet::new(&model).unwrap();
+        let mut buf = [0.5_f32];
+        wn.process_buffer(&mut buf);
+        assert!((buf[0] - 6.5).abs() < 1e-5, "got {}", buf[0]);
+
+        // And the per-sample path agrees with the block path.
+        let mut wn2 = WaveNet::new(&model).unwrap();
+        let got = wn2.process_sample(0.5);
+        assert!((got - 6.5).abs() < 1e-5, "per-sample got {}", got);
+    }
+
+    #[test]
+    fn post_stack_head_multichannel_out_rejected() {
+        let json = r#"{
+            "version":"0.6.0","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":1,"head_size":1,
+                    "kernel_size":1,"dilations":[1],"activation":"ReLU",
+                    "gated":false,"head_bias":false}],
+                "head":{"channels":2,"out_channels":2,"kernel_sizes":[1],"activation":"ReLU"},
+                "head_scale":1.0},
+            "weights":[]}"#;
+        let model0 = NamModel::from_json_str(json).unwrap();
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n = expected_weight_count(cfg).unwrap();
+        let model = NamModel {
+            version: "0.6.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights: vec![0.0; n],
+            sample_rate: None,
+            metadata: None,
+        };
+        assert!(matches!(
+            WaveNet::new(&model),
+            Err(Error::UnsupportedFeature(f)) if f.contains("out_channels != 1")
+        ));
     }
 
     #[test]

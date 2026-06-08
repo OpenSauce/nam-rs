@@ -766,7 +766,10 @@ mod tests {
         let mut got = signal.clone();
         wn.process_buffer(&mut got);
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert!((g - w).abs() < 1e-5, "sample {i}: block {g} vs per-sample {w}");
+            assert!(
+                (g - w).abs() < 1e-5,
+                "sample {i}: block {g} vs per-sample {w}"
+            );
         }
     }
 }

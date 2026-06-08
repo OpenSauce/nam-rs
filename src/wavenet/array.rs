@@ -337,8 +337,16 @@ mod tests {
         // One layer that contributes 0 to head (relu of negative). head_in=[10].
         // head_rechannel weight=2, bias=[1] -> head_out = 2*10 + 1 = 21.
         let layer = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
-        let mut array =
-            LayerArray::new(1, 1, 1, 1, vec![1.0], vec![layer], vec![2.0], Some(vec![1.0]));
+        let mut array = LayerArray::new(
+            1,
+            1,
+            1,
+            1,
+            vec![1.0],
+            vec![layer],
+            vec![2.0],
+            Some(vec![1.0]),
+        );
 
         let mut head_out = vec![0.0];
         let mut array_out = vec![0.0];
@@ -364,8 +372,19 @@ mod tests {
         // rechannel is a 2-tap conv over the head-accum time series with weights
         // [w_old, w_cur] = [10, 1]: head_out[t] = 1*acc[t] + 10*acc[t-1].
         // Layer: conv w=1 b=0, ignore cond (mix w=0), 1x1 w=1 b=0, ReLU.
-        let layer = Layer::new(1, 1, 1, 1, Activation::Relu, false,
-            vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
+        let layer = Layer::new(
+            1,
+            1,
+            1,
+            1,
+            Activation::Relu,
+            false,
+            vec![1.0],
+            vec![0.0],
+            vec![0.0],
+            vec![1.0],
+            vec![0.0],
+        );
         // head_rechannel weights [out=1][in=1][k=2] = [w@oldest_tap, w@current_tap] = [10, 1].
         let mut array = LayerArray::new(1, 1, 1, 2, vec![1.0], vec![layer], vec![10.0, 1.0], None);
 

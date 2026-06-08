@@ -156,7 +156,9 @@ impl<'de> Deserialize<'de> for NamModel {
         let raw = Raw::deserialize(deserializer)?;
         let config = match raw.architecture.as_str() {
             "WaveNet" => {
-                ModelConfig::WaveNet(serde_json::from_value(raw.config).map_err(de::Error::custom)?)
+                let raw_wn: RawWaveNetConfig =
+                    serde_json::from_value(raw.config).map_err(de::Error::custom)?;
+                ModelConfig::WaveNet(raw_wn.normalize().map_err(de::Error::custom)?)
             }
             "LSTM" => {
                 ModelConfig::Lstm(serde_json::from_value(raw.config).map_err(de::Error::custom)?)
@@ -362,47 +364,105 @@ impl FilmConfig {
     }
 }
 
-/// WaveNet configuration: a sequence of layer-arrays plus a final output scale.
+/// Post-stack head (`config.head`): a stack of `activation → Conv1D` applied after
+/// the layer-arrays. `None` for A1 / current A2 defaults.
 #[derive(Debug, Clone)]
-pub struct WaveNetConfig {
-    /// One config per layer-array (NAM standard models have two).
-    pub layers: Vec<LayerArrayConfig>,
-    /// Optional separate head. `null` in shipped models; a non-null head is a
-    /// deferred feature (rejected at build time).
-    pub head: Option<serde_json::Value>,
-    /// Output gain applied after the head.
-    pub head_scale: f32,
-    /// Unrecognized top-level config keys (e.g. `condition_dsp`), captured so the
-    /// feature-guard can reject deferred features instead of silently dropping them.
-    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
+pub struct PostStackHeadConfig {
+    /// Hidden channel count between head convs.
+    pub channels: usize,
+    /// Final output channels.
+    pub out_channels: usize,
+    /// Per-conv kernel sizes (one conv per entry).
+    pub kernel_sizes: Vec<usize>,
+    /// Activation applied before each head conv.
+    pub activation: ActivationSpec,
 }
 
-impl<'de> Deserialize<'de> for WaveNetConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct RawWaveNetConfig {
-            layers: Vec<RawLayerArrayConfig>,
-            #[serde(default)]
-            head: Option<serde_json::Value>,
-            head_scale: f32,
-            #[serde(flatten)]
-            extra: serde_json::Map<String, serde_json::Value>,
-        }
+/// WaveNet configuration: layer-arrays, optional post-stack head + condition DSP,
+/// and the output scale. Per-layer quantities are normalized into `Vec`s.
+#[derive(Debug, Clone)]
+pub struct WaveNetConfig {
+    /// One config per layer-array.
+    pub layers: Vec<LayerArrayConfig>,
+    /// Optional post-stack head (`config.head`).
+    pub post_stack_head: Option<PostStackHeadConfig>,
+    /// Output gain (note: the runtime value is the trailing weight).
+    pub head_scale: f32,
+    /// Input channels (default 1).
+    pub in_channels: usize,
+    /// Optional nested conditioning DSP.
+    pub condition_dsp: Option<Box<NamModel>>,
+}
 
-        let raw = RawWaveNetConfig::deserialize(deserializer)?;
-        let layers = raw
+#[derive(serde::Deserialize)]
+struct RawWaveNetConfig {
+    layers: Vec<RawLayerArrayConfig>,
+    #[serde(default)]
+    head: Option<serde_json::Value>,
+    head_scale: f32,
+    #[serde(default)]
+    in_channels: Option<usize>,
+    #[serde(default)]
+    condition_dsp: Option<serde_json::Value>,
+}
+
+impl RawWaveNetConfig {
+    fn normalize(self) -> Result<WaveNetConfig, String> {
+        let layers = self
             .layers
             .into_iter()
-            .map(|r| r.normalize().map_err(de::Error::custom))
+            .map(RawLayerArrayConfig::normalize)
             .collect::<Result<Vec<_>, _>>()?;
+
+        let post_stack_head = match self.head {
+            Some(h) if !h.is_null() => {
+                let channels = h
+                    .get("channels")
+                    .and_then(|x| x.as_u64())
+                    .ok_or("post-stack head missing channels")? as usize;
+                let out_channels = h
+                    .get("out_channels")
+                    .and_then(|x| x.as_u64())
+                    .ok_or("post-stack head missing out_channels")? as usize;
+                let kernel_sizes: Vec<usize> = h
+                    .get("kernel_sizes")
+                    .and_then(|x| x.as_array())
+                    .ok_or("post-stack head missing kernel_sizes")?
+                    .iter()
+                    .map(|k| {
+                        k.as_u64()
+                            .map(|v| v as usize)
+                            .ok_or("kernel_sizes entry not an int".to_string())
+                    })
+                    .collect::<Result<_, _>>()?;
+                let activation = serde_json::from_value::<ActivationSpec>(
+                    h.get("activation").cloned().unwrap_or(serde_json::Value::Null),
+                )
+                .map_err(|e| e.to_string())?;
+                Some(PostStackHeadConfig {
+                    channels,
+                    out_channels,
+                    kernel_sizes,
+                    activation,
+                })
+            }
+            _ => None,
+        };
+
+        let condition_dsp = match self.condition_dsp {
+            Some(v) if !v.is_null() => {
+                let m = serde_json::from_value::<NamModel>(v).map_err(|e| e.to_string())?;
+                Some(Box::new(m))
+            }
+            _ => None,
+        };
+
         Ok(WaveNetConfig {
             layers,
-            head: raw.head,
-            head_scale: raw.head_scale,
-            extra: raw.extra,
+            post_stack_head,
+            head_scale: self.head_scale,
+            in_channels: self.in_channels.unwrap_or(1),
+            condition_dsp,
         })
     }
 }
@@ -833,5 +893,84 @@ mod a2_subconfig_tests {
             Head1x1Config::from_json(Some(&v)),
             Head1x1Config { active: false, out_channels: Some(1), groups: 1 }
         );
+    }
+}
+
+#[cfg(test)]
+mod wavenet_config_tests {
+    use super::*;
+
+    fn parse(json: &str) -> WaveNetConfig {
+        match NamModel::from_json_str(json).unwrap().config {
+            ModelConfig::WaveNet(c) => c,
+            other => panic!("expected WaveNet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a1_config_parses_unchanged() {
+        let c = parse(r#"{
+            "version":"0.5.4","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":2,"head_size":1,
+                    "kernel_size":3,"dilations":[1,2],"activation":"Tanh",
+                    "gated":false,"head_bias":false}],
+                "head":null,"head_scale":2.0},
+            "weights":[]}"#);
+        assert_eq!(c.layers.len(), 1);
+        assert_eq!(c.head_scale, 2.0);
+        assert!(c.post_stack_head.is_none());
+        assert!(c.condition_dsp.is_none());
+        assert_eq!(c.layers[0].kernel_sizes, vec![3, 3]);
+    }
+
+    #[test]
+    fn a2_flexible_container_submodel_config_parses() {
+        let c = parse(r#"{
+            "version":"0.7.0","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":3,"bottleneck":3,
+                    "dilations":[1,3,7],"kernel_sizes":[6,6,15],
+                    "activation":[{"type":"LeakyReLU"},{"type":"LeakyReLU"},{"type":"LeakyReLU"}],
+                    "head":{"out_channels":1,"kernel_size":16,"bias":true},
+                    "head1x1":{"active":false},"layer1x1":{"active":true,"groups":1},
+                    "gating_mode":["none","none","none"]}],
+                "head":null,"head_scale":0.5},
+            "weights":[]}"#);
+        assert_eq!(c.layers[0].head_kernel_size, 16);
+        assert_eq!(c.layers[0].kernel_sizes, vec![6, 6, 15]);
+        assert!(c.post_stack_head.is_none());
+    }
+
+    #[test]
+    fn post_stack_head_parses() {
+        let c = parse(r#"{
+            "version":"0.6.0","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":2,"head_size":2,
+                    "kernel_size":3,"dilations":[1],"activation":"Tanh",
+                    "gated":false,"head_bias":false}],
+                "head":{"channels":4,"out_channels":1,"kernel_sizes":[1,1],"activation":"ReLU"},
+                "head_scale":1.0},
+            "weights":[]}"#);
+        let h = c.post_stack_head.expect("post-stack head present");
+        assert_eq!(h.channels, 4);
+        assert_eq!(h.out_channels, 1);
+        assert_eq!(h.kernel_sizes, vec![1, 1]);
+    }
+
+    #[test]
+    fn condition_dsp_parses_as_nested_model() {
+        let c = parse(r#"{
+            "version":"0.6.0","architecture":"WaveNet","config":{
+                "layers":[{"input_size":1,"condition_size":1,"channels":2,"head_size":1,
+                    "kernel_size":3,"dilations":[1],"activation":"Tanh",
+                    "gated":false,"head_bias":false}],
+                "head":null,"head_scale":1.0,
+                "condition_dsp":{"version":"0.5.4","architecture":"WaveNet","config":{
+                    "layers":[{"input_size":1,"condition_size":1,"channels":1,"head_size":1,
+                        "kernel_size":1,"dilations":[1],"activation":"Tanh",
+                        "gated":false,"head_bias":false}],
+                    "head":null,"head_scale":1.0},"weights":[]}},
+            "weights":[]}"#);
+        let dsp = c.condition_dsp.expect("condition_dsp present");
+        assert_eq!(dsp.architecture, "WaveNet");
     }
 }

@@ -74,9 +74,13 @@ gain-staging.
   `set_slim_size(value)` (NAM Core semantics: the first submodel whose `max_value`
   exceeds `value`, else the full model) or `select(index)`. Switching is real-time-safe.
 
-Deferred A2 features (`condition_dsp`, FiLM, bottleneck, gated/multi-tap heads, per-layer
-activation lists, exotic activations) are rejected with a clear `Error::UnsupportedFeature`
-rather than silently mis-run.
+The A2 feature set is supported: FiLM, gating, bottleneck, grouped convs, multi-tap conv
+heads, the optional post-stack head (an `activation → Conv1d` chain after the arrays, with
+`head_scale` scaling its input), and a (mono) `condition_dsp` (a nested model whose output
+replaces the conditioning fed to every array). The remaining restrictions — multi-channel
+input, a multi-channel-output `condition_dsp` or post-stack head, mixed gating modes within
+one array, and exotic activations — are rejected with a clear `Error::UnsupportedFeature`
+(or `Error::UnsupportedActivation`) rather than silently mis-run.
 
 ## Development
 

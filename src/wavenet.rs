@@ -5,8 +5,15 @@
 //! All scratch buffers are pre-allocated in [`WaveNet::new`].
 //!
 //! The forward pass is a port of NAM's WaveNet, built bottom-up from the `conv`,
-//! `layer`, and `array` submodules (each unit-tested) and validated end-to-end
+//! `layer`, `array`, and `head` submodules (each unit-tested) and validated end-to-end
 //! against the reference in `tests/parity.rs`.
+//!
+//! Two top-level features are supported beyond the layer-array stack: an optional
+//! **post-stack head** (an `activation → Conv1d` chain run after the arrays, with
+//! `head_scale` scaling its input; its output is the model output) and an optional
+//! **`condition_dsp`** (a nested standalone [`crate::Model`] whose output replaces the
+//! raw mono input as the conditioning fed to every array — the raw input still drives
+//! the first array's layer input, matching NAM Core).
 
 use crate::error::Error;
 use crate::model::{GatingMode, LayerArrayConfig, NamModel, WaveNetConfig};
@@ -398,13 +405,16 @@ impl WaveNet {
     }
 }
 
-/// Reject WaveNet-top-level features whose forward pass is not implemented yet, with
-/// a clear [`Error::UnsupportedFeature`] (rather than silently mis-running). The
-/// per-layer A2 features (grouped convs, head1x1, bottleneck≠channels, all 8 FiLM
-/// sites, BLENDED gating, non-sigmoid secondaries, inactive layer1x1) are now fully
-/// supported by [`Layer`]; only the WaveNet-top-level scope (post-stack head,
-/// condition DSP, multi-channel input) and the within-array mixed-gating case remain
-/// unsupported.
+/// Reject WaveNet features whose forward pass is not implemented yet, with a clear
+/// [`Error::UnsupportedFeature`] (rather than silently mis-running). The per-layer A2
+/// features (grouped convs, head1x1, bottleneck≠channels, all 8 FiLM sites, BLENDED
+/// gating, non-sigmoid secondaries, inactive layer1x1) are fully supported by
+/// [`Layer`], and the two top-level features — the post-stack head and a (mono)
+/// `condition_dsp` — are now supported (their build paths consume/own their weights
+/// and run on the hot path). The remaining unsupported cases are multi-channel input
+/// (`in_channels != 1`) and the within-array mixed-gating case; a multi-channel-output
+/// `condition_dsp` or a post-stack head with `out_channels != 1` are rejected at their
+/// respective build sites.
 fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
     if cfg.in_channels != 1 {
         return Err(Error::UnsupportedFeature("in_channels != 1".into()));

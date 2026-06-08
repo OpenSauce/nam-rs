@@ -110,9 +110,21 @@ impl Conv1d {
         }
     }
 
-    #[cfg(test)]
+    // Consumed by the post-stack head (`head.rs`), which is wired into `WaveNet`
+    // over the following tasks; allow until then.
+    #[allow(dead_code)]
     pub(super) fn out_ch(&self) -> usize {
         self.out_ch
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn in_ch(&self) -> usize {
+        self.in_ch
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn kernel(&self) -> usize {
+        self.kernel
     }
 
     /// Push one input column (`in_ch` values) and write the convolution result

@@ -17,6 +17,7 @@ mod array;
 mod conv;
 mod film;
 mod gating;
+mod head;
 mod layer;
 
 use activation::Activation;

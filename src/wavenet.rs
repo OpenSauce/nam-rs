@@ -22,14 +22,23 @@ mod layer;
 
 use activation::Activation;
 use array::LayerArray;
-use conv::MAX_BLOCK;
+use conv::{Conv1d, MAX_BLOCK};
 use gating::Gating;
+use head::PostStackHead;
 use layer::{Layer, LayerDims, LayerWeights};
 
 /// A ready-to-run WaveNet, with all scratch buffers pre-allocated.
 #[derive(Debug)]
 pub struct WaveNet {
     arrays: Vec<LayerArray>,
+    /// Optional post-stack head: an `activation → Conv1d` chain run after the arrays.
+    /// When present, `head_scale` scales the head's *input* and the chain's output is
+    /// the model output; when absent, output = `head_scale · final_head_output`.
+    post_stack_head: Option<PostStackHead>,
+    /// Pre-allocated `[head_in_channels][MAX_BLOCK]` scratch holding the
+    /// `head_scale`-scaled final head output fed into `post_stack_head`. Keeps the
+    /// hot path allocation-free.
+    head_scale_scratch: Vec<f32>,
     head_scale: f32,
     /// Samples of input history the deepest dilated tap reaches back over; equals
     /// the model's warmup length / processing latency in samples.
@@ -99,6 +108,14 @@ impl WaveNet {
             }
         }
 
+        let post_stack_head = match &cfg.post_stack_head {
+            Some(hc) => {
+                let in_channels = arrays.last().map_or(0, LayerArray::head_size);
+                Some(build_post_stack_head(&mut r, hc, in_channels)?)
+            }
+            None => None,
+        };
+
         let head_scale = r.take(1)[0];
         // The up-front check guarantees `expected == weights.len()`; this asserts the
         // other half of the invariant — that building consumed exactly `expected`, so
@@ -122,8 +139,15 @@ impl WaveNet {
         // First array's incoming head is silence of its accumulator width (`head_in`).
         let head_in0 = arrays.first().map_or(0, LayerArray::head_in);
 
+        let head_in_channels = post_stack_head
+            .as_ref()
+            .map_or(0, PostStackHead::in_channels)
+            .max(1);
+
         Ok(Self {
             arrays,
+            post_stack_head,
+            head_scale_scratch: vec![0.0; head_in_channels * MAX_BLOCK],
             head_scale,
             receptive_field: receptive_field(cfg),
             head_in0,
@@ -277,6 +301,9 @@ impl WaveNet {
         for a in &mut self.arrays {
             a.reset();
         }
+        if let Some(h) = &mut self.post_stack_head {
+            h.reset();
+        }
         self.head_a.fill(0.0);
         self.head_b.fill(0.0);
         self.sig_a.fill(0.0);
@@ -411,13 +438,80 @@ fn array_weight_count(la: &LayerArrayConfig) -> Result<usize, Error> {
     Ok(total)
 }
 
+/// Weights one post-stack head consumes from the flat blob, in NAMCore conv-chain
+/// order. Conv `i` is `[out][in][k]` + `[out]` bias; in/out follow the chain
+/// `in_channels → channels → … → channels → out_channels`. `in_channels` is the
+/// last layer-array's `head_size`.
+fn post_stack_head_weight_count(
+    head: &crate::model::PostStackHeadConfig,
+    in_channels: usize,
+) -> Result<usize, Error> {
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(Error::ConfigTooLarge);
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
+    if head.kernel_sizes.is_empty() {
+        return Err(Error::UnsupportedFeature(
+            "post-stack head with no convs".into(),
+        ));
+    }
+    let n = head.kernel_sizes.len();
+    let mut total = 0usize;
+    let mut cin = in_channels;
+    for (i, &k) in head.kernel_sizes.iter().enumerate() {
+        let cout = if i + 1 == n {
+            head.out_channels
+        } else {
+            head.channels
+        };
+        total = add(total, add(mul(mul(cout, cin)?, k)?, cout)?)?; // weights + bias
+        cin = cout;
+    }
+    Ok(total)
+}
+
 fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
     let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
     let mut total = 0usize;
     for la in &cfg.layers {
         total = add(total, array_weight_count(la)?)?;
     }
+    if let Some(head) = &cfg.post_stack_head {
+        let in_ch = cfg.layers.last().map_or(0, |la| la.head_size);
+        total = add(total, post_stack_head_weight_count(head, in_ch)?)?;
+    }
     add(total, 1) // head_scale
+}
+
+/// Build the post-stack head, consuming its convs from the flat blob in NAMCore
+/// chain order (matching [`post_stack_head_weight_count`]): conv `i` reads
+/// `[out][in][k]` weights then `[out]` bias, with `in/out` following
+/// `in_channels → channels → … → channels → out_channels`. Each conv has dilation 1
+/// and bias.
+fn build_post_stack_head(
+    r: &mut Reader,
+    hc: &crate::model::PostStackHeadConfig,
+    in_channels: usize,
+) -> Result<PostStackHead, Error> {
+    if hc.out_channels != 1 {
+        return Err(Error::UnsupportedFeature(
+            "post-stack head out_channels != 1".into(),
+        ));
+    }
+    let n = hc.kernel_sizes.len();
+    let activation = Activation::from_spec(&hc.activation)?;
+    let mut convs = Vec::with_capacity(n);
+    let mut cin = in_channels;
+    for (i, &k) in hc.kernel_sizes.iter().enumerate() {
+        let cout = if i + 1 == n {
+            hc.out_channels
+        } else {
+            hc.channels
+        };
+        let w = r.take(cout * cin * k);
+        let b = r.take(cout);
+        convs.push((activation, Conv1d::new(cin, cout, k, 1, w, Some(b))));
+        cin = cout;
+    }
+    Ok(PostStackHead::new(convs, in_channels, hc.out_channels))
 }
 
 fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Error> {
@@ -589,6 +683,16 @@ mod tests {
         "weights":[]}"#;
 
     #[test]
+    fn weight_count_includes_post_stack_head() {
+        let model0 = NamModel::from_json_str(TINY_HEAD).unwrap();
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        assert_eq!(expected_weight_count(cfg).unwrap(), 10);
+    }
+
+    #[test]
     fn post_stack_head_no_longer_rejected() {
         let model0 = NamModel::from_json_str(TINY_HEAD).unwrap();
         let cfg = match &model0.config {
@@ -612,6 +716,26 @@ mod tests {
             }
             _ => {} // ok (builds, or fails for another reason until Tasks 3-5 land)
         }
+    }
+
+    #[test]
+    fn post_stack_head_builds_and_consumes_exact_weights() {
+        let model0 = NamModel::from_json_str(TINY_HEAD).unwrap();
+        let cfg = match &model0.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        let n = expected_weight_count(cfg).unwrap(); // 10
+        let weights: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let model = NamModel {
+            version: "0.6.0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg.clone()),
+            weights,
+            sample_rate: None,
+            metadata: None,
+        };
+        assert!(WaveNet::new(&model).is_ok(), "post-stack head model builds");
     }
 
     #[test]

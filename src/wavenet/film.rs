@@ -19,9 +19,6 @@
 use super::conv::{Conv1d, MAX_BLOCK};
 
 /// A FiLM block with all scratch buffers pre-allocated.
-// Exercised only by this module's tests until the Generalized Layer phase wires
-// FiLM into `Layer`; allow dead_code so the un-consumed (but tested) API builds.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(super) struct FiLM {
     /// `condition_dim -> (shift ? 2 : 1) * input_dim`, kernel 1, bias, grouped.
@@ -36,7 +33,6 @@ pub(super) struct FiLM {
     ss_blk: Vec<f32>,
 }
 
-#[allow(dead_code)]
 impl FiLM {
     /// Build a FiLM block. See the module-level contract for parameter semantics.
     pub(super) fn new(

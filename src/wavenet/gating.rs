@@ -22,9 +22,6 @@ pub(super) struct Gating {
     bottleneck: usize,
 }
 
-// The whole surface is exercised by unit tests but not yet called from the
-// runtime; it is wired into `Layer` in the Generalized Layer phase.
-#[allow(dead_code)]
 impl Gating {
     /// Build from a resolved mode + activations and the bottleneck width `bn`
     /// (the number of output rows). `secondary` is ignored when `mode == None`.
@@ -55,7 +52,9 @@ impl Gating {
         }
     }
 
-    /// Number of output rows written: always `bn`.
+    /// Number of output rows written: always `bn`. (The Layer reads `bottleneck`
+    /// directly; this accessor documents the contract and is exercised by tests.)
+    #[cfg(test)]
     pub(super) fn output_rows(&self) -> usize {
         self.bottleneck
     }

@@ -95,7 +95,10 @@ impl WaveNet {
         // The up-front check guarantees `expected == weights.len()`; this asserts the
         // other half of the invariant — that building consumed exactly `expected`, so
         // `expected_weight_count` and the `build_array` consumption order agree.
-        debug_assert_eq!(
+        // A hard assert (not `debug_assert`): if the count formula and the consumption
+        // order ever drift, under-consumption would otherwise leave the model silently
+        // mis-built in release. (Over-consumption already panics in `Reader::take`.)
+        assert_eq!(
             r.remaining(),
             0,
             "build_array consumed fewer weights than expected_weight_count claimed"
@@ -349,32 +352,43 @@ fn receptive_field(cfg: &WaveNetConfig) -> usize {
 /// Uses checked arithmetic: an absurd or adversarial config whose dimensions overflow
 /// `usize` returns [`Error::ConfigTooLarge`] rather than panicking (debug) or wrapping
 /// to a wrong, small count (release).
-fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
+/// Number of weights one layer-array consumes from the flat blob, in exactly
+/// [`build_array`]'s `take` order. This is the **single arithmetic source** for the
+/// weight layout: [`expected_weight_count`] sums it across arrays for the up-front
+/// validation, and [`build_array`] asserts it consumes precisely this many, so the
+/// count formula and the consumption order cannot silently drift apart.
+fn array_weight_count(la: &LayerArrayConfig) -> Result<usize, Error> {
     let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(Error::ConfigTooLarge);
     let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
 
+    let mut total = mul(la.channels, la.input_size)?; // rechannel (no bias)
+    let gated = la.gating_mode() == GatingMode::Gated;
+    let mid = if gated {
+        mul(2, la.channels)?
+    } else {
+        la.channels
+    };
+    for &k in &la.kernel_sizes {
+        let conv = add(mul(mul(mid, la.channels)?, k)?, mid)?; // conv weights + bias
+        let mixin = mul(mid, la.condition_size)?; // input mixer (no bias)
+        let one = add(mul(la.channels, la.channels)?, la.channels)?; // 1x1 weights + bias
+        total = add(total, add(add(conv, mixin)?, one)?)?;
+    }
+    total = add(
+        total,
+        mul(mul(la.head_size, la.channels)?, la.head_kernel_size)?,
+    )?; // head rechannel
+    if la.head_bias {
+        total = add(total, la.head_size)?;
+    }
+    Ok(total)
+}
+
+fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
     let mut total = 0usize;
     for la in &cfg.layers {
-        total = add(total, mul(la.channels, la.input_size)?)?; // rechannel (no bias)
-        let gated = la.gating_mode() == GatingMode::Gated;
-        let mid = if gated {
-            mul(2, la.channels)?
-        } else {
-            la.channels
-        };
-        for &k in &la.kernel_sizes {
-            let conv = add(mul(mul(mid, la.channels)?, k)?, mid)?; // conv weights + bias
-            let mixin = mul(mid, la.condition_size)?; // input mixer (no bias)
-            let one = add(mul(la.channels, la.channels)?, la.channels)?; // 1x1 weights + bias
-            total = add(total, add(add(conv, mixin)?, one)?)?;
-        }
-        total = add(
-            total,
-            mul(mul(la.head_size, la.channels)?, la.head_kernel_size)?,
-        )?; // head rechannel
-        if la.head_bias {
-            total = add(total, la.head_size)?;
-        }
+        total = add(total, array_weight_count(la)?)?;
     }
     add(total, 1) // head_scale
 }
@@ -383,6 +397,7 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
     let gated = la.gating_mode() == GatingMode::Gated;
     let mid = if gated { 2 * la.channels } else { la.channels };
 
+    let before = r.remaining();
     let rechannel_w = r.take(la.channels * la.input_size);
     let mut layers = Vec::with_capacity(la.dilations.len());
     for (i, &d) in la.dilations.iter().enumerate() {
@@ -413,6 +428,15 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
     } else {
         None
     };
+
+    // Self-check: this array must have consumed exactly what the single count source
+    // claims. Fires immediately (and locally) if a future edit changes the `take`
+    // order here without updating `array_weight_count`, or vice versa.
+    debug_assert_eq!(
+        before - r.remaining(),
+        array_weight_count(la)?,
+        "build_array consumption drifted from array_weight_count"
+    );
 
     Ok(LayerArray::new(
         la.input_size,

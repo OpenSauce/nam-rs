@@ -180,15 +180,19 @@ impl Conv1d {
             let b = self.bias.as_ref().map_or(0.0, |bias| bias[o]);
             block_out[o * n..o * n + n].fill(b);
         }
+        let opg = self.out_per_group;
+        let ipg = self.in_per_group;
         for o in 0..self.out_ch {
-            let wo = o * self.in_ch * self.kernel;
+            let g = o / opg;
+            let in_base = g * ipg;
+            let wo = o * ipg * self.kernel; // compact: rows are opg-by-ipg per group, contiguous in o
             let out = &mut block_out[o * n..o * n + n];
             for k in 0..self.kernel {
                 let back = (self.kernel - 1 - k) * self.dilation;
-                for j in 0..self.in_ch {
-                    let w = self.weights[wo + j * self.kernel + k];
+                for jl in 0..ipg {
+                    let w = self.weights[wo + jl * self.kernel + k];
                     // staged time for output t is `hist_len + t`; tap k reads `- back`.
-                    let base = j * s + hist_len - back;
+                    let base = (in_base + jl) * s + hist_len - back;
                     let src = &self.staged[base..base + n];
                     for t in 0..n {
                         out[t] += w * src[t];
@@ -402,6 +406,72 @@ mod tests {
         let w: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let conv = Conv1d::new_grouped(4, 4, 2, 1, 2, w, Some(vec![0.0; 4]));
         assert_eq!(conv.out_ch(), 4);
+    }
+
+    #[test]
+    fn grouped_process_block_equals_process_sample_loop() {
+        // (in_ch, out_ch, kernel, dilation, groups) — all divisible by groups.
+        let cases = [
+            (4_usize, 4_usize, 1_usize, 1_usize, 2_usize),
+            (4, 4, 2, 2, 2),      // grouped, dilated
+            (4, 4, 3, 1, 4),      // depthwise (groups == in == out)
+            (6, 4, 2, 1, 2),      // out_per_group=2, in_per_group=3
+            (4, 6, 2, 3, 2),      // out_per_group=3, in_per_group=2, dilation wraps
+        ];
+        for (in_ch, out_ch, kernel, dilation, groups) in cases {
+            let wlen = out_ch * in_ch * kernel / groups;
+            let w: Vec<f32> = (0..wlen)
+                .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.1)
+                .collect();
+            let bias: Vec<f32> = (0..out_ch).map(|o| (o as f32 + 1.0) * 0.05).collect();
+            let total = 200_usize;
+            let xs: Vec<Vec<f32>> = (0..total)
+                .map(|t| {
+                    (0..in_ch)
+                        .map(|j| ((t * in_ch + j) as f32 * 0.31).sin())
+                        .collect()
+                })
+                .collect();
+
+            // Reference: per-sample.
+            let mut a =
+                Conv1d::new_grouped(in_ch, out_ch, kernel, dilation, groups, w.clone(), Some(bias.clone()));
+            let mut want = vec![0.0; out_ch];
+            let want_all: Vec<Vec<f32>> = xs
+                .iter()
+                .map(|x| {
+                    a.process_sample(x, &mut want);
+                    want.clone()
+                })
+                .collect();
+
+            // Under test: block path, uneven chunks to exercise history.
+            let mut b = Conv1d::new_grouped(in_ch, out_ch, kernel, dilation, groups, w, Some(bias));
+            let chunks = [50usize, 1, 99, 50];
+            let mut t0 = 0;
+            for &len in &chunks {
+                let mut bin = vec![0.0; in_ch * len];
+                for (lt, x) in xs[t0..t0 + len].iter().enumerate() {
+                    for (j, &v) in x.iter().enumerate() {
+                        bin[j * len + lt] = v;
+                    }
+                }
+                let mut bout = vec![0.0; out_ch * len];
+                b.process_block(&bin, &mut bout, len);
+                for lt in 0..len {
+                    for o in 0..out_ch {
+                        let got = bout[o * len + lt];
+                        let exp = want_all[t0 + lt][o];
+                        assert!(
+                            (got - exp).abs() < 1e-5,
+                            "shape {in_ch}x{out_ch} k{kernel} d{dilation} g{groups} t{} o{o}: got {got}, want {exp}",
+                            t0 + lt
+                        );
+                    }
+                }
+                t0 += len;
+            }
+        }
     }
 
     #[test]

@@ -717,4 +717,150 @@ mod tests {
             }
         }
     }
+
+    /// Grouped sweep: the block path equals the per-sample path across gating modes
+    /// and group counts for conv / mixin / layer1x1, with compact grouped weights.
+    #[test]
+    fn process_block_equals_process_sample_loop_grouped() {
+        let channels = 4usize;
+        let bottleneck = 4usize;
+        let cond_sz = 2usize;
+        let kernel = 3usize;
+        let dilation = 4usize;
+        let mk = |len: usize, salt: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| (((i * 31 + salt * 7) % 29) as f32 - 14.0) * 0.07)
+                .collect()
+        };
+
+        for mode in [GatingMode::None, GatingMode::Gated] {
+            let mid = if mode == GatingMode::None {
+                bottleneck
+            } else {
+                2 * bottleneck
+            };
+            for gi in [1usize, 2] {
+                for gim in [1usize, 2] {
+                    for gl in [1usize, 2] {
+                        let conv_w = mk(mid * channels * kernel / gi, 1);
+                        let conv_b = mk(mid, 2);
+                        let mix_w = mk(mid * cond_sz / gim, 3);
+                        let one_w = mk(channels * bottleneck / gl, 4);
+                        let one_b = mk(channels, 5);
+
+                        let mk_layer = || {
+                            let gating = Gating::new(
+                                mode,
+                                Activation::Tanh,
+                                Activation::Sigmoid,
+                                bottleneck,
+                            );
+                            Layer::new(
+                                LayerDims {
+                                    channels,
+                                    bottleneck,
+                                    condition_size: cond_sz,
+                                    kernel,
+                                    dilation,
+                                    groups_input: gi,
+                                    groups_input_mixin: gim,
+                                    layer1x1_groups: gl,
+                                    head1x1_groups: 1,
+                                    head1x1_out: None,
+                                    film_shift: [false; 8],
+                                    film_groups: [1; 8],
+                                },
+                                gating,
+                                Activation::Tanh,
+                                LayerWeights {
+                                    conv_w: conv_w.clone(),
+                                    conv_b: conv_b.clone(),
+                                    mix_w: mix_w.clone(),
+                                    layer1x1_w: Some(one_w.clone()),
+                                    layer1x1_b: Some(one_b.clone()),
+                                    head1x1_w: None,
+                                    head1x1_b: None,
+                                    films: [None, None, None, None, None, None, None, None],
+                                },
+                            )
+                        };
+
+                        let total = 130usize;
+                        let inp: Vec<Vec<f32>> = (0..total)
+                            .map(|t| {
+                                (0..channels)
+                                    .map(|c| ((t * 3 + c) as f32 * 0.21).sin())
+                                    .collect()
+                            })
+                            .collect();
+                        let cond: Vec<Vec<f32>> = (0..total)
+                            .map(|t| {
+                                (0..cond_sz)
+                                    .map(|c| ((t * 5 + c) as f32 * 0.17).cos())
+                                    .collect()
+                            })
+                            .collect();
+                        let seed: Vec<Vec<f32>> = (0..total)
+                            .map(|t| (0..bottleneck).map(|c| ((t + c) as f32) * 0.01).collect())
+                            .collect();
+
+                        // Reference: per-sample.
+                        let mut a = mk_layer();
+                        let mut out_ref = vec![vec![0.0; channels]; total];
+                        let mut head_ref = vec![vec![0.0; bottleneck]; total];
+                        for t in 0..total {
+                            let mut head = seed[t].clone();
+                            let mut out = vec![0.0; channels];
+                            a.process_sample(&inp[t], &cond[t], &mut head, &mut out);
+                            out_ref[t] = out;
+                            head_ref[t] = head;
+                        }
+
+                        // Under test: block path in two chunks.
+                        let mut b = mk_layer();
+                        for (lo, len) in [(0usize, 70usize), (70, 60)] {
+                            let mut bin = vec![0.0; channels * len];
+                            let mut bcond = vec![0.0; cond_sz * len];
+                            let mut bhead = vec![0.0; bottleneck * len];
+                            for lt in 0..len {
+                                for c in 0..channels {
+                                    bin[c * len + lt] = inp[lo + lt][c];
+                                }
+                                for c in 0..bottleneck {
+                                    bhead[c * len + lt] = seed[lo + lt][c];
+                                }
+                                for c in 0..cond_sz {
+                                    bcond[c * len + lt] = cond[lo + lt][c];
+                                }
+                            }
+                            let mut bout = vec![0.0; channels * len];
+                            b.process_block(&bin, &bcond, &mut bhead, &mut bout, len);
+                            for lt in 0..len {
+                                for c in 0..channels {
+                                    let go = bout[c * len + lt];
+                                    assert!(
+                                        (go - out_ref[lo + lt][c]).abs() < 1e-5,
+                                        "mode={mode:?} gi{gi} gim{gim} gl{gl} t{} c{c} out: \
+                                         got {go}, want {}",
+                                        lo + lt,
+                                        out_ref[lo + lt][c]
+                                    );
+                                }
+                                for c in 0..bottleneck {
+                                    let gh = bhead[c * len + lt];
+                                    assert!(
+                                        (gh - head_ref[lo + lt][c]).abs() < 1e-5,
+                                        "mode={mode:?} gi{gi} gim{gim} gl{gl} t{} c{c} head: \
+                                         got {gh}, want {}",
+                                        lo + lt,
+                                        head_ref[lo + lt][c]
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

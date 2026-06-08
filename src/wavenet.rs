@@ -39,6 +39,16 @@ pub struct WaveNet {
     /// `head_scale`-scaled final head output fed into `post_stack_head`. Keeps the
     /// hot path allocation-free.
     head_scale_scratch: Vec<f32>,
+    /// Optional nested `condition_dsp` model. When present, its output replaces the
+    /// raw mono input as the conditioning fed to every array; the raw input still
+    /// drives the first array's layer input (NAMCore semantics). Boxed to break the
+    /// `Model → WaveNet → Model` type cycle. Mono-in/mono-out for this phase.
+    condition_dsp: Option<Box<crate::Model>>,
+    /// Pre-allocated `MAX_BLOCK` scratch holding `condition_dsp(input)`; reused each
+    /// chunk so the hot path allocates nothing. Consumed by the forward pass once the
+    /// conditioning replacement is wired (next task).
+    #[allow(dead_code)]
+    cond_dsp_out: Vec<f32>,
     head_scale: f32,
     /// Samples of input history the deepest dilated tap reaches back over; equals
     /// the model's warmup length / processing latency in samples.
@@ -75,6 +85,16 @@ impl WaveNet {
         };
 
         check_unsupported_features(cfg)?;
+
+        // Build the nested condition_dsp eagerly (off the audio thread). It carries
+        // its own weights in its nested `.nam` and consumes nothing from the parent
+        // blob, so `expected_weight_count` / the `r.remaining() == 0` assert are
+        // unaffected. A failing nested build fails fast here.
+        let condition_dsp = match &cfg.condition_dsp {
+            Some(nested) => Some(Box::new(crate::Model::from_nam(nested)?)),
+            None => None,
+        };
+
         let expected = expected_weight_count(cfg)?;
         if expected != model.weights.len() {
             return Err(Error::WeightCountMismatch {
@@ -148,6 +168,8 @@ impl WaveNet {
             arrays,
             post_stack_head,
             head_scale_scratch: vec![0.0; head_in_channels * MAX_BLOCK],
+            condition_dsp,
+            cond_dsp_out: vec![0.0; MAX_BLOCK],
             head_scale,
             receptive_field: receptive_field(cfg),
             head_in0,
@@ -172,6 +194,11 @@ impl WaveNet {
     /// rather than a training-time forward pass that pre-pads the whole input.
     pub fn receptive_field(&self) -> usize {
         self.receptive_field
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_condition_dsp(&self) -> bool {
+        self.condition_dsp.is_some()
     }
 
     /// Process a buffer of mono samples in place.
@@ -330,6 +357,9 @@ impl WaveNet {
         }
         if let Some(h) = &mut self.post_stack_head {
             h.reset();
+        }
+        if let Some(c) = &mut self.condition_dsp {
+            c.reset();
         }
         self.head_a.fill(0.0);
         self.head_b.fill(0.0);
@@ -710,6 +740,19 @@ mod tests {
             "head":{"channels":1,"out_channels":1,"kernel_sizes":[1],"activation":"ReLU"},
             "head_scale":2.0},
         "weights":[]}"#;
+
+    #[test]
+    fn condition_dsp_model_builds() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/condition_dsp_mono.nam");
+        let json = std::fs::read_to_string(path).expect("condition_dsp_mono.nam");
+        let model = NamModel::from_json_str(&json).expect("parse");
+        let wn = WaveNet::new(&model).expect("condition_dsp model builds");
+        assert!(
+            wn.has_condition_dsp(),
+            "nested condition_dsp must be present"
+        );
+    }
 
     #[test]
     fn condition_dsp_no_longer_rejected() {

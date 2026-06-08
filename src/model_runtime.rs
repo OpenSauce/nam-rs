@@ -14,8 +14,10 @@ use crate::wavenet::WaveNet;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Model {
-    /// A WaveNet model.
-    WaveNet(WaveNet),
+    /// A WaveNet model. Boxed so the enum's variants are similarly sized (a `WaveNet`
+    /// carries many pre-allocated scratch buffers); the indirection is one pointer
+    /// hop off the build path, not the per-sample hot loop.
+    WaveNet(Box<WaveNet>),
     /// An LSTM model.
     Lstm(Lstm),
     /// A width-selectable container of submodels.
@@ -74,7 +76,7 @@ impl Model {
     /// Build the runtime matching `model.architecture`. All allocation happens here.
     pub fn from_nam(model: &NamModel) -> Result<Self, Error> {
         match &model.config {
-            ModelConfig::WaveNet(_) => Ok(Model::WaveNet(WaveNet::new(model)?)),
+            ModelConfig::WaveNet(_) => Ok(Model::WaveNet(Box::new(WaveNet::new(model)?))),
             ModelConfig::Lstm(_) => Ok(Model::Lstm(Lstm::new(model)?)),
             ModelConfig::Slimmable(cfg) => {
                 if cfg.submodels.is_empty() {

@@ -133,6 +133,32 @@ impl FiLM {
         }
     }
 
+    /// In-place block, planar `[channel * n + t]`. `buf` is `input_dim * n`,
+    /// `condition` is `condition_dim * n`, `n <= MAX_BLOCK`.
+    pub(super) fn process_block_(&mut self, buf: &mut [f32], condition: &[f32], n: usize) {
+        debug_assert!(n <= MAX_BLOCK);
+        debug_assert_eq!(buf.len(), self.input_dim * n);
+        let d = self.input_dim;
+        let out_rows = self.ss.len();
+        let ss = &mut self.ss_blk[..out_rows * n];
+        self.cond_to_scale_shift.process_block(condition, ss, n);
+        if self.shift {
+            for i in 0..d {
+                let (srow, hrow, brow) = (i * n, (d + i) * n, i * n);
+                for t in 0..n {
+                    buf[brow + t] = buf[brow + t] * ss[srow + t] + ss[hrow + t];
+                }
+            }
+        } else {
+            for i in 0..d {
+                let row = i * n;
+                for t in 0..n {
+                    buf[row + t] *= ss[row + t];
+                }
+            }
+        }
+    }
+
     /// Rows the internal Conv1x1 emits: `(shift ? 2 : 1) * input_dim`.
     #[cfg(test)]
     pub(super) fn out_rows(&self) -> usize {
@@ -218,5 +244,16 @@ mod tests {
         f.process_block(&input, &cond, &mut out, n);
         // planar [row*n + t]: row0 = [8,16,4], row1 = [14,28,7]
         assert_eq!(out, vec![8.0, 16.0, 4.0, 14.0, 28.0, 7.0]);
+    }
+
+    #[test]
+    fn process_block_in_place_matches_out_of_place() {
+        // Same params as process_block_scale_and_shift_matches_hand_values.
+        let mut f = FiLM::new(1, 2, true, 1, vec![3.0, 4.0, 5.0, 6.0], vec![0.0; 4]);
+        let n = 3;
+        let cond = vec![1.0, 2.0, 0.5];
+        let mut buf = vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0];
+        f.process_block_(&mut buf, &cond, n);
+        assert_eq!(buf, vec![8.0, 16.0, 4.0, 14.0, 28.0, 7.0]);
     }
 }

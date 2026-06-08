@@ -193,6 +193,33 @@ fn post_stack_head_matches_namcore_oracle() {
     );
 }
 
+/// condition_dsp matches NAMCore: the nested condition_dsp output replaces the array
+/// conditioning (the raw input still drives the first array's layer input). A
+/// committed, oracle-generated mono fixture run through nam-rs must equal NAMCore's
+/// output in steady state within TOLERANCE.
+#[test]
+fn condition_dsp_matches_namcore_oracle() {
+    let json = std::fs::read_to_string(fixture("condition_dsp_mono.nam"))
+        .unwrap_or_else(|e| panic!("missing fixture condition_dsp_mono.nam: {e}"));
+    let model = NamModel::from_json_str(&json).expect("parse condition_dsp model");
+    let mut net = Model::from_nam(&model).expect("condition_dsp model builds");
+    let input = load_samples("input_condition_dsp.json");
+    let expected = load_samples("expected_condition_dsp.json");
+    assert_eq!(input.len(), expected.len());
+    let rf = net.receptive_field();
+    let mut signal = input.clone();
+    net.process_buffer(&mut signal);
+    let max_err = signal[rf..]
+        .iter()
+        .zip(&expected[rf..])
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_err <= TOLERANCE,
+        "condition_dsp max steady-state error {max_err} > {TOLERANCE}"
+    );
+}
+
 /// End-to-end parity for the committed synthetic A2 fixtures: each `a2_*.nam` run
 /// through nam-rs must equal the NAMCore oracle output in steady state within
 /// TOLERANCE. CI-safe (committed fixtures; skips cleanly if any are absent).

@@ -162,6 +162,10 @@ impl WaveNet {
             .map_or(0, |h| h.in_channels())
             .max(1);
 
+        // condition_dsp's prewarm seeds the RF accumulator (else 1). Compute before
+        // moving `condition_dsp` into the struct.
+        let rf_base = condition_dsp.as_ref().map_or(1, |m| m.receptive_field());
+
         Ok(Self {
             arrays,
             post_stack_head,
@@ -169,7 +173,7 @@ impl WaveNet {
             condition_dsp,
             cond_dsp_out: vec![0.0; MAX_BLOCK],
             head_scale,
-            receptive_field: receptive_field(cfg),
+            receptive_field: receptive_field(cfg, rf_base),
             head_in0,
             head_a: vec![0.0; head_w],
             head_b: vec![0.0; head_w],
@@ -417,9 +421,12 @@ fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
 }
 
 /// Receptive field implied by `config`: per layer `(kernel_size - 1)·dilation`,
-/// plus `(head_kernel_size - 1)` per array for the (possibly multi-tap) head.
-fn receptive_field(cfg: &WaveNetConfig) -> usize {
-    let mut rf = 1;
+/// plus `(head_kernel_size - 1)` per array for the (possibly multi-tap) head, plus
+/// `Σ(kernel - 1)` for the post-stack head. The accumulator starts at `base`, which
+/// is `1` for a plain model and the nested `condition_dsp`'s receptive field when one
+/// is present (NAMCore: prewarm = `condition_dsp->PrewarmSamples()` instead of 1).
+fn receptive_field(cfg: &WaveNetConfig, base: usize) -> usize {
+    let mut rf = base;
     for la in &cfg.layers {
         for (k, &d) in la.kernel_sizes.iter().zip(&la.dilations) {
             rf += (k - 1) * d;
@@ -768,6 +775,28 @@ mod tests {
         "weights":[]}"#;
 
     #[test]
+    fn receptive_field_includes_condition_dsp_prewarm() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/condition_dsp_mono.nam");
+        let json = std::fs::read_to_string(path).expect("condition_dsp_mono.nam");
+        let model = NamModel::from_json_str(&json).expect("parse");
+        let cfg = match &model.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        // Expected: nested condition_dsp rf + Σ array rf-terms (+ head, none here).
+        let nested = crate::Model::from_nam(cfg.condition_dsp.as_ref().unwrap()).unwrap();
+        let mut want = nested.receptive_field();
+        for la in &cfg.layers {
+            for (k, &d) in la.kernel_sizes.iter().zip(&la.dilations) {
+                want += (k - 1) * d;
+            }
+            want += la.head_kernel_size - 1;
+        }
+        assert_eq!(WaveNet::new(&model).unwrap().receptive_field(), want);
+    }
+
+    #[test]
     fn condition_dsp_block_equals_per_sample() {
         // The mono condition_dsp fixture: block path must equal the per-sample path,
         // proving the conditioning replacement is applied consistently across both.
@@ -1047,7 +1076,7 @@ mod tests {
             condition_dsp: None,
         };
         // (3-1)*1 + (3-1)*2 + (3-1)*8 = 2 + 4 + 16 = 22, + 1 = 23.
-        assert_eq!(receptive_field(&cfg), 23);
+        assert_eq!(receptive_field(&cfg, 1), 23);
 
         // TINY (kernel 1, dilation 1) reaches back over no past samples: rf = 1.
         let model = NamModel::from_json_str(TINY).unwrap();

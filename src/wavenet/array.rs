@@ -23,14 +23,19 @@ pub(super) struct LayerArray {
     layers: Vec<Layer>,
     head_rechannel: Conv1d,
     channels: usize,
+    /// Width of the per-layer head contribution (`head1x1.active ? head1x1_out :
+    /// bottleneck`). The head accumulator and the head-rechannel input are this wide,
+    /// which decouples them from `channels`.
+    head_in: usize,
     head_size: usize,
     /// `channels`-wide scratch: current layer-signal.
     cur: Vec<f32>,
     /// `channels`-wide scratch: next layer-signal (ping-ponged with `cur`).
     nxt: Vec<f32>,
-    /// `channels`-wide head accumulator.
+    /// `head_in`-wide head accumulator.
     head_accum: Vec<f32>,
-    /// Planar `[channels][MAX_BLOCK]` block-path twins of `cur`/`nxt`/`head_accum`.
+    /// Planar `[channels][MAX_BLOCK]` block-path twins of `cur`/`nxt`, and
+    /// `[head_in][MAX_BLOCK]` for `head_accum`.
     cur_blk: Vec<f32>,
     nxt_blk: Vec<f32>,
     head_accum_blk: Vec<f32>,
@@ -41,6 +46,7 @@ impl LayerArray {
     pub(super) fn new(
         input_size: usize,
         channels: usize,
+        head_in: usize,
         head_size: usize,
         head_kernel_size: usize,
         rechannel_w: Vec<f32>,
@@ -51,20 +57,25 @@ impl LayerArray {
         Self {
             rechannel: Conv1d::new(input_size, channels, 1, 1, rechannel_w, None),
             layers,
-            head_rechannel: Conv1d::new(channels, head_size, head_kernel_size, 1, head_w, head_b),
+            head_rechannel: Conv1d::new(head_in, head_size, head_kernel_size, 1, head_w, head_b),
             channels,
+            head_in,
             head_size,
             cur: vec![0.0; channels],
             nxt: vec![0.0; channels],
-            head_accum: vec![0.0; channels],
+            head_accum: vec![0.0; head_in],
             cur_blk: vec![0.0; channels * MAX_BLOCK],
             nxt_blk: vec![0.0; channels * MAX_BLOCK],
-            head_accum_blk: vec![0.0; channels * MAX_BLOCK],
+            head_accum_blk: vec![0.0; head_in * MAX_BLOCK],
         }
     }
 
     pub(super) fn channels(&self) -> usize {
         self.channels
+    }
+
+    pub(super) fn head_in(&self) -> usize {
+        self.head_in
     }
 
     pub(super) fn head_size(&self) -> usize {
@@ -75,19 +86,19 @@ impl LayerArray {
     ///
     /// - `input`: `input_size` wide.
     /// - `condition`: conditioning signal.
-    /// - `head_in`: `channels`-wide incoming head (silence for the first array).
+    /// - `head_prev`: `head_in`-wide incoming head (silence for the first array).
     /// - `head_out`: `head_size`-wide head output.
     /// - `array_out`: `channels`-wide output for the next array.
     pub(super) fn process_sample(
         &mut self,
         input: &[f32],
         condition: &[f32],
-        head_in: &[f32],
+        head_prev: &[f32],
         head_out: &mut [f32],
         array_out: &mut [f32],
     ) {
         self.rechannel.process_sample(input, &mut self.cur);
-        self.head_accum.copy_from_slice(head_in);
+        self.head_accum.copy_from_slice(head_prev);
 
         for i in 0..self.layers.len() {
             self.layers[i].process_sample(
@@ -105,21 +116,22 @@ impl LayerArray {
     }
 
     /// Block twin of [`Self::process_sample`]. All slices are **planar** `[ch][t]`,
-    /// `n <= MAX_BLOCK`: `input` is `input_size * n`, `head_in`/`array_out` are
-    /// `channels * n`, `head_out` is `head_size * n`. Allocation-free.
+    /// `n <= MAX_BLOCK`: `input` is `input_size * n`, `head_prev` is `head_in * n`,
+    /// `array_out` is `channels * n`, `head_out` is `head_size * n`. Allocation-free.
     pub(super) fn process_block(
         &mut self,
         input: &[f32],
         condition: &[f32],
-        head_in: &[f32],
+        head_prev: &[f32],
         head_out: &mut [f32],
         array_out: &mut [f32],
         n: usize,
     ) {
         let ch = self.channels;
+        let hin = self.head_in;
         self.rechannel
             .process_block(input, &mut self.cur_blk[..ch * n], n);
-        self.head_accum_blk[..ch * n].copy_from_slice(head_in);
+        self.head_accum_blk[..hin * n].copy_from_slice(head_prev);
 
         for i in 0..self.layers.len() {
             // Split-borrow the two ping-pong scratch rows for this block length.
@@ -128,7 +140,7 @@ impl LayerArray {
             self.layers[i].process_block(
                 cur,
                 condition,
-                &mut self.head_accum_blk[..ch * n],
+                &mut self.head_accum_blk[..hin * n],
                 nxt,
                 n,
             );
@@ -136,7 +148,7 @@ impl LayerArray {
         }
 
         self.head_rechannel
-            .process_block(&self.head_accum_blk[..ch * n], head_out, n);
+            .process_block(&self.head_accum_blk[..hin * n], head_out, n);
         array_out.copy_from_slice(&self.cur_blk[..ch * n]);
     }
 
@@ -210,6 +222,7 @@ mod tests {
         let mk_array = || {
             LayerArray::new(
                 input_size,
+                channels,
                 channels,
                 head_size,
                 1,
@@ -305,7 +318,7 @@ mod tests {
         // rechannel r=1 ; layer: z=2*x+0.5+cond ; relu ; out=3*post+0.1+x ;
         // head_rechannel h=0.5, no bias ; head_in = silence.
         let layer = relu_layer(1, vec![2.0], vec![0.5], vec![1.0], vec![3.0], vec![0.1]);
-        let mut array = LayerArray::new(1, 1, 1, 1, vec![1.0], vec![layer], vec![0.5], None);
+        let mut array = LayerArray::new(1, 1, 1, 1, 1, vec![1.0], vec![layer], vec![0.5], None);
 
         let mut head_out = vec![0.0];
         let mut array_out = vec![0.0];
@@ -322,7 +335,7 @@ mod tests {
         // rechannel=1 ; head_rechannel=1, no bias ; head_in=silence.
         let l0 = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
         let l1 = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
-        let mut array = LayerArray::new(1, 1, 1, 1, vec![1.0], vec![l0, l1], vec![1.0], None);
+        let mut array = LayerArray::new(1, 1, 1, 1, 1, vec![1.0], vec![l0, l1], vec![1.0], None);
 
         let mut head_out = vec![0.0];
         let mut array_out = vec![0.0];
@@ -339,6 +352,7 @@ mod tests {
         // head_rechannel weight=2, bias=[1] -> head_out = 2*10 + 1 = 21.
         let layer = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
         let mut array = LayerArray::new(
+            1,
             1,
             1,
             1,
@@ -361,7 +375,7 @@ mod tests {
     #[test]
     fn channels_and_head_size_reported() {
         let layer = relu_layer(1, vec![1.0], vec![0.0], vec![0.0], vec![1.0], vec![0.0]);
-        let array = LayerArray::new(1, 1, 2, 1, vec![1.0], vec![layer], vec![1.0, 1.0], None);
+        let array = LayerArray::new(1, 1, 1, 2, 1, vec![1.0], vec![layer], vec![1.0, 1.0], None);
         assert_eq!(array.channels(), 1);
         assert_eq!(array.head_size(), 2);
     }
@@ -387,7 +401,8 @@ mod tests {
             vec![0.0],
         );
         // head_rechannel weights [out=1][in=1][k=2] = [w@oldest_tap, w@current_tap] = [10, 1].
-        let mut array = LayerArray::new(1, 1, 1, 2, vec![1.0], vec![layer], vec![10.0, 1.0], None);
+        let mut array =
+            LayerArray::new(1, 1, 1, 1, 2, vec![1.0], vec![layer], vec![10.0, 1.0], None);
 
         let mut head_out = vec![0.0];
         let mut array_out = vec![0.0];

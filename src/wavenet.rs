@@ -496,6 +496,7 @@ fn build_array(r: &mut Reader, la: &LayerArrayConfig) -> Result<LayerArray, Erro
     Ok(LayerArray::new(
         la.input_size,
         la.channels,
+        la.channels, // head_in (Task 3 computes the real head-contribution width)
         la.head_size,
         la.head_kernel_size,
         rechannel_w,

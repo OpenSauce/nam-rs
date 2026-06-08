@@ -363,51 +363,425 @@ impl FilmConfig {
 }
 
 /// WaveNet configuration: a sequence of layer-arrays plus a final output scale.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct WaveNetConfig {
     /// One config per layer-array (NAM standard models have two).
     pub layers: Vec<LayerArrayConfig>,
     /// Optional separate head. `null` in shipped models; a non-null head is a
     /// deferred feature (rejected at build time).
-    #[serde(default)]
     pub head: Option<serde_json::Value>,
     /// Output gain applied after the head.
     pub head_scale: f32,
     /// Unrecognized top-level config keys (e.g. `condition_dsp`), captured so the
     /// feature-guard can reject deferred features instead of silently dropping them.
-    #[serde(flatten)]
     pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Configuration for a single WaveNet layer-array (a stack of dilated layers
-/// sharing channel/kernel parameters).
-#[derive(Debug, Clone, Deserialize)]
+impl<'de> Deserialize<'de> for WaveNetConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawWaveNetConfig {
+            layers: Vec<RawLayerArrayConfig>,
+            #[serde(default)]
+            head: Option<serde_json::Value>,
+            head_scale: f32,
+            #[serde(flatten)]
+            extra: serde_json::Map<String, serde_json::Value>,
+        }
+
+        let raw = RawWaveNetConfig::deserialize(deserializer)?;
+        let layers = raw
+            .layers
+            .into_iter()
+            .map(|r| r.normalize().map_err(de::Error::custom))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(WaveNetConfig {
+            layers,
+            head: raw.head,
+            head_scale: raw.head_scale,
+            extra: raw.extra,
+        })
+    }
+}
+
+/// Configuration for one WaveNet layer-array, normalized so every per-layer
+/// quantity is a `Vec` of length `dilations.len()`. Built from the on-disk JSON by
+/// [`RawLayerArrayConfig::normalize`]; A1 files fill the A2 fields with defaults.
+#[derive(Debug, Clone)]
 pub struct LayerArrayConfig {
-    /// Number of input channels into the array (1 for the first array).
+    /// Input channels into the array (1 for the first array).
     pub input_size: usize,
-    /// Conditioning signal width (1 for standard amp models).
+    /// Conditioning signal width.
     pub condition_size: usize,
-    /// Hidden channel count.
+    /// Hidden channel count between layers.
     pub channels: usize,
-    /// Output channels of each layer's head 1x1.
-    pub head_size: usize,
-    /// Dilated-convolution kernel size (typically 3).
-    pub kernel_size: usize,
-    /// Per-layer dilation factors, e.g. `[1, 2, 4, ..., 512]`.
+    /// Internal per-layer width (defaults to `channels`).
+    pub bottleneck: usize,
+    /// Per-layer dilation factors; its length defines the number of layers.
     pub dilations: Vec<usize>,
-    /// Activation function spec, e.g. `"Tanh"` or `{"type":"LeakyReLU"}`.
-    pub activation: ActivationSpec,
-    /// Whether the layer uses a gated activation (`tanh * sigmoid`). Absent in some
-    /// A2 layers (which use `gating_mode` instead — a deferred feature).
-    #[serde(default)]
-    pub gated: bool,
-    /// Whether the head 1x1 has a bias term.
+    /// Per-layer dilated-conv kernel sizes (length == `dilations.len()`).
+    pub kernel_sizes: Vec<usize>,
+    /// Per-layer primary activations (length == `dilations.len()`).
+    pub activations: Vec<ActivationSpec>,
+    /// Per-layer gating modes (length == `dilations.len()`).
+    pub gating_modes: Vec<GatingMode>,
+    /// Per-layer secondary activations (for gating); element may be the default
+    /// (a `Named{"Sigmoid"}`) where unspecified. Length == `dilations.len()`.
+    pub secondary_activations: Vec<ActivationSpec>,
+    /// Grouped-conv groups for the dilated conv.
+    pub groups_input: usize,
+    /// Grouped-conv groups for the input mixer.
+    pub groups_input_mixin: usize,
+    /// Head rechannel output width.
+    pub head_size: usize,
+    /// Head rechannel kernel size (1 for A1; e.g. 16 for A2 conv heads).
+    pub head_kernel_size: usize,
+    /// Whether the head rechannel has a bias.
     pub head_bias: bool,
-    /// Unrecognized per-layer keys (e.g. `bottleneck`, FiLM, `groups_input`, a
-    /// non-null nested `head`), captured for the feature-guard. The benign
-    /// training key `slimmable` lives here too and is allowlisted.
-    #[serde(flatten)]
-    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
+    /// Residual 1×1 config.
+    pub layer1x1: Layer1x1Config,
+    /// Head 1×1 config.
+    pub head1x1: Head1x1Config,
+    /// FiLM: applied to the layer input before the dilated conv.
+    pub conv_pre_film: FilmConfig,
+    /// FiLM: applied to the dilated-conv output.
+    pub conv_post_film: FilmConfig,
+    /// FiLM: applied to the conditioning before the input mixer.
+    pub input_mixin_pre_film: FilmConfig,
+    /// FiLM: applied to the input-mixer output.
+    pub input_mixin_post_film: FilmConfig,
+    /// FiLM: applied to the conv+mixin sum before activation.
+    pub activation_pre_film: FilmConfig,
+    /// FiLM: applied to the activation output.
+    pub activation_post_film: FilmConfig,
+    /// FiLM: applied to the layer1x1 output (BLENDED branch only, per NAMCore).
+    pub layer1x1_post_film: FilmConfig,
+    /// FiLM: applied to the head1x1 output.
+    pub head1x1_post_film: FilmConfig,
+}
+
+/// On-disk shape of a layer-array config: optional / either-or fields exactly as
+/// NAM writes them. Converted to [`LayerArrayConfig`] by [`Self::normalize`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct RawLayerArrayConfig {
+    input_size: usize,
+    condition_size: usize,
+    channels: usize,
+    #[serde(default)]
+    bottleneck: Option<usize>,
+    dilations: Vec<usize>,
+    #[serde(default)]
+    kernel_size: Option<usize>,
+    #[serde(default)]
+    kernel_sizes: Option<Vec<usize>>,
+    activation: serde_json::Value,
+    #[serde(default)]
+    gating_mode: Option<serde_json::Value>,
+    #[serde(default)]
+    gated: Option<bool>,
+    #[serde(default)]
+    secondary_activation: Option<serde_json::Value>,
+    #[serde(default)]
+    groups_input: Option<usize>,
+    #[serde(default)]
+    groups_input_mixin: Option<usize>,
+    #[serde(default)]
+    head: Option<serde_json::Value>,
+    #[serde(default)]
+    head_size: Option<usize>,
+    #[serde(default)]
+    head_bias: Option<bool>,
+    #[serde(default)]
+    layer1x1: Option<serde_json::Value>,
+    #[serde(default)]
+    head1x1: Option<serde_json::Value>,
+    #[serde(default)]
+    conv_pre_film: Option<serde_json::Value>,
+    #[serde(default)]
+    conv_post_film: Option<serde_json::Value>,
+    #[serde(default)]
+    input_mixin_pre_film: Option<serde_json::Value>,
+    #[serde(default)]
+    input_mixin_post_film: Option<serde_json::Value>,
+    #[serde(default)]
+    activation_pre_film: Option<serde_json::Value>,
+    #[serde(default)]
+    activation_post_film: Option<serde_json::Value>,
+    #[serde(default)]
+    layer1x1_post_film: Option<serde_json::Value>,
+    #[serde(default)]
+    head1x1_post_film: Option<serde_json::Value>,
+}
+
+impl RawLayerArrayConfig {
+    pub(crate) fn normalize(self) -> Result<LayerArrayConfig, String> {
+        let n = self.dilations.len();
+        if n == 0 {
+            return Err("layer-array has no dilations".into());
+        }
+
+        let kernel_sizes = match (self.kernel_size, self.kernel_sizes) {
+            (Some(_), Some(_)) => {
+                return Err("layer-array specifies both kernel_size and kernel_sizes".into())
+            }
+            (Some(k), None) => vec![k; n],
+            (None, Some(ks)) => {
+                if ks.len() != n {
+                    return Err(format!(
+                        "kernel_sizes length {} != number of layers {n}",
+                        ks.len()
+                    ));
+                }
+                ks
+            }
+            (None, None) => {
+                return Err("layer-array specifies neither kernel_size nor kernel_sizes".into())
+            }
+        };
+
+        let activations = broadcast_activations(&self.activation, n)?;
+
+        let gating_modes = match (&self.gating_mode, self.gated) {
+            (Some(v), _) => broadcast_gating(v, n)?,
+            (None, Some(true)) => vec![GatingMode::Gated; n],
+            (None, _) => vec![GatingMode::None; n],
+        };
+
+        let secondary_activations = match &self.secondary_activation {
+            Some(v) => broadcast_secondary(v, n)?,
+            None => vec![default_sigmoid(); n],
+        };
+
+        let (head_size, head_kernel_size, head_bias) = match &self.head {
+            Some(h) if !h.is_null() => {
+                let out = h
+                    .get("out_channels")
+                    .and_then(|x| x.as_u64())
+                    .ok_or("layer head missing out_channels")? as usize;
+                let k = h
+                    .get("kernel_size")
+                    .and_then(|x| x.as_u64())
+                    .ok_or("layer head missing kernel_size")? as usize;
+                let bias = h.get("bias").and_then(|x| x.as_bool()).unwrap_or(true);
+                (out, k, bias)
+            }
+            _ => {
+                let hs = self
+                    .head_size
+                    .ok_or("layer-array missing head_size (and no head object)")?;
+                (hs, 1, self.head_bias.unwrap_or(false))
+            }
+        };
+
+        Ok(LayerArrayConfig {
+            input_size: self.input_size,
+            condition_size: self.condition_size,
+            channels: self.channels,
+            bottleneck: self.bottleneck.unwrap_or(self.channels),
+            dilations: self.dilations,
+            kernel_sizes,
+            activations,
+            gating_modes,
+            secondary_activations,
+            groups_input: self.groups_input.unwrap_or(1),
+            groups_input_mixin: self.groups_input_mixin.unwrap_or(1),
+            head_size,
+            head_kernel_size,
+            head_bias,
+            layer1x1: Layer1x1Config::from_json(self.layer1x1.as_ref()),
+            head1x1: Head1x1Config::from_json(self.head1x1.as_ref()),
+            conv_pre_film: FilmConfig::from_json(self.conv_pre_film.as_ref()),
+            conv_post_film: FilmConfig::from_json(self.conv_post_film.as_ref()),
+            input_mixin_pre_film: FilmConfig::from_json(self.input_mixin_pre_film.as_ref()),
+            input_mixin_post_film: FilmConfig::from_json(self.input_mixin_post_film.as_ref()),
+            activation_pre_film: FilmConfig::from_json(self.activation_pre_film.as_ref()),
+            activation_post_film: FilmConfig::from_json(self.activation_post_film.as_ref()),
+            layer1x1_post_film: FilmConfig::from_json(self.layer1x1_post_film.as_ref()),
+            head1x1_post_film: FilmConfig::from_json(self.head1x1_post_film.as_ref()),
+        })
+    }
+}
+
+/// A `Named{"Sigmoid"}` activation, the gating secondary default.
+fn default_sigmoid() -> ActivationSpec {
+    ActivationSpec::Named {
+        name: "Sigmoid".into(),
+        negative_slope: None,
+    }
+}
+
+/// Broadcast a single activation or expand a per-layer list to length `n`.
+fn broadcast_activations(v: &serde_json::Value, n: usize) -> Result<Vec<ActivationSpec>, String> {
+    match v {
+        serde_json::Value::Array(items) => {
+            if items.len() != n {
+                return Err(format!(
+                    "activation list length {} != number of layers {n}",
+                    items.len()
+                ));
+            }
+            items
+                .iter()
+                .map(|e| {
+                    serde_json::from_value::<ActivationSpec>(e.clone()).map_err(|e| e.to_string())
+                })
+                .collect()
+        }
+        other => {
+            let a = serde_json::from_value::<ActivationSpec>(other.clone()).map_err(|e| e.to_string())?;
+            Ok(vec![a; n])
+        }
+    }
+}
+
+/// Broadcast/expand `secondary_activation`; JSON `null` elements become the
+/// Sigmoid default (NAMCore's default secondary).
+fn broadcast_secondary(v: &serde_json::Value, n: usize) -> Result<Vec<ActivationSpec>, String> {
+    let one = |e: &serde_json::Value| -> Result<ActivationSpec, String> {
+        if e.is_null() {
+            Ok(default_sigmoid())
+        } else {
+            serde_json::from_value::<ActivationSpec>(e.clone()).map_err(|e| e.to_string())
+        }
+    };
+    match v {
+        serde_json::Value::Array(items) => {
+            if items.len() != n {
+                return Err(format!(
+                    "secondary_activation list length {} != {n}",
+                    items.len()
+                ));
+            }
+            items.iter().map(one).collect()
+        }
+        other => Ok(vec![one(other)?; n]),
+    }
+}
+
+/// Broadcast a single gating name or expand a per-layer list to length `n`.
+fn broadcast_gating(v: &serde_json::Value, n: usize) -> Result<Vec<GatingMode>, String> {
+    match v {
+        serde_json::Value::String(s) => {
+            let g = GatingMode::from_name(s)?;
+            Ok(vec![g; n])
+        }
+        serde_json::Value::Array(items) => {
+            if items.len() != n {
+                return Err(format!(
+                    "gating_mode list length {} != number of layers {n}",
+                    items.len()
+                ));
+            }
+            items
+                .iter()
+                .map(|e| {
+                    e.as_str()
+                        .ok_or_else(|| "gating_mode entry is not a string".to_string())
+                        .and_then(GatingMode::from_name)
+                })
+                .collect()
+        }
+        _ => Err("gating_mode is neither a string nor a list".into()),
+    }
+}
+
+#[cfg(test)]
+mod layer_array_normalize_tests {
+    use super::*;
+
+    fn norm(v: serde_json::Value) -> LayerArrayConfig {
+        let raw: RawLayerArrayConfig = serde_json::from_value(v).unwrap();
+        raw.normalize().unwrap()
+    }
+
+    #[test]
+    fn a1_layer_broadcasts_scalar_kernel_and_string_activation() {
+        let la = norm(serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 2, "head_size": 1,
+            "kernel_size": 3, "dilations": [1, 2, 4], "activation": "Tanh",
+            "gated": false, "head_bias": false
+        }));
+        assert_eq!(la.channels, 2);
+        assert_eq!(la.bottleneck, 2);
+        assert_eq!(la.kernel_sizes, vec![3, 3, 3]);
+        assert_eq!(la.gating_modes, vec![GatingMode::None; 3]);
+        assert_eq!(la.head_size, 1);
+        assert_eq!(la.head_kernel_size, 1);
+        assert!(!la.head_bias);
+        assert!(la.layer1x1.active);
+        assert!(!la.head1x1.active);
+        assert_eq!(la.groups_input, 1);
+        assert_eq!(la.activations.len(), 3);
+        assert!(matches!(&la.activations[0], ActivationSpec::Named { name, .. } if name == "Tanh"));
+        let g = norm(serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 2, "head_size": 1,
+            "kernel_size": 3, "dilations": [1], "activation": "Tanh",
+            "gated": true, "head_bias": true
+        }));
+        assert_eq!(g.gating_modes, vec![GatingMode::Gated]);
+    }
+
+    #[test]
+    fn a2_flexible_layer_parses_per_layer_vectors_and_nested_head() {
+        let la = norm(serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 3, "bottleneck": 3,
+            "dilations": [1, 3, 7],
+            "kernel_sizes": [6, 6, 15],
+            "activation": [
+                {"type": "LeakyReLU", "negative_slope": 0.01},
+                {"type": "LeakyReLU", "negative_slope": 0.01},
+                {"type": "LeakyReLU", "negative_slope": 0.01}
+            ],
+            "head": {"out_channels": 1, "kernel_size": 16, "bias": true},
+            "head1x1": {"active": false, "out_channels": 1, "groups": 1},
+            "layer1x1": {"active": true, "groups": 1},
+            "groups_input": 1, "groups_input_mixin": 1,
+            "gating_mode": ["none", "none", "none"],
+            "secondary_activation": [null, null, null],
+            "conv_pre_film": {"active": false, "shift": true, "groups": 1}
+        }));
+        assert_eq!(la.kernel_sizes, vec![6, 6, 15]);
+        assert_eq!(la.gating_modes, vec![GatingMode::None; 3]);
+        assert_eq!(la.head_size, 1);
+        assert_eq!(la.head_kernel_size, 16);
+        assert!(la.head_bias);
+        assert_eq!(la.bottleneck, 3);
+        assert_eq!(la.activations.len(), 3);
+        assert!(!la.conv_pre_film.active);
+    }
+
+    #[test]
+    fn both_kernel_forms_is_an_error() {
+        let raw: RawLayerArrayConfig = serde_json::from_value(serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+            "kernel_size": 3, "kernel_sizes": [3], "dilations": [1],
+            "activation": "Tanh", "gated": false, "head_bias": false
+        })).unwrap();
+        assert!(raw.normalize().is_err());
+    }
+
+    #[test]
+    fn kernel_sizes_length_mismatch_is_an_error() {
+        let raw: RawLayerArrayConfig = serde_json::from_value(serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+            "kernel_sizes": [3, 3], "dilations": [1],
+            "activation": "Tanh", "gated": false, "head_bias": false
+        })).unwrap();
+        assert!(raw.normalize().is_err());
+    }
+
+    #[test]
+    fn activation_list_length_mismatch_is_an_error() {
+        let raw: RawLayerArrayConfig = serde_json::from_value(serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 1, "head_size": 1,
+            "kernel_size": 3, "dilations": [1, 2],
+            "activation": ["Tanh"], "gated": false, "head_bias": false
+        })).unwrap();
+        assert!(raw.normalize().is_err());
+    }
 }
 
 #[cfg(test)]

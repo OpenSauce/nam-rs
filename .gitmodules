@@ -1,0 +1,3 @@
+[submodule "tests/oracle/NeuralAmpModelerCore"]
+	path = tests/oracle/NeuralAmpModelerCore
+	url = https://github.com/sdatkinson/NeuralAmpModelerCore.git

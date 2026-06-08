@@ -783,6 +783,321 @@ mod tests {
         assert_eq!(out, vec![5.0, -1.0]);
     }
 
+    #[test]
+    fn conv_post_film_scales_conv_output_before_sum() {
+        // channels=1 bottleneck=1 mid=1 NONE ReLU. conv [1]=[2.0] b[0]; input=1 -> conv_out=2.
+        // conv_post_film[1] scale-only: cond_dim=1, input_dim=mid=1, W=[3.0] b=[0]; cond=1
+        //   -> scale=3 -> conv_out=6. mix=0. z=6. act=relu(6)=6. head+=6.
+        //   layer1x1 W[1]=[1] b[0] -> res=6. out = input + res = 7.
+        let gating = Gating::new(GatingMode::None, Activation::Relu, Activation::Sigmoid, 1);
+        let mut films: [Option<(Vec<f32>, Vec<f32>)>; 8] =
+            [None, None, None, None, None, None, None, None];
+        films[1] = Some((vec![3.0], vec![0.0])); // conv_post_film, scale-only (shift=false)
+        let mut layer = Layer::new(
+            LayerDims {
+                channels: 1,
+                bottleneck: 1,
+                condition_size: 1,
+                kernel: 1,
+                dilation: 1,
+                groups_input: 1,
+                groups_input_mixin: 1,
+                layer1x1_groups: 1,
+                head1x1_groups: 1,
+                head1x1_out: None,
+                film_shift: [false; 8],
+                film_groups: [1; 8],
+            },
+            gating,
+            Activation::Relu,
+            LayerWeights {
+                conv_w: vec![2.0],
+                conv_b: vec![0.0],
+                mix_w: vec![0.0],
+                layer1x1_w: Some(vec![1.0]),
+                layer1x1_b: Some(vec![0.0]),
+                head1x1_w: None,
+                head1x1_b: None,
+                films,
+            },
+        );
+        let mut head = vec![0.0];
+        let mut out = vec![0.0];
+        layer.process_sample(&[1.0], &[1.0], &mut head, &mut out);
+        assert_eq!(head, vec![6.0]);
+        assert_eq!(out, vec![7.0]);
+    }
+
+    #[test]
+    fn input_mixin_pre_film_modulates_condition_before_mixer() {
+        // channels=1 bottleneck=1 mid=1 NONE ReLU. conv [1]=[0.0] b[0] (conv_out=0).
+        // input_mixin_pre_film[2]: input_dim=condition_size=1 scale-only W=[5.0] b[0]; cond=2
+        //   -> FiLM modulates the condition: scale = W*cond = 5*2 = 10; mix_in = cond*scale
+        //   = 2*10 = 20. mixin W[in=1,out=1]=[1.0] -> mix=20. z=0+20=20.
+        //   act=relu(20)=20. head+=20. layer1x1 W=[1] b[0] -> res=20. out=input(0)+20=20.
+        let gating = Gating::new(GatingMode::None, Activation::Relu, Activation::Sigmoid, 1);
+        let mut films: [Option<(Vec<f32>, Vec<f32>)>; 8] =
+            [None, None, None, None, None, None, None, None];
+        films[2] = Some((vec![5.0], vec![0.0])); // input_mixin_pre_film, scale-only
+        let mut layer = Layer::new(
+            LayerDims {
+                channels: 1,
+                bottleneck: 1,
+                condition_size: 1,
+                kernel: 1,
+                dilation: 1,
+                groups_input: 1,
+                groups_input_mixin: 1,
+                layer1x1_groups: 1,
+                head1x1_groups: 1,
+                head1x1_out: None,
+                film_shift: [false; 8],
+                film_groups: [1; 8],
+            },
+            gating,
+            Activation::Relu,
+            LayerWeights {
+                conv_w: vec![0.0],
+                conv_b: vec![0.0],
+                mix_w: vec![1.0],
+                layer1x1_w: Some(vec![1.0]),
+                layer1x1_b: Some(vec![0.0]),
+                head1x1_w: None,
+                head1x1_b: None,
+                films,
+            },
+        );
+        let mut head = vec![0.0];
+        let mut out = vec![0.0];
+        layer.process_sample(&[0.0], &[2.0], &mut head, &mut out);
+        assert_eq!(head, vec![20.0]);
+        assert_eq!(out, vec![20.0]);
+    }
+
+    #[test]
+    fn layer1x1_post_film_applies_only_in_blended_branch() {
+        // BLENDED channels=1 bottleneck=1 mid=2. Reuse blended_layer values:
+        // z=[-2,0] -> act=-1. layer1x1 W[1]=[1] b[0] -> res=-1.
+        // layer1x1_post_film[6] scale-only W=[3.0] b[0], cond=1 -> res = -1*3 = -3.
+        // out = input + res = 1 + (-3) = -2. head += act = -1.
+        let gating = Gating::new(
+            GatingMode::Blended,
+            Activation::Relu,
+            Activation::Sigmoid,
+            1,
+        );
+        let mut films: [Option<(Vec<f32>, Vec<f32>)>; 8] =
+            [None, None, None, None, None, None, None, None];
+        films[6] = Some((vec![3.0], vec![0.0]));
+        let mut layer = Layer::new(
+            LayerDims {
+                channels: 1,
+                bottleneck: 1,
+                condition_size: 1,
+                kernel: 1,
+                dilation: 1,
+                groups_input: 1,
+                groups_input_mixin: 1,
+                layer1x1_groups: 1,
+                head1x1_groups: 1,
+                head1x1_out: None,
+                film_shift: [false; 8],
+                film_groups: [1; 8],
+            },
+            gating,
+            Activation::Relu,
+            LayerWeights {
+                conv_w: vec![-2.0, 0.0],
+                conv_b: vec![0.0, 0.0],
+                mix_w: vec![0.0, 0.0],
+                layer1x1_w: Some(vec![1.0]),
+                layer1x1_b: Some(vec![0.0]),
+                head1x1_w: None,
+                head1x1_b: None,
+                films,
+            },
+        );
+        let mut head = vec![0.0];
+        let mut out = vec![0.0];
+        layer.process_sample(&[1.0], &[1.0], &mut head, &mut out);
+        assert!((head[0] - (-1.0)).abs() < 1e-6, "head={}", head[0]);
+        assert!((out[0] - (-2.0)).abs() < 1e-6, "out={}", out[0]);
+
+        // Same films[6] present, but NONE gating: the layer1x1_post_film must be IGNORED.
+        let gating_n = Gating::new(GatingMode::None, Activation::Relu, Activation::Sigmoid, 1);
+        let mut films_n: [Option<(Vec<f32>, Vec<f32>)>; 8] =
+            [None, None, None, None, None, None, None, None];
+        films_n[6] = Some((vec![3.0], vec![0.0]));
+        let mut layer_n = Layer::new(
+            LayerDims {
+                channels: 1,
+                bottleneck: 1,
+                condition_size: 1,
+                kernel: 1,
+                dilation: 1,
+                groups_input: 1,
+                groups_input_mixin: 1,
+                layer1x1_groups: 1,
+                head1x1_groups: 1,
+                head1x1_out: None,
+                film_shift: [false; 8],
+                film_groups: [1; 8],
+            },
+            gating_n,
+            Activation::Relu,
+            LayerWeights {
+                conv_w: vec![3.0],
+                conv_b: vec![0.0],
+                mix_w: vec![0.0],
+                layer1x1_w: Some(vec![1.0]),
+                layer1x1_b: Some(vec![0.0]),
+                head1x1_w: None,
+                head1x1_b: None,
+                films: films_n,
+            },
+        );
+        // input=1 -> conv_out=3 -> z=3 -> act=relu(3)=3. res=1*3=3 (NO post_film scaling).
+        // out = input + res = 1 + 3 = 4.
+        let mut head_n = vec![0.0];
+        let mut out_n = vec![0.0];
+        layer_n.process_sample(&[1.0], &[1.0], &mut head_n, &mut out_n);
+        assert!((out_n[0] - 4.0).abs() < 1e-6, "NONE out={}", out_n[0]);
+    }
+
+    /// Block ≡ per-sample with several FiLM sites active (conv_pre scale, conv_post
+    /// shift, activation_pre scale) under GATED gating.
+    #[test]
+    fn process_block_equals_per_sample_with_films_active() {
+        let channels = 2usize;
+        let bottleneck = 2usize;
+        let cond_sz = 2usize;
+        let kernel = 3usize;
+        let dilation = 2usize;
+        let mid = 2 * bottleneck; // GATED
+        let mk = |len: usize, salt: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| (((i * 17 + salt * 11) % 31) as f32 - 15.0) * 0.05)
+                .collect()
+        };
+
+        let mut film_shift = [false; 8];
+        film_shift[1] = true; // conv_post_film uses shift
+        let mk_layer = || {
+            let gating = Gating::new(
+                GatingMode::Gated,
+                Activation::Tanh,
+                Activation::Sigmoid,
+                bottleneck,
+            );
+            let mut films: [Option<(Vec<f32>, Vec<f32>)>; 8] =
+                [None, None, None, None, None, None, None, None];
+            // conv_pre_film[0]: input_dim=channels, scale-only.
+            films[0] = Some((mk(channels * cond_sz, 11), mk(channels, 12)));
+            // conv_post_film[1]: input_dim=mid, shift -> out_rows=2*mid.
+            films[1] = Some((mk(2 * mid * cond_sz, 13), mk(2 * mid, 14)));
+            // activation_pre_film[4]: input_dim=mid, scale-only.
+            films[4] = Some((mk(mid * cond_sz, 15), mk(mid, 16)));
+            Layer::new(
+                LayerDims {
+                    channels,
+                    bottleneck,
+                    condition_size: cond_sz,
+                    kernel,
+                    dilation,
+                    groups_input: 1,
+                    groups_input_mixin: 1,
+                    layer1x1_groups: 1,
+                    head1x1_groups: 1,
+                    head1x1_out: None,
+                    film_shift,
+                    film_groups: [1; 8],
+                },
+                gating,
+                Activation::Tanh,
+                LayerWeights {
+                    conv_w: mk(mid * channels * kernel, 1),
+                    conv_b: mk(mid, 2),
+                    mix_w: mk(mid * cond_sz, 3),
+                    layer1x1_w: Some(mk(channels * bottleneck, 4)),
+                    layer1x1_b: Some(mk(channels, 5)),
+                    head1x1_w: None,
+                    head1x1_b: None,
+                    films,
+                },
+            )
+        };
+
+        let total = 130usize;
+        let inp: Vec<Vec<f32>> = (0..total)
+            .map(|t| {
+                (0..channels)
+                    .map(|c| ((t * 3 + c) as f32 * 0.19).sin())
+                    .collect()
+            })
+            .collect();
+        let cond: Vec<Vec<f32>> = (0..total)
+            .map(|t| {
+                (0..cond_sz)
+                    .map(|c| ((t * 5 + c) as f32 * 0.13).cos())
+                    .collect()
+            })
+            .collect();
+        let seed: Vec<Vec<f32>> = (0..total)
+            .map(|t| (0..bottleneck).map(|c| ((t + c) as f32) * 0.01).collect())
+            .collect();
+
+        let mut a = mk_layer();
+        let mut out_ref = vec![vec![0.0; channels]; total];
+        let mut head_ref = vec![vec![0.0; bottleneck]; total];
+        for t in 0..total {
+            let mut head = seed[t].clone();
+            let mut out = vec![0.0; channels];
+            a.process_sample(&inp[t], &cond[t], &mut head, &mut out);
+            out_ref[t] = out;
+            head_ref[t] = head;
+        }
+
+        let mut b = mk_layer();
+        for (lo, len) in [(0usize, 70usize), (70, 60)] {
+            let mut bin = vec![0.0; channels * len];
+            let mut bcond = vec![0.0; cond_sz * len];
+            let mut bhead = vec![0.0; bottleneck * len];
+            for lt in 0..len {
+                for c in 0..channels {
+                    bin[c * len + lt] = inp[lo + lt][c];
+                }
+                for c in 0..bottleneck {
+                    bhead[c * len + lt] = seed[lo + lt][c];
+                }
+                for c in 0..cond_sz {
+                    bcond[c * len + lt] = cond[lo + lt][c];
+                }
+            }
+            let mut bout = vec![0.0; channels * len];
+            b.process_block(&bin, &bcond, &mut bhead, &mut bout, len);
+            for lt in 0..len {
+                for c in 0..channels {
+                    let go = bout[c * len + lt];
+                    assert!(
+                        (go - out_ref[lo + lt][c]).abs() < 1e-5,
+                        "t{} c{c} out: got {go}, want {}",
+                        lo + lt,
+                        out_ref[lo + lt][c]
+                    );
+                }
+                for c in 0..bottleneck {
+                    let gh = bhead[c * len + lt];
+                    assert!(
+                        (gh - head_ref[lo + lt][c]).abs() < 1e-5,
+                        "t{} c{c} head: got {gh}, want {}",
+                        lo + lt,
+                        head_ref[lo + lt][c]
+                    );
+                }
+            }
+        }
+    }
+
     /// Block path reproduces the per-sample path for a full layer, gated and not,
     /// multi-channel, dilated, with a per-sample head seed carried in planar form.
     #[test]

@@ -59,6 +59,26 @@ impl FiLM {
         }
     }
 
+    /// Out-of-place: `out = input ⊙ scale (+ shift)`. `input`/`out` are
+    /// `input_dim` wide, `condition` is `condition_dim` wide. `out` must not
+    /// alias `input`.
+    pub(super) fn process_sample(&mut self, input: &[f32], condition: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(input.len(), self.input_dim);
+        debug_assert_eq!(out.len(), self.input_dim);
+        self.cond_to_scale_shift
+            .process_sample(condition, &mut self.ss);
+        let d = self.input_dim;
+        if self.shift {
+            for i in 0..d {
+                out[i] = input[i] * self.ss[i] + self.ss[d + i];
+            }
+        } else {
+            for i in 0..d {
+                out[i] = input[i] * self.ss[i];
+            }
+        }
+    }
+
     /// Rows the internal Conv1x1 emits: `(shift ? 2 : 1) * input_dim`.
     #[cfg(test)]
     pub(super) fn out_rows(&self) -> usize {
@@ -78,5 +98,30 @@ mod tests {
         // scale+shift: out rows = 2*input_dim = 4.
         let g = FiLM::new(3, 2, true, 1, vec![0.0; 4 * 3], vec![0.0; 4]);
         assert_eq!(g.out_rows(), 4);
+    }
+
+    #[test]
+    fn process_sample_scale_only() {
+        // input_dim=2, condition_dim=1, no shift, groups=1.
+        // Conv1x1 W = [out=2][in=1][k=1] = [3.0, 4.0], bias = [1.0, -1.0].
+        // cond = [2.0] -> scale = [3*2+1, 4*2-1] = [7.0, 7.0].
+        // input = [10.0, 100.0] -> out = [70.0, 700.0].
+        let mut f = FiLM::new(1, 2, false, 1, vec![3.0, 4.0], vec![1.0, -1.0]);
+        let mut out = vec![0.0; 2];
+        f.process_sample(&[10.0, 100.0], &[2.0], &mut out);
+        assert_eq!(out, vec![70.0, 700.0]);
+    }
+
+    #[test]
+    fn process_sample_scale_and_shift() {
+        // input_dim=2, condition_dim=1, shift=true -> out_rows=4.
+        // Conv1x1 W = [out=4][in=1][k=1] = [3,4,5,6], bias = [0,0,0,0].
+        // cond = [2.0] -> ss = [6, 8, 10, 12]; scale = ss[0..2] = [6,8],
+        //   shift = ss[2..4] = [10,12].
+        // input = [1.0, 1.0] -> out = [1*6+10, 1*8+12] = [16.0, 20.0].
+        let mut f = FiLM::new(1, 2, true, 1, vec![3.0, 4.0, 5.0, 6.0], vec![0.0; 4]);
+        let mut out = vec![0.0; 2];
+        f.process_sample(&[1.0, 1.0], &[2.0], &mut out);
+        assert_eq!(out, vec![16.0, 20.0]);
     }
 }

@@ -582,6 +582,24 @@ mod tests {
     }"#;
 
     #[test]
+    fn default_path_unchanged_baseline() {
+        // No post-stack head, no condition_dsp: output = head_scale * final_head.
+        // TINY: x=0.5 -> out=10.0 (pinned in tiny_model_matches_hand_computed_forward).
+        let model = NamModel::from_json_str(TINY).unwrap();
+        let mut wn = WaveNet::new(&model).unwrap();
+        let mut buf = [0.5_f32];
+        wn.process_buffer(&mut buf);
+        assert!((buf[0] - 10.0).abs() < 1e-5, "got {}", buf[0]);
+        // And the config really has neither feature.
+        let cfg = match &model.config {
+            crate::model::ModelConfig::WaveNet(c) => c,
+            _ => unreachable!(),
+        };
+        assert!(cfg.post_stack_head.is_none());
+        assert!(cfg.condition_dsp.is_none());
+    }
+
+    #[test]
     fn tiny_model_matches_hand_computed_forward() {
         let model = NamModel::from_json_str(TINY).unwrap();
         let mut wn = WaveNet::new(&model).unwrap();

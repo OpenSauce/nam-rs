@@ -28,14 +28,11 @@ fn a2_max_features_are_rejected_not_run() {
 fn mono_condition_dsp_is_supported_not_blanket_guarded() {
     // condition_dsp is no longer a blanket-guarded feature. A *mono* condition_dsp
     // (`condition_size == 1`) builds and runs — full forward parity is covered by the
-    // parity suite's `condition_dsp_matches_namcore_oracle`. So the generic
-    // `UnsupportedFeature("condition_dsp")` rejection must be gone.
-    if let Err(Error::UnsupportedFeature(msg)) = build_fixture("condition_dsp_mono.nam") {
-        assert!(
-            !msg.contains("condition_dsp"),
-            "mono condition_dsp must build, got UnsupportedFeature({msg:?})"
-        );
-    }
+    // parity suite's `condition_dsp_matches_namcore_oracle`. It must build with no
+    // error at all (not merely avoid a "condition_dsp"-worded one).
+    let mut m = build_fixture("condition_dsp_mono.nam").expect("mono condition_dsp must build");
+    let mut buf = vec![0.1_f32; 256];
+    m.process_buffer(&mut buf); // must not panic
 }
 
 #[test]

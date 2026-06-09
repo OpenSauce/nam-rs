@@ -98,6 +98,19 @@ impl Model {
         }
     }
 
+    /// Build a model for use as a nested `condition_dsp`, where a WaveNet may emit
+    /// more than one output channel (its N rows feed the parent arrays' conditioning).
+    /// Only WaveNet has a multi-channel output path; LSTM/Slimmable are always mono,
+    /// so they fall back to [`Model::from_nam`].
+    pub(crate) fn from_nam_conditioning(model: &NamModel) -> Result<Self, Error> {
+        match &model.config {
+            ModelConfig::WaveNet(_) => {
+                Ok(Model::WaveNet(Box::new(WaveNet::new_conditioning(model)?)))
+            }
+            _ => Model::from_nam(model),
+        }
+    }
+
     /// Process a buffer of mono samples in place. Allocation-free.
     pub fn process_buffer(&mut self, io: &mut [f32]) {
         match self {

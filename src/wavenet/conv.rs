@@ -28,12 +28,6 @@ pub(super) struct Conv1d {
     out_ch: usize,
     kernel: usize,
     dilation: usize,
-    /// Number of convolution groups (block-diagonal). `1` is the dense fast path.
-    /// Retained as the canonical group count; the forward paths derive their
-    /// iteration from `out_per_group`/`in_per_group`, and the Generalized Layer
-    /// phase reads it when wiring grouped layers.
-    #[allow(dead_code)]
-    groups: usize,
     /// `out_ch / groups`.
     out_per_group: usize,
     /// `in_ch / groups`.
@@ -97,7 +91,6 @@ impl Conv1d {
             out_ch,
             kernel,
             dilation,
-            groups,
             out_per_group: out_ch / groups,
             in_per_group: in_ch / groups,
             weights,

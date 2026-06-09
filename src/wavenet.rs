@@ -91,7 +91,25 @@ impl WaveNet {
     ///
     /// All allocation happens here. Fails if the architecture is unsupported, an
     /// activation is unknown, or the flat weight blob does not match the config.
+    ///
+    /// A top-level model is mono-output: this rejects a config whose forward pass
+    /// would emit more than one channel (a last-array `head_size > 1` with no
+    /// post-stack head), which the mono [`process_buffer`](Self::process_buffer) would
+    /// otherwise silently truncate to row 0. (A *multi-channel* WaveNet is only valid
+    /// nested as a `condition_dsp`; that path is built via the internal
+    /// `new_conditioning`.)
     pub fn new(model: &NamModel) -> Result<Self, Error> {
+        Self::build(model, false)
+    }
+
+    /// Build a WaveNet for use as a nested `condition_dsp`, where a multi-channel
+    /// output is expected (its N rows become the parent arrays' conditioning). Unlike
+    /// [`Self::new`], this does not require mono output.
+    pub(crate) fn new_conditioning(model: &NamModel) -> Result<Self, Error> {
+        Self::build(model, true)
+    }
+
+    fn build(model: &NamModel, allow_multi_output: bool) -> Result<Self, Error> {
         let cfg = match &model.config {
             crate::model::ModelConfig::WaveNet(cfg) => cfg,
             crate::model::ModelConfig::Lstm(_) | crate::model::ModelConfig::Slimmable(_) => {
@@ -101,12 +119,28 @@ impl WaveNet {
 
         check_unsupported_features(cfg)?;
 
+        // A top-level model is mono-output. With no post-stack head, a last-array
+        // `head_size > 1` would have the mono `process_buffer` silently emit only row 0;
+        // reject it up front. (`new_conditioning` sets `allow_multi_output` for the
+        // nested condition_dsp path, where the N rows legitimately become the parent's
+        // conditioning.) When a post-stack head IS present its builder enforces
+        // `out_channels == 1`, which covers the head's output width for every path.
+        if !allow_multi_output && cfg.post_stack_head.is_none() {
+            let out_ch = cfg.layers.last().map_or(1, |la| la.head_size);
+            if out_ch != 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "top-level WaveNet must be mono-output, but produces {out_ch} channels \
+                     (a multi-channel WaveNet is only valid as a nested condition_dsp)"
+                )));
+            }
+        }
+
         // Build the nested condition_dsp eagerly (off the audio thread). It carries
         // its own weights in its nested `.nam` and consumes nothing from the parent
         // blob, so `expected_weight_count` / the `r.remaining() == 0` assert are
         // unaffected. A failing nested build fails fast here.
         let condition_dsp = match &cfg.condition_dsp {
-            Some(nested) => Some(Box::new(crate::Model::from_nam(nested)?)),
+            Some(nested) => Some(Box::new(crate::Model::from_nam_conditioning(nested)?)),
             None => None,
         };
 
@@ -123,7 +157,8 @@ impl WaveNet {
             for (i, la) in cfg.layers.iter().enumerate() {
                 if la.condition_size != n_out {
                     return Err(Error::UnsupportedFeature(format!(
-                        "condition_size of layer {i} ({}) != condition_dsp output channels ({n_out})",
+                        "condition_size of layer-array {i} ({}) != condition_dsp output \
+                         channels ({n_out})",
                         la.condition_size
                     )));
                 }
@@ -516,6 +551,15 @@ fn check_unsupported_features(cfg: &WaveNetConfig) -> Result<(), Error> {
     if cfg.in_channels != 1 {
         return Err(Error::UnsupportedFeature("in_channels != 1".into()));
     }
+    // A WaveNet with no layer-arrays would build, but every hot path treats the
+    // empty-array case as a passthrough and ignores a configured post-stack head /
+    // condition_dsp — i.e. silently wrong for a structurally-valid config. Reject it
+    // so the runtime can rely on at least one array.
+    if cfg.layers.is_empty() {
+        return Err(Error::UnsupportedFeature(
+            "WaveNet with no layer-arrays".into(),
+        ));
+    }
     for la in &cfg.layers {
         // The array builds one `Gating` from the uniform `gating_mode()`; a layer-array
         // mixing modes across its layers is still unsupported.
@@ -548,12 +592,6 @@ fn receptive_field(cfg: &WaveNetConfig, base: usize) -> usize {
     rf
 }
 
-/// Number of `f32`s `config` implies in the flat weight blob, including the final
-/// `head_scale`.
-///
-/// Uses checked arithmetic: an absurd or adversarial config whose dimensions overflow
-/// `usize` returns [`Error::ConfigTooLarge`] rather than panicking (debug) or wrapping
-/// to a wrong, small count (release).
 /// Number of weights one layer-array consumes from the flat blob, in exactly
 /// [`build_array`]'s `take` order. This is the **single arithmetic source** for the
 /// weight layout: [`expected_weight_count`] sums it across arrays for the up-front
@@ -573,8 +611,17 @@ fn array_weight_count(la: &LayerArrayConfig) -> Result<usize, Error> {
     let cond = la.condition_size;
 
     // Grouped Conv1d weight count: out*in*kernel/groups (compact). Caller adds bias.
+    // The block-diagonal layout needs `out` and `in` each divisible by `groups`
+    // (NAMCore's `% groups` precondition); reject a non-dividing config here as a
+    // clean `Err` rather than letting `Conv1d::new_grouped` assert-panic at build.
+    // (`groups >= 1` is already guaranteed by `normalize`, so no divide-by-zero.)
     let conv_w = |out: usize, in_ch: usize, k: usize, groups: usize| -> Result<usize, Error> {
-        Ok(mul(mul(out, in_ch)?, k)? / groups) // dims validated divisible at build
+        if out % groups != 0 || in_ch % groups != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "grouped conv: out ({out}) and in ({in_ch}) must both be divisible by groups ({groups})"
+            )));
+        }
+        Ok(mul(mul(out, in_ch)?, k)? / groups)
     };
     // FiLM: out_rows = (shift?2:1)*input_dim; weights out_rows*cond/groups + out_rows bias.
     let film = |f: &crate::model::FilmConfig, input_dim: usize| -> Result<usize, Error> {
@@ -667,6 +714,12 @@ fn post_stack_head_weight_count(
     Ok(total)
 }
 
+/// Number of `f32`s `config` implies in the flat weight blob, including the final
+/// `head_scale`.
+///
+/// Uses checked arithmetic: an absurd or adversarial config whose dimensions overflow
+/// `usize` returns [`Error::ConfigTooLarge`] rather than panicking (debug) or wrapping
+/// to a wrong, small count (release).
 fn expected_weight_count(cfg: &WaveNetConfig) -> Result<usize, Error> {
     let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::ConfigTooLarge);
     let mut total = 0usize;
@@ -1304,16 +1357,95 @@ mod tests {
                 sample_rate: None,
                 metadata: None,
             };
-            assert!(WaveNet::new(&mk_model(n)).is_ok(), "exact count n={n}");
+            // Build via `new_conditioning`: this pins the weight-count *consumption*
+            // invariant across shapes, including multi-output ones (head_size > 1 with
+            // no post-stack head), which the mono `new` rightly rejects. Both share the
+            // same build/weight-accounting path, so the count check is identical.
+            assert!(
+                WaveNet::new_conditioning(&mk_model(n)).is_ok(),
+                "exact count n={n}"
+            );
             assert!(matches!(
-                WaveNet::new(&mk_model(n - 1)),
+                WaveNet::new_conditioning(&mk_model(n - 1)),
                 Err(Error::WeightCountMismatch { .. })
             ));
             assert!(matches!(
-                WaveNet::new(&mk_model(n + 1)),
+                WaveNet::new_conditioning(&mk_model(n + 1)),
                 Err(Error::WeightCountMismatch { .. })
             ));
         }
+    }
+
+    /// Build a `NamModel` wrapping a `WaveNetConfig` with the given layers (no
+    /// post-stack head / condition_dsp), padded with as many zero weights as it claims
+    /// to need so the build reaches the validation under test rather than failing on a
+    /// weight-count mismatch first.
+    fn wavenet_model(layers: Vec<crate::model::LayerArrayConfig>) -> NamModel {
+        let cfg = WaveNetConfig {
+            layers,
+            post_stack_head: None,
+            head_scale: 1.0,
+            in_channels: 1,
+            condition_dsp: None,
+        };
+        let count = expected_weight_count(&cfg).unwrap_or(1);
+        NamModel {
+            version: "0".into(),
+            architecture: "WaveNet".into(),
+            config: crate::model::ModelConfig::WaveNet(cfg),
+            weights: vec![0.0; count],
+            sample_rate: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn empty_layers_is_rejected() {
+        // A WaveNet with no arrays would build but every hot path is a passthrough
+        // that ignores a post-stack head / condition_dsp — reject it at build time.
+        let model = wavenet_model(vec![]);
+        assert!(matches!(
+            WaveNet::new(&model),
+            Err(Error::UnsupportedFeature(f)) if f.contains("no layer-arrays")
+        ));
+    }
+
+    #[test]
+    fn top_level_multi_output_is_rejected_but_allowed_when_nested() {
+        // A single array with head_size 2 and no post-stack head emits 2 channels;
+        // the mono `process_buffer` would silently keep only row 0. The top-level
+        // `new` must reject it, while `new_conditioning` (the nested cdsp path) accepts
+        // it — there the 2 rows become the parent's conditioning.
+        let layers = vec![mk_layer(serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 2, "head_size": 2,
+            "kernel_size": 1, "dilations": [1], "activation": "Tanh",
+            "gated": false, "head_bias": false
+        }))];
+        let model = wavenet_model(layers);
+        assert!(matches!(
+            WaveNet::new(&model),
+            Err(Error::UnsupportedFeature(f)) if f.contains("mono-output")
+        ));
+        assert!(
+            WaveNet::new_conditioning(&model).is_ok(),
+            "multi-output is valid for a nested condition_dsp"
+        );
+    }
+
+    #[test]
+    fn non_divisible_groups_is_rejected_cleanly_not_panicking() {
+        // groups_input = 2 with channels = 3 (3 % 2 != 0): the block-diagonal layout
+        // can't be formed. This must surface as a clean `Err`, not a `Conv1d` panic.
+        let layers = vec![mk_layer(serde_json::json!({
+            "input_size": 1, "condition_size": 1, "channels": 3, "head_size": 1,
+            "kernel_size": 1, "dilations": [1], "activation": "Tanh",
+            "gated": false, "head_bias": false, "groups_input": 2
+        }))];
+        let model = wavenet_model(layers);
+        assert!(matches!(
+            WaveNet::new(&model),
+            Err(Error::UnsupportedFeature(f)) if f.contains("divisible by groups")
+        ));
     }
 
     #[test]

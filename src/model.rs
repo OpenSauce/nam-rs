@@ -490,7 +490,8 @@ impl RawWaveNetConfig {
 
 /// Configuration for one WaveNet layer-array, normalized so every per-layer
 /// quantity is a `Vec` of length `dilations.len()`. Built from the on-disk JSON by
-/// [`RawLayerArrayConfig::normalize`]; A1 files fill the A2 fields with defaults.
+/// the internal `RawLayerArrayConfig::normalize`; A1 files fill the A2 fields with
+/// defaults.
 #[derive(Debug, Clone)]
 pub struct LayerArrayConfig {
     /// Input channels into the array (1 for the first array).

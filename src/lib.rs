@@ -6,7 +6,8 @@
 //! a whole buffer at a time (WaveNet uses a cache-friendly block kernel), or one
 //! sample at a time — with no heap allocation on the audio (hot) path. It is a
 //! from-scratch Rust port of NAM's inference, written against the reference
-//! implementations below and validated for **bit-level parity** against them.
+//! implementations below and validated for **parity** against them (per-sample
+//! error within `1e-5`, the same tolerance NeuralAudio uses).
 //!
 //! Three model shapes are supported through the architecture-agnostic [`Model`] enum,
 //! which dispatches on the `.nam`'s declared architecture so you never branch on it
@@ -91,13 +92,11 @@
 //! - [NeuralAmpModelerCore] — the canonical C++ inference library (MIT).
 //! - [NeuralAudio] — Mike Oliphant's high-performance C++ NAM/RTNeural runtime,
 //!   designed to match NAM Core exactly (MIT). Primary porting reference.
-//! - [waveny] — a Go port of NAM (Apache-2.0). Used as a conceptual cross-check only.
 //!
 //! [Neural Amp Modeler]: https://www.neuralampmodeler.com/
 //! [neural-amp-modeler]: https://github.com/sdatkinson/neural-amp-modeler
 //! [NeuralAmpModelerCore]: https://github.com/sdatkinson/NeuralAmpModelerCore
 //! [NeuralAudio]: https://github.com/mikeoliphant/NeuralAudio
-//! [waveny]: https://github.com/nlpodyssey/waveny
 
 mod error;
 mod lstm;

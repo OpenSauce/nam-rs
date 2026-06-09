@@ -18,9 +18,16 @@
 //! (a single index write); each submodel keeps its own state, so switching mid-stream
 //! leaves a short warmup transient on the newly-selected submodel.
 //!
-//! Deferred A2 features (`condition_dsp`, FiLM, bottleneck, gated/multi-tap heads,
-//! per-layer activation lists, exotic activations) are **rejected** with
-//! [`Error::UnsupportedFeature`] rather than silently mis-run.
+//! The A2 feature set is supported: FiLM, gating, bottleneck, grouped convs, the
+//! per-array head (incl. multi-tap conv heads), the optional post-stack head
+//! (`activation → Conv1d` chain run after the arrays, with `head_scale` scaling its
+//! input), and a `condition_dsp` (a nested model whose output replaces the
+//! conditioning fed to every array — including a multi-channel-output one, whose N rows
+//! become the N-wide conditioning fed to every array). The remaining restrictions —
+//! multi-channel input (`in_channels != 1`), a post-stack head with `out_channels != 1`,
+//! mixed gating modes within one array, and exotic
+//! activations — are **rejected** with [`Error::UnsupportedFeature`] (or
+//! [`Error::UnsupportedActivation`]) rather than silently mis-run.
 //!
 //! **Sample rate.** A `.nam` is captured at a specific rate
 //! ([`NamModel::expected_sample_rate`], 48 kHz when the file does not say). `nam-rs`

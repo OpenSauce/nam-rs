@@ -54,6 +54,86 @@ fn conv_head_process_buffer_does_not_allocate() {
 }
 
 #[test]
+fn post_stack_head_process_buffer_does_not_allocate() {
+    // The post-stack head (an `activation -> Conv1d` chain after the arrays) runs on
+    // the hot path. Its convs and the `head_scale` scaling scratch are pre-allocated
+    // in `new`, so `process_buffer` must stay alloc-free — pin it here.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/post_stack_head.nam");
+    let json = std::fs::read_to_string(path).expect("post_stack_head.nam");
+    let model = NamModel::from_json_str(&json).expect("parse model");
+    let mut wn = WaveNet::new(&model).expect("build WaveNet");
+    let mut buffer = vec![0.0_f32; 2100]; // > MAX_BLOCK
+
+    wn.process_buffer(&mut buffer); // warm up off-guard
+    assert_no_alloc(|| {
+        wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
+fn condition_dsp_process_buffer_does_not_allocate() {
+    // The nested condition_dsp model runs on the hot path: its output replaces the
+    // array conditioning. The nested `Model::process_buffer` is RT-safe by contract,
+    // and the parent's feeding scratch (`cond_dsp_out`) is pre-allocated in `new`, so
+    // the whole `process_buffer` must stay alloc-free.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/condition_dsp_mono.nam");
+    let json = std::fs::read_to_string(path).expect("condition_dsp_mono.nam");
+    let model = NamModel::from_json_str(&json).expect("parse model");
+    let mut wn = WaveNet::new(&model).expect("build WaveNet");
+    let mut buffer = vec![0.0_f32; 2100]; // > MAX_BLOCK
+
+    wn.process_buffer(&mut buffer); // warm up off-guard (both nested + outer)
+    assert_no_alloc(|| {
+        wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
+fn multi_channel_condition_dsp_process_buffer_does_not_allocate() {
+    // A multi-channel-output condition_dsp (the `wavenet_condition_dsp.nam` example,
+    // `condition_size == 3`) runs the nested model via `process_block_multi`, writing
+    // its 3 output rows into the parent's pre-allocated `cond_dsp_out` (sized
+    // `cond_out_ch × MAX_BLOCK` in `new`). The nested `Model::process_block_multi` is
+    // RT-safe by contract, so the whole `process_buffer` must stay alloc-free.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wavenet_condition_dsp.nam");
+    let json = std::fs::read_to_string(path).expect("wavenet_condition_dsp.nam");
+    let model = NamModel::from_json_str(&json).expect("parse model");
+    let mut wn = WaveNet::new(&model).expect("multi-channel condition_dsp builds");
+    let mut buffer = vec![0.0_f32; 2100]; // > MAX_BLOCK
+
+    wn.process_buffer(&mut buffer); // warm up off-guard (both nested + outer)
+    assert_no_alloc(|| {
+        wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
+fn a2_synthetic_process_buffer_does_not_allocate() {
+    // The richest A2 path: FiLM + BLENDED gating + layer1x1_post_film. Every FiLM owns
+    // pre-allocated scratch, Gating is scratchless, and the Layer's `*_blk` buffers are
+    // sized in `new`, so the hot path must allocate nothing. Skips if the fixture is
+    // absent (e.g. the oracle could not be built in this environment).
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/a2_blended.nam");
+    if !path.exists() {
+        eprintln!("skip: a2_blended.nam absent");
+        return;
+    }
+    let json = std::fs::read_to_string(&path).unwrap();
+    let model = NamModel::from_json_str(&json).unwrap();
+    let mut wn = WaveNet::new(&model).expect("a2_blended builds");
+    let mut buffer = vec![0.1_f32; 2048];
+
+    wn.process_buffer(&mut buffer); // warm up off-guard
+    assert_no_alloc(|| {
+        wn.process_buffer(&mut buffer);
+    });
+}
+
+#[test]
 fn lstm_process_buffer_does_not_allocate() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference_lstm.nam");

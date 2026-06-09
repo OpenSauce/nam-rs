@@ -490,7 +490,8 @@ impl RawWaveNetConfig {
 
 /// Configuration for one WaveNet layer-array, normalized so every per-layer
 /// quantity is a `Vec` of length `dilations.len()`. Built from the on-disk JSON by
-/// [`RawLayerArrayConfig::normalize`]; A1 files fill the A2 fields with defaults.
+/// the internal `RawLayerArrayConfig::normalize`; A1 files fill the A2 fields with
+/// defaults.
 #[derive(Debug, Clone)]
 pub struct LayerArrayConfig {
     /// Input channels into the array (1 for the first array).
@@ -701,32 +702,73 @@ impl RawLayerArrayConfig {
         if self.dilations.contains(&0) {
             return Err("layer-array dilations entries must be >= 1".into());
         }
+        let bottleneck = self.bottleneck.unwrap_or(self.channels);
+        if bottleneck == 0 {
+            return Err("layer-array bottleneck must be >= 1".into());
+        }
+
+        let groups_input = self.groups_input.unwrap_or(1);
+        let groups_input_mixin = self.groups_input_mixin.unwrap_or(1);
+        let layer1x1 = Layer1x1Config::from_json(self.layer1x1.as_ref());
+        let head1x1 = Head1x1Config::from_json(self.head1x1.as_ref());
+        let films = [
+            FilmConfig::from_json(self.conv_pre_film.as_ref()),
+            FilmConfig::from_json(self.conv_post_film.as_ref()),
+            FilmConfig::from_json(self.input_mixin_pre_film.as_ref()),
+            FilmConfig::from_json(self.input_mixin_post_film.as_ref()),
+            FilmConfig::from_json(self.activation_pre_film.as_ref()),
+            FilmConfig::from_json(self.activation_post_film.as_ref()),
+            FilmConfig::from_json(self.layer1x1_post_film.as_ref()),
+            FilmConfig::from_json(self.head1x1_post_film.as_ref()),
+        ];
+        // Grouped-conv group counts must be >= 1: a zero divides by zero when the
+        // runtime lays out the block-diagonal weight tensor. (Divisibility of the
+        // channel dims by the group count is checked in `array_weight_count`, which
+        // knows every dim.) Reject here as a clean `Err`, not a panic — mirroring
+        // NAMCore's `% groups` precondition.
+        let group_counts = [
+            ("groups_input", groups_input),
+            ("groups_input_mixin", groups_input_mixin),
+            ("layer1x1.groups", layer1x1.groups),
+            ("head1x1.groups", head1x1.groups),
+            (
+                "film.groups",
+                films.iter().map(|f| f.groups).min().unwrap_or(1),
+            ),
+        ];
+        for (name, g) in group_counts {
+            if g == 0 {
+                return Err(format!("layer-array {name} must be >= 1"));
+            }
+        }
+        let [conv_pre_film, conv_post_film, input_mixin_pre_film, input_mixin_post_film, activation_pre_film, activation_post_film, layer1x1_post_film, head1x1_post_film] =
+            films;
 
         Ok(LayerArrayConfig {
             input_size: self.input_size,
             condition_size: self.condition_size,
             channels: self.channels,
-            bottleneck: self.bottleneck.unwrap_or(self.channels),
+            bottleneck,
             dilations: self.dilations,
             kernel_sizes,
             activations,
             gating_modes,
             secondary_activations,
-            groups_input: self.groups_input.unwrap_or(1),
-            groups_input_mixin: self.groups_input_mixin.unwrap_or(1),
+            groups_input,
+            groups_input_mixin,
             head_size,
             head_kernel_size,
             head_bias,
-            layer1x1: Layer1x1Config::from_json(self.layer1x1.as_ref()),
-            head1x1: Head1x1Config::from_json(self.head1x1.as_ref()),
-            conv_pre_film: FilmConfig::from_json(self.conv_pre_film.as_ref()),
-            conv_post_film: FilmConfig::from_json(self.conv_post_film.as_ref()),
-            input_mixin_pre_film: FilmConfig::from_json(self.input_mixin_pre_film.as_ref()),
-            input_mixin_post_film: FilmConfig::from_json(self.input_mixin_post_film.as_ref()),
-            activation_pre_film: FilmConfig::from_json(self.activation_pre_film.as_ref()),
-            activation_post_film: FilmConfig::from_json(self.activation_post_film.as_ref()),
-            layer1x1_post_film: FilmConfig::from_json(self.layer1x1_post_film.as_ref()),
-            head1x1_post_film: FilmConfig::from_json(self.head1x1_post_film.as_ref()),
+            layer1x1,
+            head1x1,
+            conv_pre_film,
+            conv_post_film,
+            input_mixin_pre_film,
+            input_mixin_post_film,
+            activation_pre_film,
+            activation_post_film,
+            layer1x1_post_film,
+            head1x1_post_film,
         })
     }
 }
@@ -931,6 +973,28 @@ mod layer_array_normalize_tests {
     fn zero_dilation_is_an_error() {
         let raw = raw_layer_array(|v| v["dilations"] = serde_json::json!([0]));
         assert!(raw.normalize().is_err());
+    }
+
+    #[test]
+    fn zero_bottleneck_is_an_error() {
+        // An explicit `bottleneck == 0` yields `mid == 0` and degenerate conv buffers;
+        // reject it like the other zero dims (it is otherwise unguarded since it
+        // defaults to `channels` when absent).
+        let raw = raw_layer_array(|v| v["bottleneck"] = serde_json::json!(0));
+        assert!(raw.normalize().is_err());
+    }
+
+    #[test]
+    fn zero_groups_is_an_error() {
+        // `groups == 0` would divide-by-zero in the block-diagonal weight layout.
+        for field in ["groups_input", "groups_input_mixin"] {
+            let raw = raw_layer_array(|v| v[field] = serde_json::json!(0));
+            assert!(raw.normalize().is_err(), "{field} == 0 must error");
+        }
+        let raw = raw_layer_array(|v| {
+            v["layer1x1"] = serde_json::json!({ "active": true, "groups": 0 });
+        });
+        assert!(raw.normalize().is_err(), "layer1x1.groups == 0 must error");
     }
 
     #[test]

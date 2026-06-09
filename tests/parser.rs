@@ -17,18 +17,35 @@ fn a2_max_features_are_rejected_not_run() {
     // wavenet_a2_max.nam carries bottleneck/FiLM/groups/dict-activation etc.
     // It must error cleanly (UnsupportedFeature or WeightCountMismatch), never panic.
     match build_fixture("wavenet_a2_max.nam") {
-        Err(Error::UnsupportedFeature(_)) | Err(Error::WeightCountMismatch { .. }) => {}
+        Err(Error::UnsupportedFeature(_))
+        | Err(Error::WeightCountMismatch { .. })
+        | Err(Error::UnsupportedActivation(_)) => {}
         other => panic!("expected a clean rejection, got {other:?}"),
     }
 }
 
 #[test]
-fn condition_dsp_is_rejected_not_run() {
-    // 147 == 147 reconciles, so the weight-count check passes; the guard must catch it.
-    match build_fixture("wavenet_condition_dsp.nam") {
-        Err(Error::UnsupportedFeature(msg)) => assert!(msg.contains("condition_dsp"), "{msg}"),
-        other => panic!("expected UnsupportedFeature(condition_dsp), got {other:?}"),
-    }
+fn mono_condition_dsp_is_supported_not_blanket_guarded() {
+    // condition_dsp is no longer a blanket-guarded feature. A *mono* condition_dsp
+    // (`condition_size == 1`) builds and runs — full forward parity is covered by the
+    // parity suite's `condition_dsp_matches_namcore_oracle`. It must build with no
+    // error at all (not merely avoid a "condition_dsp"-worded one).
+    let mut m = build_fixture("condition_dsp_mono.nam").expect("mono condition_dsp must build");
+    let mut buf = vec![0.1_f32; 256];
+    m.process_buffer(&mut buf); // must not panic
+}
+
+#[test]
+fn multi_channel_condition_dsp_builds_and_runs() {
+    // A multi-channel-output condition_dsp is now supported: the NAMCore
+    // `wavenet_condition_dsp.nam` example feeds arrays with `condition_size == 3`, fed by
+    // a nested WaveNet emitting 3 output channels. It must BUILD and RUN (the N rows of
+    // the nested model become the N-wide conditioning) — never reject, never panic.
+    // Steady-state parity vs the oracle is covered by the parity suite.
+    let mut m =
+        build_fixture("wavenet_condition_dsp.nam").expect("multi-channel condition_dsp must build");
+    let mut buf = vec![0.1_f32; 256];
+    m.process_buffer(&mut buf); // must not panic
 }
 
 #[test]

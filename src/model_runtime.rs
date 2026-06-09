@@ -14,8 +14,10 @@ use crate::wavenet::WaveNet;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Model {
-    /// A WaveNet model.
-    WaveNet(WaveNet),
+    /// A WaveNet model. Boxed so the enum's variants are similarly sized (a `WaveNet`
+    /// carries many pre-allocated scratch buffers); the indirection is one pointer
+    /// hop off the build path, not the per-sample hot loop.
+    WaveNet(Box<WaveNet>),
     /// An LSTM model.
     Lstm(Lstm),
     /// A width-selectable container of submodels.
@@ -74,7 +76,7 @@ impl Model {
     /// Build the runtime matching `model.architecture`. All allocation happens here.
     pub fn from_nam(model: &NamModel) -> Result<Self, Error> {
         match &model.config {
-            ModelConfig::WaveNet(_) => Ok(Model::WaveNet(WaveNet::new(model)?)),
+            ModelConfig::WaveNet(_) => Ok(Model::WaveNet(Box::new(WaveNet::new(model)?))),
             ModelConfig::Lstm(_) => Ok(Model::Lstm(Lstm::new(model)?)),
             ModelConfig::Slimmable(cfg) => {
                 if cfg.submodels.is_empty() {
@@ -93,6 +95,19 @@ impl Model {
                     active,
                 }))
             }
+        }
+    }
+
+    /// Build a model for use as a nested `condition_dsp`, where a WaveNet may emit
+    /// more than one output channel (its N rows feed the parent arrays' conditioning).
+    /// Only WaveNet has a multi-channel output path; LSTM/Slimmable are always mono,
+    /// so they fall back to [`Model::from_nam`].
+    pub(crate) fn from_nam_conditioning(model: &NamModel) -> Result<Self, Error> {
+        match &model.config {
+            ModelConfig::WaveNet(_) => {
+                Ok(Model::WaveNet(Box::new(WaveNet::new_conditioning(model)?)))
+            }
+            _ => Model::from_nam(model),
         }
     }
 
@@ -137,6 +152,32 @@ impl Model {
             Model::WaveNet(w) => w.receptive_field(),
             Model::Lstm(_) => 0,
             Model::Slimmable(s) => s.submodels[s.active].receptive_field(),
+        }
+    }
+
+    /// Number of output channels this model emits, matching NAM Core. WaveNet defers to
+    /// its post-stack head / last layer-array; LSTM is always mono. Used when this model
+    /// is a nested `condition_dsp` whose rows become the parent's N-wide conditioning.
+    pub(crate) fn num_output_channels(&self) -> usize {
+        match self {
+            Model::WaveNet(w) => w.num_output_channels(),
+            Model::Lstm(_) => 1,
+            Model::Slimmable(s) => s.submodels[s.active].num_output_channels(),
+        }
+    }
+
+    /// Run a mono `input[..n]` chunk, writing `num_output_channels() × n` planar
+    /// `[ch][t]` into `out`. Allocation-free; used to produce a nested `condition_dsp`'s
+    /// multi-channel conditioning for the parent WaveNet.
+    pub(crate) fn process_block_multi(&mut self, input: &[f32], out: &mut [f32], n: usize) {
+        match self {
+            Model::WaveNet(w) => w.process_block_multi(input, out, n),
+            Model::Lstm(l) => {
+                // LSTM is always mono-out: copy the input into `out` and run in place.
+                out[..n].copy_from_slice(&input[..n]);
+                l.process_buffer(&mut out[..n]);
+            }
+            Model::Slimmable(s) => s.submodels[s.active].process_block_multi(input, out, n),
         }
     }
 

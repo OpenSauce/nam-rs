@@ -2,6 +2,8 @@
 
 [![crates.io](https://img.shields.io/crates/v/nam-rs.svg)](https://crates.io/crates/nam-rs)
 [![docs.rs](https://docs.rs/nam-rs/badge.svg)](https://docs.rs/nam-rs)
+[![CI](https://github.com/OpenSauce/nam-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/OpenSauce/nam-rs/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/nam-rs.svg)](LICENSE)
 
 Pure-Rust, real-time-safe inference for [Neural Amp Modeler](https://www.neuralampmodeler.com/) (NAM) `.nam` models.
 
@@ -10,19 +12,18 @@ buffer at a time (WaveNet uses a cache-friendly block kernel) or one sample at a
 with **no heap allocation on the audio thread**, suitable for use inside a JACK
 callback, a VST3/CLAP `process()`, or any real-time audio graph.
 
-> Status: **WaveNet, LSTM, and SlimmableContainer (NAM "A2") inference are implemented
-> and tested** — parser, forward pass, parity, and RT-safety harnesses all green. Build
-> any `.nam` with the architecture-agnostic `Model::from_nam`, which dispatches on the
-> model's architecture.
+**WaveNet**, **LSTM**, and **SlimmableContainer** (NAM "A2") models all load through
+one entry point, `Model::from_nam`, which dispatches on the file's declared
+architecture.
 
 ## Design contract
 
-1. **Parity with the reference.** Output must equal the canonical Python/C++ NAM
-   implementations within float tolerance for the same model and input. Enforced by
-   `tests/parity.rs` against fixtures generated from Python NAM.
-2. **Real-time safety.** The runtime's `process_buffer` (for both WaveNet and LSTM,
-   reached via `Model`) performs zero heap allocation, locks, or syscalls; all scratch
-   buffers are pre-allocated at construction. Enforced by `tests/rt_safety.rs` via
+1. **Parity with the reference.** Output must match the canonical Python/C++ NAM
+   implementations within `1e-5` per sample for the same model and input. Enforced by
+   `tests/parity.rs` against reference-generated fixtures.
+2. **Real-time safety.** `process_buffer` (every architecture, reached via `Model`)
+   performs zero heap allocation, locks, or syscalls; all scratch buffers are
+   pre-allocated at construction. Enforced by `tests/rt_safety.rs` via
    `assert_no_alloc`.
 
 ## Install
@@ -30,6 +31,8 @@ callback, a VST3/CLAP `process()`, or any real-time audio graph.
 ```bash
 cargo add nam-rs
 ```
+
+MSRV: Rust 1.74. No C/C++ toolchain or native dependencies needed.
 
 ## Usage
 
@@ -47,7 +50,15 @@ let mut audio_buffer = vec![0.0_f32; 512]; // your host's block, filled with inp
 amp.process_buffer(&mut audio_buffer);
 ```
 
-For WaveNet models, the first `WaveNet::receptive_field()` output samples are a startup
+To smoke-test a model file without writing any code:
+
+```bash
+cargo run --release --example run_model -- path/to/model.nam
+```
+
+(`examples/streaming.rs` shows the block-wise hot-path loop in full.)
+
+For WaveNet models, the first `Model::receptive_field()` output samples are a startup
 transient (the dilated stack filling against zero-history) — the model's inherent
 latency, the same convention NAM Core / NeuralAudio use. LSTM models have no such
 warmup. Call `Model::reset` to return to silence.
@@ -68,20 +79,28 @@ gain-staging.
 
 - **WaveNet** (A1 and A2 single models) — dilated-conv forward pass, parity-tested.
 - **LSTM** — recurrent forward pass, parity-tested.
-- **SlimmableContainer** (NAM "A2") — a width-selectable set of complete standalone
-  submodels (any mix of WaveNet/LSTM). The container holds no weights; it delegates to
-  the active submodel. Select the width with `model.as_slimmable_mut()` →
-  `set_slim_size(value)` (NAM Core semantics: the first submodel whose `max_value`
-  exceeds `value`, else the full model) or `select(index)`. Switching is real-time-safe.
+- **SlimmableContainer** (NAM "A2") — a set of complete standalone submodels (any mix
+  of WaveNet/LSTM) with a runtime width dial as a CPU/quality trade-off. Select via
+  `as_slimmable_mut()` → `set_slim_size` or `select`; switching is real-time-safe.
+  See the [crate docs](https://docs.rs/nam-rs) for the selection semantics.
 
-The A2 feature set is supported: FiLM, gating, bottleneck, grouped convs, multi-tap conv
-heads, the optional post-stack head (an `activation → Conv1d` chain after the arrays, with
-`head_scale` scaling its input), and a `condition_dsp` (a nested model whose output
-replaces the conditioning fed to every array, including a multi-channel-output one whose N
-rows become the N-wide conditioning). The remaining restrictions — multi-channel
-input, a post-stack head with `out_channels != 1`, mixed gating modes within
-one array, and exotic activations — are rejected with a clear `Error::UnsupportedFeature`
-(or `Error::UnsupportedActivation`) rather than silently mis-run.
+The A2 feature set is covered: FiLM, gating, bottleneck, grouped convs, multi-tap conv
+heads, the optional post-stack head, and `condition_dsp` (a nested model that generates
+the conditioning signal, multi-channel included). A few restrictions remain —
+multi-channel *input*, a post-stack head with more than one output channel, mixed
+gating modes within one array, and unrecognized activations — and these are rejected
+with a descriptive error at load time rather than silently mis-run.
+
+## Performance
+
+Rough numbers from the included Criterion bench (`cargo bench`), standard-size
+fixture models, one x86-64 desktop core, release + LTO:
+
+- Standard WaveNet capture: ≈1.9 µs/sample via `process_buffer` (≈11× real-time at
+  48 kHz). The block path is ~3.5× faster than per-sample, so prefer whole blocks.
+- Standard LSTM capture: ≈1.2 µs/sample (≈17× real-time).
+
+Numbers vary with CPU and model size — run `cargo bench` on your own target.
 
 ## Development
 
@@ -105,7 +124,6 @@ texts are reproduced in [`NOTICE`](NOTICE).
 | [neural-amp-modeler](https://github.com/sdatkinson/neural-amp-modeler) | Reference trainer + `.nam` exporter (source of truth for weight/config layout) | MIT |
 | [NeuralAmpModelerCore](https://github.com/sdatkinson/NeuralAmpModelerCore) | Canonical C++ inference library | MIT |
 | [NeuralAudio](https://github.com/mikeoliphant/NeuralAudio) | High-performance C++ NAM runtime; primary porting reference | MIT |
-| [waveny](https://github.com/nlpodyssey/waveny) | Go port; conceptual cross-check only | Apache-2.0 |
 
 `.nam` model files are licensed separately by whoever captured them; `nam-rs` ships
 no model files.

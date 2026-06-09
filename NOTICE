@@ -44,6 +44,16 @@ These are real exported WaveNet models redistributed from NeuralAmpModelerCore
     tests/fixtures/reference_standard.nam
         from NeuralAmpModelerCore/example_models/wavenet_a1_standard.nam
         (v0.5.0, 13,802 weights — standard 16+8-channel architecture)
+    tests/fixtures/slimmable_wavenet.nam
+        from NeuralAmpModelerCore example_models (v0.5.2 — standalone A2 WaveNet)
+    tests/fixtures/slimmable_container.nam
+        from NeuralAmpModelerCore example_models (v0.5.2 — A2 SlimmableContainer)
+    tests/fixtures/wavenet_a2_max.nam
+        from NeuralAmpModelerCore example_models (v0.5.2 — synthetic A2
+        feature-coverage model; used as a clean-rejection negative test)
+    tests/fixtures/wavenet_condition_dsp.nam
+        from NeuralAmpModelerCore example_models (v0.5.2 — A2 condition_dsp model,
+        condition_size == 3)
 
 Redistributed under the MIT terms above. No third-party (GPL / TONE3000-T3K)
 model files are committed to this repository.

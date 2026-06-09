@@ -20,16 +20,22 @@ pub enum Error {
     UnsupportedActivation(String),
 
     /// A `.nam` config uses a feature this crate does not yet implement (e.g.
-    /// `condition_dsp`, FiLM, bottleneck, gated/multi-tap heads, a per-layer
-    /// activation list, or an empty container). Rejected explicitly rather than
-    /// silently mis-run — see the validation model in the crate docs.
+    /// multi-channel input, a post-stack head with more than one output channel,
+    /// mixed gating modes within one layer array, or an empty container).
+    /// Rejected explicitly rather than silently mis-run — see the crate-level
+    /// docs for the full list of supported and rejected features.
     #[error("unsupported model feature: {0}")]
     UnsupportedFeature(String),
 
     /// The flat `weights` array did not contain the number of values the
     /// `config` implies (corrupt file, or a config/weights mismatch).
     #[error("weight count mismatch: config implies {expected} weights, file has {found}")]
-    WeightCountMismatch { expected: usize, found: usize },
+    WeightCountMismatch {
+        /// Number of weights the `config` implies the file must contain.
+        expected: usize,
+        /// Number of weights actually present in the file's flat `weights` array.
+        found: usize,
+    },
 
     /// The `config`'s declared dimensions are so large that the implied weight
     /// count overflows `usize`, so the model cannot be built. Indicates a corrupt

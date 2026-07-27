@@ -257,6 +257,11 @@ fn nonstandard_gear_and_tone_types_still_parse() {
 
 /// Real files write explicit JSON `null` for absent calibration levels, and write
 /// integers where the schema says float. Both must parse as cleanly as an absent key.
+///
+/// Note this passes with or without the `lenient` deserializer — plain
+/// `#[serde(default)] Option<T>` already handles nulls and integer-valued floats. It
+/// is a regression test for that baseline, *not* coverage of `lenient`; the shapes
+/// `lenient` actually exists for are covered by the two tests below.
 #[test]
 fn null_and_integer_metadata_values_parse() {
     let json = WITH_METADATA.replace(
@@ -290,6 +295,32 @@ fn one_malformed_field_does_not_discard_the_others() {
     assert!((md.loudness.expect("loudness") - -20.02).abs() < 1e-4);
     assert_eq!(md.gear_type.as_deref(), Some("amp"));
     assert_eq!(md.name.as_deref(), Some("Test"));
+}
+
+/// The other shapes `lenient` exists for: a scalar field holding the wrong JSON type.
+/// Without per-field leniency either of these would fail the whole `from_value` call
+/// and, via `metadata_typed`'s fallback to `Default`, silently erase the calibration
+/// numbers the DSP path depends on.
+#[test]
+fn wrong_typed_scalar_fields_cost_only_themselves() {
+    // A number where a string belongs, and a string where a number belongs.
+    let json = WITH_METADATA
+        .replace("\"gear_type\": \"amp\"", "\"gear_type\": 5")
+        .replace("\"loudness\": -20.02", "\"loudness\": \"quite loud\"");
+    let md = NamModel::from_json_str(&json)
+        .expect("parse")
+        .metadata_typed();
+
+    assert_eq!(md.gear_type, None, "the malformed field itself yields None");
+    assert_eq!(md.loudness, None, "the malformed field itself yields None");
+    // The neighbours are untouched — including the other calibration levels.
+    assert!((md.input_level_dbu.expect("input level") - 18.3).abs() < 1e-4);
+    assert!((md.output_level_dbu.expect("output level") - 12.3).abs() < 1e-4);
+    assert_eq!(md.name.as_deref(), Some("Test"));
+    assert_eq!(md.tone_type.as_deref(), Some("overdrive"));
+    assert!(md.date.is_some());
+    // A `gear_type` that failed to parse is unknown, never a guess.
+    assert_eq!(md.includes_cab(), None);
 }
 
 #[test]
@@ -335,6 +366,21 @@ fn includes_cab_classifies_known_gear_types() {
     assert_eq!(with_gear("\"experimental\""), None);
     assert_eq!(with_gear("\"something-new\""), None);
     assert_eq!(with_gear("null"), None);
+
+    // `cab` is matched as a whole `_`-separated token, never a substring: these contain
+    // "cab" while meaning something else entirely. A false `Some(true)` is the
+    // dangerous direction — it tells the caller to drop an IR the model needs.
+    for gear in ["\"cabless\"", "\"cable\"", "\"cabaret\""] {
+        assert_eq!(with_gear(gear), None, "{gear} must not read as a cab");
+    }
+    // ...but an unseen spelling that does name a cab component still classifies,
+    // without needing a new match arm.
+    assert_eq!(with_gear("\"pedal_amp_cab\""), Some(true));
+    // Documented limit of the token rule: a *negated* spelling still reads as
+    // cab-inclusive, since `cab` is one of its tokens. No vendor forms values this
+    // way, and sniffing for negation in free text is the guesswork this function
+    // exists to avoid — so the behaviour is pinned here rather than defended against.
+    assert_eq!(with_gear("\"amp_no_cab\""), Some(true));
     assert_eq!(
         NamModel::from_json_str(MINIMAL_WAVENET)
             .expect("parse")
@@ -583,16 +629,37 @@ fn real_captures_metadata_matches_the_typed_schema() {
                 );
             }
         }
-        // ...and the two nested blocks as themselves.
+        // ...and the two nested blocks as themselves. Check every date component: a
+        // month/day transposition in the struct is exactly the slip that would survive
+        // a spot-check of year alone.
         if let Some(want) = raw.get("date").and_then(|v| v.as_object()) {
             let date = md
                 .date
                 .unwrap_or_else(|| panic!("{name}: metadata.date lost"));
-            assert_eq!(i64::from(date.year), want["year"].as_i64().unwrap());
-            assert_eq!(u64::from(date.second), want["second"].as_u64().unwrap());
+            let got = [
+                i64::from(date.year),
+                i64::from(date.month),
+                i64::from(date.day),
+                i64::from(date.hour),
+                i64::from(date.minute),
+                i64::from(date.second),
+            ];
+            for (component, got) in ["year", "month", "day", "hour", "minute", "second"]
+                .into_iter()
+                .zip(got)
+            {
+                assert_eq!(
+                    got,
+                    want[component].as_i64().unwrap(),
+                    "{name}: metadata.date.{component}"
+                );
+            }
         }
+        // `Option<Value>` maps an explicit JSON `null` to `None`, so compare against
+        // "present and non-null" rather than mere key presence.
+        let training_in_file = raw.get("training").is_some_and(|v| !v.is_null());
         assert_eq!(
-            raw.contains_key("training"),
+            training_in_file,
             md.training.is_some(),
             "{name}: metadata.training lost"
         );

@@ -91,7 +91,7 @@ pass. Every field is `Option`, since any of them may be absent.
 | `tone_type` | `Option<String>` | `clean`, `overdrive`, `crunch`, `hi_gain`, `fuzz`, … |
 | `trainer` | `Option<String>` | Which trainer produced the file, e.g. `"TONE3000"` |
 | `date` | `Option<Date>` | Export timestamp (`year`…`second`; ordered chronologically) |
-| `loudness` | `Option<f32>` | Output loudness in LUFS |
+| `loudness` | `Option<f32>` | How loud the model is against NAM's standardized input, in dBFS RMS — not LUFS, and not perceptual |
 | `input_level_dbu`, `output_level_dbu` | `Option<f32>` | Analog dBu at 0 dBFS — the calibration numbers for gain-staging |
 | `gain` | `Option<f32>` | The trainer's `0.0..=1.0` estimate of how much gain/compression the model has |
 | `training` | `Option<serde_json::Value>` | The trainer's raw training record, left untyped |
@@ -111,14 +111,14 @@ values in neither (`"vintage"`, `"T3K-Null"`). An enum would reject those files.
 For the one question that actually changes a signal chain — is a speaker cab already
 baked into this capture, so that adding an IR would be a second one? —
 `Metadata::includes_cab()` (also on `NamModel`) classifies `gear_type` across both
-vocabularies, ignoring case, whitespace, and `-` vs `_`:
+vocabularies, ignoring case, surrounding whitespace, and `-` vs `_`:
 
 ```rust
 let model = NamModel::from_file("model.nam")?;
 
 match model.includes_cab() {
-    Some(true) => println!("cab is baked in — a second one would be an IR too many"),
-    Some(false) => println!("no cab in this capture"),
+    Some(true) => println!("file says the cab is baked in — a second one would be an IR too many"),
+    Some(false) => println!("file claims no cab — but `amp` is also the do-nothing default"),
     None => println!("unknown — don't touch the signal chain"),
 }
 ```
@@ -126,7 +126,10 @@ match model.includes_cab() {
 It returns `None` rather than guessing at a value it doesn't recognize, and it only
 ever reports what the file claims: `gear_type` is author-supplied and captures do
 mislabel themselves, so treat the answer as a default to offer the user, not a fact to
-reroute audio on silently.
+reroute audio on silently. The two answers are not equally strong — `Some(true)`
+required someone to actively pick a cab-ish value, while `Some(false)` is mostly
+`"amp"`, which is what you get by leaving the field alone. One of the three real
+captures in this repo's test corpus is a full rig tagged `gear_type: "amp"`.
 
 ## Supported architectures
 

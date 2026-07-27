@@ -188,10 +188,15 @@ impl<'de> Deserialize<'de> for NamModel {
 ///
 /// [`Metadata`] is parsed all-or-nothing by `serde_json::from_value`, so one field
 /// with an unexpected shape would otherwise discard *every* other field along with
-/// it (see [`NamModel::metadata_typed`], which falls back to `Default`). Files in
-/// the wild do carry surprises — explicit `null`s, integers where the schema says
-/// float, trainer-specific spellings — so each field absorbs its own error and
-/// yields `None` instead.
+/// it (see [`NamModel::metadata_typed`], which falls back to `Default`). Each field
+/// therefore absorbs its own error and yields `None` instead.
+///
+/// This covers a value of the wrong *shape* — `"date": "last Tuesday"`, a numeric
+/// `"gear_type"` — which is the case that would otherwise cost us the calibration
+/// numbers the DSP path depends on. It is not needed for an explicit `null` or for
+/// an integer where the schema says float (real files write `"input_level_dbu": 15`):
+/// plain `#[serde(default)] Option<T>` already handles both, and did before this
+/// existed.
 fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -239,10 +244,16 @@ pub struct Date {
 /// For comparison, NAM's C++ `NeuralAmpModelerCore` types only the three
 /// calibration numbers (`loudness`, `input_level_dbu`, `output_level_dbu`) and
 /// leaves the rest as an untyped JSON blob for each host to re-derive.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[non_exhaustive]
 pub struct Metadata {
-    /// Perceived loudness of the model's output, in LUFS (NAM's `loudness`).
+    /// How loud the model is against NAM's standardized input, in dBFS (NAM's
+    /// `loudness`).
+    ///
+    /// This is plain RMS — the trainer computes `20·log10(sqrt(mean(y²)))` — not a
+    /// perceptual measure. It is **not** LUFS: no K-weighting, no gating. Two models
+    /// with the same `loudness` but different spectra will not match perceptually, so
+    /// don't feed this number to a loudness target that expects ITU-R BS.1770.
     #[serde(default, deserialize_with = "lenient")]
     pub loudness: Option<f32>,
     /// Analog level (dBu) corresponding to 0 dBFS at the model input.
@@ -312,10 +323,20 @@ impl Metadata {
     /// of your chain, since a `pedal` or `outboard` capture wants an amp next, not a
     /// cab.
     ///
-    /// Returns `None` when `gear_type` is absent or is a value we can't confidently
-    /// place — callers get "unknown", never a guess. Matching ignores case,
-    /// surrounding whitespace, and `-` vs `_`, so TONE3000's `"full-rig"` and a
-    /// hypothetical `"full_rig"` agree.
+    /// Recognized are the values NAM's trainer and TONE3000 actually write, plus any
+    /// value naming `cab` as one of its `_`-separated components (so a future
+    /// `"pedal_amp_cab"` classifies without a code change). `cab` is matched as a
+    /// whole token, never a substring, so `"cable"` and `"cabless"` don't read as
+    /// cab-inclusive. Matching ignores case, surrounding whitespace, and `-` vs `_`,
+    /// so TONE3000's `"full-rig"` and a hypothetical `"full_rig"` agree.
+    ///
+    /// Anything else returns `None` — callers get "unknown" rather than a guess.
+    ///
+    /// The token rule has a known limit: a *negated* spelling like `"amp_no_cab"`
+    /// still reads as cab-inclusive, since `cab` is one of its tokens. Neither
+    /// vocabulary forms values that way, and detecting negation in free text is
+    /// guesswork of the kind this function exists to avoid — so it is documented
+    /// rather than defended against.
     ///
     /// The answer is only ever as good as the file: `gear_type` is author-supplied
     /// and real captures do mislabel themselves (a file named `...-FullRig.nam`
@@ -353,8 +374,11 @@ impl Metadata {
             // directly — a cab by definition.
             "full_rig" | "ir" => Some(true),
             // `amp_cab`/`amp-cab`, `cab`, `amp_pedal_cab`, and any future spelling
-            // that names a cab.
-            other if other.contains("cab") => Some(true),
+            // that names a cab as one of its components. Match `cab` as a whole
+            // `_`-separated token, never a substring: `"cable"` and `"cabless"` both
+            // contain "cab" while meaning something else entirely, and a false
+            // `Some(true)` tells the caller to drop an IR the model needs.
+            other if other.split('_').any(|token| token == "cab") => Some(true),
             // Unknown: NAM's undocumented `studio` (see above) and TONE3000's
             // `experimental`, which promises nothing about the signal chain.
             _ => None,
@@ -392,9 +416,13 @@ impl NamModel {
         self.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE)
     }
 
-    /// The typed [`Metadata`] (loudness + calibration levels), parsed from the raw
-    /// `metadata` block in one shot. Returns defaults (all `None`) when there is no
-    /// metadata block or it lacks these keys; unknown keys are ignored.
+    /// The file's descriptive [`Metadata`] — name, gear, tone, trainer, date, loudness
+    /// and calibration levels — parsed from the raw `metadata` block in one shot.
+    ///
+    /// Returns defaults (every field `None`) when the file has no metadata block.
+    /// Fields the block omits are `None`; keys we don't type are ignored, and remain
+    /// reachable on [`Self::metadata`]. Parsing is per-field lenient, so a single
+    /// malformed entry costs only itself.
     ///
     /// Prefer this over the single-field accessors ([`Self::loudness`], etc.) when you
     /// want several fields: each single-field accessor re-clones and re-parses the raw
@@ -408,7 +436,8 @@ impl NamModel {
         }
     }
 
-    /// Output loudness in LUFS, if the file records it.
+    /// Output loudness in dBFS RMS, if the file records it — see
+    /// [`Metadata::loudness`], and note it is not LUFS.
     #[must_use]
     pub fn loudness(&self) -> Option<f32> {
         self.metadata_typed().loudness

@@ -184,19 +184,206 @@ impl<'de> Deserialize<'de> for NamModel {
     }
 }
 
-/// Loudness/level-calibration fields NAM may write into `metadata`. All optional;
-/// older or minimal files omit them. Unknown metadata keys are ignored.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Deserialize a field without letting its failure sink the whole struct.
+///
+/// [`Metadata`] is parsed all-or-nothing by `serde_json::from_value`, so one field
+/// with an unexpected shape would otherwise discard *every* other field along with
+/// it (see [`NamModel::metadata_typed`], which falls back to `Default`). Each field
+/// therefore absorbs its own error and yields `None` instead.
+///
+/// This covers a value of the wrong *shape* — `"date": "last Tuesday"`, a numeric
+/// `"gear_type"` — which is the case that would otherwise cost us the calibration
+/// numbers the DSP path depends on. It is not needed for an explicit `null` or for
+/// an integer where the schema says float (real files write `"input_level_dbu": 15`):
+/// plain `#[serde(default)] Option<T>` already handles both, and did before this
+/// existed.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: for<'a> Deserialize<'a>,
+{
+    // Buffer into a `Value` first: that always succeeds for well-formed JSON, and
+    // lets the fallible typed conversion happen where we can swallow the error.
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+/// The calendar timestamp NAM stamps into `metadata.date` when the model is
+/// exported. No timezone is recorded, so treat it as a naive local timestamp.
+///
+/// Field order makes the derived [`Ord`] chronological, so a list of models sorts
+/// newest-last by date. Across authors that ordering is approximate — each stamp is
+/// local wall-clock time in whatever zone the trainer ran in.
+///
+/// The ranges below are what NAM writes; values are taken verbatim from the file and
+/// are not range-checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize)]
+#[non_exhaustive]
+pub struct Date {
+    /// Calendar year, e.g. `2026`.
+    pub year: i32,
+    /// Month of year, `1..=12`.
+    pub month: u32,
+    /// Day of month, `1..=31`.
+    pub day: u32,
+    /// Hour on a 24-hour clock, `0..=23`.
+    pub hour: u32,
+    /// Minute of the hour, `0..=59`.
+    pub minute: u32,
+    /// Second of the minute, `0..=59`.
+    pub second: u32,
+}
+
+/// The fields NAM may write into a `.nam` file's `metadata` block.
+///
+/// **None of this reaches the forward pass** — it is descriptive only, for display
+/// and routing decisions. All fields are optional: older or minimal files omit the
+/// block entirely, and each field is parsed leniently, so one malformed entry never
+/// costs you the others. Unknown keys are ignored.
+///
+/// For comparison, NAM's C++ `NeuralAmpModelerCore` types only the three
+/// calibration numbers (`loudness`, `input_level_dbu`, `output_level_dbu`) and
+/// leaves the rest as an untyped JSON blob for each host to re-derive.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[non_exhaustive]
 pub struct Metadata {
-    /// Perceived loudness of the model's output, in LUFS (NAM's `loudness`).
-    #[serde(default)]
+    /// How loud the model is against NAM's standardized input, in dBFS (NAM's
+    /// `loudness`).
+    ///
+    /// This is plain RMS — the trainer computes `20·log10(sqrt(mean(y²)))` — not a
+    /// perceptual measure. It is **not** LUFS: no K-weighting, no gating. Two models
+    /// with the same `loudness` but different spectra will not match perceptually, so
+    /// don't feed this number to a loudness target that expects ITU-R BS.1770.
+    #[serde(default, deserialize_with = "lenient")]
     pub loudness: Option<f32>,
     /// Analog level (dBu) corresponding to 0 dBFS at the model input.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub input_level_dbu: Option<f32>,
     /// Analog level (dBu) corresponding to 0 dBFS at the model output.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub output_level_dbu: Option<f32>,
+    /// NAM's own estimate, in `0.0..=1.0`, of "how much gain / compression does the
+    /// model seem to have" — derived by the trainer from the model's response across
+    /// a sweep of input levels, not a knob position on the modelled gear.
+    #[serde(default, deserialize_with = "lenient")]
+    pub gain: Option<f32>,
+    /// Human-readable model name chosen by its author. Often more descriptive than
+    /// the filename, which is whatever the file happens to have been saved as.
+    #[serde(default, deserialize_with = "lenient")]
+    pub name: Option<String>,
+    /// Who captured the model.
+    #[serde(default, deserialize_with = "lenient")]
+    pub modeled_by: Option<String>,
+    /// Manufacturer of the modelled gear, e.g. `"Marshall"`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub gear_make: Option<String>,
+    /// Model of the modelled gear, e.g. `"JMP-50"`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub gear_model: Option<String>,
+    /// What kind of gear was captured, and — crucially — how much of the signal
+    /// chain the capture covers.
+    ///
+    /// This is a `String` rather than an enum on purpose: there is no single
+    /// vocabulary, and the vocabularies move. NAM's trainer writes `amp`, `pedal`,
+    /// `pedal_amp`, `amp_cab`, `amp_pedal_cab`, `preamp`, `studio`; TONE3000 writes
+    /// `amp`, `amp-cab`, `pedal`, `outboard`, `cab`, `space`, `experimental`, plus
+    /// the deprecated-but-permanently-accepted `full-rig` and `ir`. Only `amp` and
+    /// `pedal` are common to both, and TONE3000 has already retired values that
+    /// exist in files on disk. An enum over either set would reject real files.
+    /// Use [`Metadata::includes_cab`] rather than matching by hand.
+    #[serde(default, deserialize_with = "lenient")]
+    pub gear_type: Option<String>,
+    /// Character of the captured tone. NAM's vocabulary is `clean`, `overdrive`,
+    /// `crunch`, `hi_gain`, `fuzz`; a `String` for the same reason as
+    /// [`Self::gear_type`] (values like `"bass"` and `"T3K-Null"` occur in the wild).
+    #[serde(default, deserialize_with = "lenient")]
+    pub tone_type: Option<String>,
+    /// Which trainer produced the file, when it says, e.g. `"TONE3000"`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub trainer: Option<String>,
+    /// When the model was exported.
+    #[serde(default, deserialize_with = "lenient")]
+    pub date: Option<Date>,
+    /// The trainer's own record of the training run — latency calibration, data
+    /// checks, settings. Deliberately left untyped: the shape is trainer- and
+    /// version-specific and carries no stability guarantee.
+    #[serde(default)]
+    pub training: Option<serde_json::Value>,
+}
+
+impl Metadata {
+    /// Whether the capture includes a speaker cabinet, as far as
+    /// [`Self::gear_type`] says.
+    ///
+    /// This is the question that matters for signal routing: stacking an impulse
+    /// response on top of a model that already has a cab in it means two cabs in
+    /// series, which sounds wrong. `Some(true)` says the cab is already baked in, so
+    /// don't add an IR. `Some(false)` says only that this capture stops before the
+    /// speaker — whether an IR belongs *directly* after it still depends on the rest
+    /// of your chain, since a `pedal` or `outboard` capture wants an amp next, not a
+    /// cab.
+    ///
+    /// Recognized are the values NAM's trainer and TONE3000 actually write, plus any
+    /// value naming `cab` as one of its `_`-separated components (so a future
+    /// `"pedal_amp_cab"` classifies without a code change). `cab` is matched as a
+    /// whole token, never a substring, so `"cable"` and `"cabless"` don't read as
+    /// cab-inclusive. Matching ignores case, surrounding whitespace, and `-` vs `_`,
+    /// so TONE3000's `"full-rig"` and a hypothetical `"full_rig"` agree.
+    ///
+    /// Anything else returns `None` — callers get "unknown" rather than a guess.
+    ///
+    /// The token rule has a known limit: a *negated* spelling like `"amp_no_cab"`
+    /// still reads as cab-inclusive, since `cab` is one of its tokens. Neither
+    /// vocabulary forms values that way, and detecting negation in free text is
+    /// guesswork of the kind this function exists to avoid — so it is documented
+    /// rather than defended against.
+    ///
+    /// The answer is only ever as good as the file: `gear_type` is author-supplied
+    /// and real captures do mislabel themselves (a file named `...-FullRig.nam`
+    /// tagged `gear_type: "amp"`). Treat it as a default to offer, not a fact to act
+    /// on silently.
+    ///
+    /// NAM's `"studio"` is deliberately `None`: NAM documents the value nowhere, and
+    /// it reads equally well as "studio outboard gear" (no speaker — which is what
+    /// TONE3000 calls `outboard`) or "studio-recorded chain" (speaker included).
+    /// Guessing wrong would silently route audio through one cab too many, or none
+    /// at all, so we decline to guess.
+    ///
+    /// ```
+    /// # use nam_rs::Metadata;
+    /// let md = Metadata::default();
+    /// assert_eq!(md.includes_cab(), None); // no gear_type recorded
+    /// ```
+    #[must_use]
+    pub fn includes_cab(&self) -> Option<bool> {
+        let normalized = self
+            .gear_type
+            .as_deref()?
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_");
+        match normalized.as_str() {
+            // Everything that stops at or before the power amp's output jack.
+            // `outboard` is TONE3000's term for rack/desk gear, which has no speaker;
+            // `space` is its room/reverb category, which likewise isn't a guitar cab.
+            "amp" | "preamp" | "pedal" | "pedal_amp" | "outboard" | "space" => Some(false),
+            // A whole recorded chain, speaker (and mic) baked in. TONE3000 documents
+            // `full-rig` as a deprecated alias for `amp-cab`, so this is their
+            // classification, not our inference. Their `ir` category (also
+            // deprecated, superseded by `format=ir`) is a cab response captured
+            // directly — a cab by definition.
+            "full_rig" | "ir" => Some(true),
+            // `amp_cab`/`amp-cab`, `cab`, `amp_pedal_cab`, and any future spelling
+            // that names a cab as one of its components. Match `cab` as a whole
+            // `_`-separated token, never a substring: `"cable"` and `"cabless"` both
+            // contain "cab" while meaning something else entirely, and a false
+            // `Some(true)` tells the caller to drop an IR the model needs.
+            other if other.split('_').any(|token| token == "cab") => Some(true),
+            // Unknown: NAM's undocumented `studio` (see above) and TONE3000's
+            // `experimental`, which promises nothing about the signal chain.
+            _ => None,
+        }
+    }
 }
 
 impl NamModel {
@@ -229,9 +416,13 @@ impl NamModel {
         self.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE)
     }
 
-    /// The typed [`Metadata`] (loudness + calibration levels), parsed from the raw
-    /// `metadata` block in one shot. Returns defaults (all `None`) when there is no
-    /// metadata block or it lacks these keys; unknown keys are ignored.
+    /// The file's descriptive [`Metadata`] — name, gear, tone, trainer, date, loudness
+    /// and calibration levels — parsed from the raw `metadata` block in one shot.
+    ///
+    /// Returns defaults (every field `None`) when the file has no metadata block.
+    /// Fields the block omits are `None`; keys we don't type are ignored, and remain
+    /// reachable on [`Self::metadata`]. Parsing is per-field lenient, so a single
+    /// malformed entry costs only itself.
     ///
     /// Prefer this over the single-field accessors ([`Self::loudness`], etc.) when you
     /// want several fields: each single-field accessor re-clones and re-parses the raw
@@ -245,7 +436,8 @@ impl NamModel {
         }
     }
 
-    /// Output loudness in LUFS, if the file records it.
+    /// Output loudness in dBFS RMS, if the file records it — see
+    /// [`Metadata::loudness`], and note it is not LUFS.
     #[must_use]
     pub fn loudness(&self) -> Option<f32> {
         self.metadata_typed().loudness
@@ -255,6 +447,16 @@ impl NamModel {
     #[must_use]
     pub fn input_level_dbu(&self) -> Option<f32> {
         self.metadata_typed().input_level_dbu
+    }
+
+    /// Whether this capture already includes a speaker cabinet — see
+    /// [`Metadata::includes_cab`] for the details and the `None` case.
+    ///
+    /// Use this to decide whether to put an impulse response after the model: a
+    /// cab-inclusive capture followed by an IR puts two cabs in series.
+    #[must_use]
+    pub fn includes_cab(&self) -> Option<bool> {
+        self.metadata_typed().includes_cab()
     }
 
     /// Output calibration level in dBu (analog level at 0 dBFS out), if present.

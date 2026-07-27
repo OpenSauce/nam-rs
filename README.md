@@ -75,6 +75,34 @@ normalization on the output — those belong to the host's audio graph, not the 
 The calibration accessors (`NamModel::loudness()` etc.) give you the numbers for that
 gain-staging.
 
+## Metadata
+
+`NamModel::metadata_typed()` returns the file's descriptive `Metadata`: `name`,
+`modeled_by`, `gear_make`, `gear_model`, `gear_type`, `tone_type`, `trainer`, `date`,
+`gain`, the calibration levels, and the trainer's raw `training` blob. All fields are
+optional and parsed leniently — one malformed entry never costs you the others.
+
+`Metadata::includes_cab()` answers the question that actually changes your signal
+chain: does this capture already have a speaker cabinet in it?
+
+```rust,no_run
+use nam_rs::NamModel;
+
+let model = NamModel::from_file("model.nam")?;
+match model.includes_cab() {
+    Some(true) => println!("cab included — don't add an IR"),
+    Some(false) => println!("no cab — an IR belongs after this"),
+    None => println!("unknown — leave the signal chain alone"),
+}
+# Ok::<(), nam_rs::Error>(())
+```
+
+`gear_type` is a `String`, not an enum, because there is no single vocabulary: NAM's
+trainer and TONE3000 use overlapping-but-different sets, and TONE3000 has already
+deprecated values that exist in files on disk. `includes_cab()` normalizes across
+both (case, whitespace, and `-` vs `_`) and returns `None` rather than guessing at a
+value it doesn't recognize.
+
 ## Supported architectures
 
 - **WaveNet** (A1 and A2 single models) — dilated-conv forward pass, parity-tested.

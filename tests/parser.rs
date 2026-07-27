@@ -155,7 +155,11 @@ const WITH_METADATA: &str = r#"{
     "weights": [1.0, 2.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
     "metadata": {
         "loudness": -20.02, "input_level_dbu": 18.3, "output_level_dbu": 12.3,
-        "name": "Test", "gear_type": "amp"
+        "gain": 0.824, "name": "Test", "modeled_by": "somebody",
+        "gear_make": "Marshall", "gear_model": "JMP-50", "gear_type": "amp",
+        "tone_type": "overdrive", "trainer": "TONE3000",
+        "date": {"year": 2026, "month": 5, "day": 15,
+                 "hour": 18, "minute": 45, "second": 6}
     }
 }"#;
 
@@ -191,15 +195,152 @@ fn metadata_absent_yields_none() {
 
 #[test]
 fn unrelated_metadata_keys_are_ignored() {
+    // Swap the calibration keys for ones nam-rs knows nothing about: the unknown keys
+    // must be skipped silently rather than failing the parse.
     let json = WITH_METADATA.replace(
         "\"loudness\": -20.02, \"input_level_dbu\": 18.3, \"output_level_dbu\": 12.3,",
-        "",
+        "\"some_future_key\": 1, \"another\": {\"nested\": true},",
     );
     let m = NamModel::from_json_str(&json).expect("parse");
     assert_eq!(m.loudness(), None);
     assert_eq!(m.input_level_dbu(), None);
     assert_eq!(m.output_level_dbu(), None);
-    // unrelated keys ("name", "gear_type") must not error.
+    // ...while the keys that *are* known still come through.
+    assert_eq!(m.metadata_typed().name.as_deref(), Some("Test"));
+}
+
+#[test]
+fn parses_descriptive_metadata() {
+    let md = NamModel::from_json_str(WITH_METADATA)
+        .expect("parse")
+        .metadata_typed();
+    assert_eq!(md.name.as_deref(), Some("Test"));
+    assert_eq!(md.modeled_by.as_deref(), Some("somebody"));
+    assert_eq!(md.gear_make.as_deref(), Some("Marshall"));
+    assert_eq!(md.gear_model.as_deref(), Some("JMP-50"));
+    assert_eq!(md.gear_type.as_deref(), Some("amp"));
+    assert_eq!(md.tone_type.as_deref(), Some("overdrive"));
+    assert_eq!(md.trainer.as_deref(), Some("TONE3000"));
+    assert!((md.gain.expect("gain") - 0.824).abs() < 1e-4);
+
+    let date = md.date.expect("date");
+    assert_eq!(
+        (
+            date.year,
+            date.month,
+            date.day,
+            date.hour,
+            date.minute,
+            date.second
+        ),
+        (2026, 5, 15, 18, 45, 6)
+    );
+}
+
+/// `gear_type` and `tone_type` are `String`, not enums, on purpose: files in the wild
+/// carry values outside NAM's own enums (TONE3000 writes `"full-rig"` and
+/// `"T3K-Null"`). A typed enum would reject those files outright.
+#[test]
+fn nonstandard_gear_and_tone_types_still_parse() {
+    let json = WITH_METADATA
+        .replace("\"gear_type\": \"amp\"", "\"gear_type\": \"full-rig\"")
+        .replace(
+            "\"tone_type\": \"overdrive\"",
+            "\"tone_type\": \"T3K-Null\"",
+        );
+    let md = NamModel::from_json_str(&json)
+        .expect("parse")
+        .metadata_typed();
+    assert_eq!(md.gear_type.as_deref(), Some("full-rig"));
+    assert_eq!(md.tone_type.as_deref(), Some("T3K-Null"));
+}
+
+/// Real files write explicit JSON `null` for absent calibration levels, and write
+/// integers where the schema says float. Both must parse as cleanly as an absent key.
+#[test]
+fn null_and_integer_metadata_values_parse() {
+    let json = WITH_METADATA.replace(
+        "\"input_level_dbu\": 18.3, \"output_level_dbu\": 12.3,",
+        "\"input_level_dbu\": null, \"output_level_dbu\": 14,",
+    );
+    let md = NamModel::from_json_str(&json)
+        .expect("parse")
+        .metadata_typed();
+    assert_eq!(md.input_level_dbu, None);
+    assert!((md.output_level_dbu.expect("present") - 14.0).abs() < 1e-4);
+}
+
+/// One field with an unexpected shape must not take the rest of the block down with
+/// it. `Metadata` is parsed in one `from_value` call that falls back to `Default` on
+/// error, so without per-field leniency a single junk value would silently erase
+/// every other field — including the calibration numbers the DSP path cares about.
+#[test]
+fn one_malformed_field_does_not_discard_the_others() {
+    let json = WITH_METADATA.replace(
+        "\"date\": {\"year\": 2026, \"month\": 5, \"day\": 15,\n                 \"hour\": 18, \"minute\": 45, \"second\": 6}",
+        "\"date\": \"last Tuesday\"",
+    );
+    assert!(json.contains("last Tuesday"), "replacement must apply");
+
+    let md = NamModel::from_json_str(&json)
+        .expect("parse")
+        .metadata_typed();
+    assert_eq!(md.date, None, "the malformed field itself yields None");
+    // ...and everything else survives.
+    assert!((md.loudness.expect("loudness") - -20.02).abs() < 1e-4);
+    assert_eq!(md.gear_type.as_deref(), Some("amp"));
+    assert_eq!(md.name.as_deref(), Some("Test"));
+}
+
+#[test]
+fn includes_cab_classifies_known_gear_types() {
+    let with_gear = |gear: &str| {
+        let json =
+            WITH_METADATA.replace("\"gear_type\": \"amp\"", &format!("\"gear_type\": {gear}"));
+        NamModel::from_json_str(&json)
+            .expect("parse")
+            .includes_cab()
+    };
+
+    // Speaker/cab in the signal chain. NAM's vocabulary...
+    for gear in ["\"amp_cab\"", "\"amp_pedal_cab\""] {
+        assert_eq!(with_gear(gear), Some(true), "{gear} should report a cab");
+    }
+    // ...and TONE3000's, which hyphenates. `full-rig` is documented by TONE3000 as
+    // an alias for `amp-cab`, and `ir` is a directly captured cab response.
+    for gear in ["\"amp-cab\"", "\"cab\"", "\"full-rig\"", "\"ir\""] {
+        assert_eq!(with_gear(gear), Some(true), "{gear} should report a cab");
+    }
+    // Gear that stops before the speaker, from both vocabularies.
+    for gear in [
+        "\"amp\"",
+        "\"preamp\"",
+        "\"pedal\"",
+        "\"pedal_amp\"",
+        "\"outboard\"",
+        "\"space\"",
+    ] {
+        assert_eq!(with_gear(gear), Some(false), "{gear} should report no cab");
+    }
+    // Case, surrounding whitespace, and `-` vs `_` are not significant, so the two
+    // spellings of every cross-vocabulary value agree.
+    assert_eq!(with_gear("\"  AMP_CAB \""), Some(true));
+    assert_eq!(with_gear("\"full_rig\""), with_gear("\"full-rig\""));
+    assert_eq!(with_gear("\"amp_cab\""), with_gear("\"amp-cab\""));
+
+    // An unrecognised or absent value is "unknown", never a guess. NAM's `studio`
+    // is undocumented and reads both ways; TONE3000's `experimental` promises
+    // nothing about the chain. Both stay unknown on purpose.
+    assert_eq!(with_gear("\"studio\""), None);
+    assert_eq!(with_gear("\"experimental\""), None);
+    assert_eq!(with_gear("\"something-new\""), None);
+    assert_eq!(with_gear("null"), None);
+    assert_eq!(
+        NamModel::from_json_str(MINIMAL_WAVENET)
+            .expect("parse")
+            .includes_cab(),
+        None
+    );
 }
 
 const MINIMAL_LSTM: &str = r#"{

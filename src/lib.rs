@@ -43,6 +43,12 @@
 //! The calibration accessors ([`NamModel::loudness`] etc.) give you the numbers to do
 //! that gain-staging yourself.
 //!
+//! **Metadata.** [`NamModel::metadata_typed`] returns the file's descriptive
+//! [`Metadata`] — who captured it, what gear, what tone, when. None of it reaches the
+//! forward pass, but [`Metadata::includes_cab`] answers a question that changes your
+//! signal chain: whether the capture already contains a speaker cabinet, and so
+//! whether an impulse response after it would be a second one.
+//!
 //! ## Design contract
 //!
 //! 1. **Parity with the reference.** The forward pass must produce output equal
@@ -108,7 +114,7 @@ mod wavenet;
 pub use error::Error;
 pub use lstm::Lstm;
 pub use model::{
-    ActivationSpec, FilmConfig, GatingMode, Head1x1Config, Layer1x1Config, LayerArrayConfig,
+    ActivationSpec, Date, FilmConfig, GatingMode, Head1x1Config, Layer1x1Config, LayerArrayConfig,
     LstmConfig, Metadata, ModelConfig, NamModel, PostStackHeadConfig, SlimmableConfig,
     SlimmableSubmodel, WaveNetConfig, DEFAULT_SAMPLE_RATE,
 };

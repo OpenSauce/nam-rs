@@ -529,3 +529,80 @@ fn real_a2_captures_parse_and_are_cleanly_guarded() {
     }
     eprintln!("real A2 capture smoke: checked {checked} file(s)");
 }
+
+/// The typed [`Metadata`] schema must match what real files actually write. Every key
+/// we claim to type has to survive the parse: a misspelled field name or a wrong Rust
+/// type would otherwise be swallowed by the lenient parser into a silent `None`,
+/// which no synthetic-JSON test would catch. Skips when the files are absent (CI).
+#[test]
+fn real_captures_metadata_matches_the_typed_schema() {
+    use nam_rs::NamModel;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/examples");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut checked = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("nam") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let model = NamModel::from_json_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let md = model.metadata_typed();
+        let Some(raw) = model.metadata.as_ref().and_then(|v| v.as_object()) else {
+            continue;
+        };
+
+        // A string in the file must arrive as a string in the struct...
+        for (key, got) in [
+            ("name", &md.name),
+            ("modeled_by", &md.modeled_by),
+            ("gear_make", &md.gear_make),
+            ("gear_model", &md.gear_model),
+            ("gear_type", &md.gear_type),
+            ("tone_type", &md.tone_type),
+            ("trainer", &md.trainer),
+        ] {
+            if let Some(want) = raw.get(key).and_then(|v| v.as_str()) {
+                assert_eq!(got.as_deref(), Some(want), "{name}: metadata.{key} lost");
+            }
+        }
+        // ...a number as a number (real files write bare integers for the levels)...
+        for (key, got) in [
+            ("loudness", md.loudness),
+            ("gain", md.gain),
+            ("input_level_dbu", md.input_level_dbu),
+            ("output_level_dbu", md.output_level_dbu),
+        ] {
+            if let Some(want) = raw.get(key).and_then(|v| v.as_f64()) {
+                let got = got.unwrap_or_else(|| panic!("{name}: metadata.{key} lost"));
+                assert!(
+                    (f64::from(got) - want).abs() < 1e-3,
+                    "{name}: metadata.{key} = {got}, file says {want}"
+                );
+            }
+        }
+        // ...and the two nested blocks as themselves.
+        if let Some(want) = raw.get("date").and_then(|v| v.as_object()) {
+            let date = md
+                .date
+                .unwrap_or_else(|| panic!("{name}: metadata.date lost"));
+            assert_eq!(i64::from(date.year), want["year"].as_i64().unwrap());
+            assert_eq!(u64::from(date.second), want["second"].as_u64().unwrap());
+        }
+        assert_eq!(
+            raw.contains_key("training"),
+            md.training.is_some(),
+            "{name}: metadata.training lost"
+        );
+
+        eprintln!(
+            "  {name}: gear_type={:?} includes_cab={:?}",
+            md.gear_type,
+            model.includes_cab()
+        );
+        checked += 1;
+    }
+    eprintln!("real capture metadata: checked {checked} file(s)");
+}

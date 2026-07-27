@@ -205,14 +205,27 @@ where
 
 /// The calendar timestamp NAM stamps into `metadata.date` when the model is
 /// exported. No timezone is recorded, so treat it as a naive local timestamp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+///
+/// Field order makes the derived [`Ord`] chronological, so a list of models sorts
+/// newest-last by date. Across authors that ordering is approximate — each stamp is
+/// local wall-clock time in whatever zone the trainer ran in.
+///
+/// The ranges below are what NAM writes; values are taken verbatim from the file and
+/// are not range-checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize)]
 #[non_exhaustive]
 pub struct Date {
+    /// Calendar year, e.g. `2026`.
     pub year: i32,
+    /// Month of year, `1..=12`.
     pub month: u32,
+    /// Day of month, `1..=31`.
     pub day: u32,
+    /// Hour on a 24-hour clock, `0..=23`.
     pub hour: u32,
+    /// Minute of the hour, `0..=59`.
     pub minute: u32,
+    /// Second of the minute, `0..=59`.
     pub second: u32,
 }
 
@@ -293,13 +306,21 @@ impl Metadata {
     ///
     /// This is the question that matters for signal routing: stacking an impulse
     /// response on top of a model that already has a cab in it means two cabs in
-    /// series, which sounds wrong. `Some(true)` means load no IR; `Some(false)`
-    /// means the model stops before the speaker and wants one.
+    /// series, which sounds wrong. `Some(true)` says the cab is already baked in, so
+    /// don't add an IR. `Some(false)` says only that this capture stops before the
+    /// speaker — whether an IR belongs *directly* after it still depends on the rest
+    /// of your chain, since a `pedal` or `outboard` capture wants an amp next, not a
+    /// cab.
     ///
     /// Returns `None` when `gear_type` is absent or is a value we can't confidently
     /// place — callers get "unknown", never a guess. Matching ignores case,
     /// surrounding whitespace, and `-` vs `_`, so TONE3000's `"full-rig"` and a
     /// hypothetical `"full_rig"` agree.
+    ///
+    /// The answer is only ever as good as the file: `gear_type` is author-supplied
+    /// and real captures do mislabel themselves (a file named `...-FullRig.nam`
+    /// tagged `gear_type: "amp"`). Treat it as a default to offer, not a fact to act
+    /// on silently.
     ///
     /// NAM's `"studio"` is deliberately `None`: NAM documents the value nowhere, and
     /// it reads equally well as "studio outboard gear" (no speaker — which is what

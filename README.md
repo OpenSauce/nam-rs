@@ -77,31 +77,56 @@ gain-staging.
 
 ## Metadata
 
-`NamModel::metadata_typed()` returns the file's descriptive `Metadata`: `name`,
-`modeled_by`, `gear_make`, `gear_model`, `gear_type`, `tone_type`, `trainer`, `date`,
-`gain`, the calibration levels, and the trainer's raw `training` blob. All fields are
-optional and parsed leniently — one malformed entry never costs you the others.
+`NamModel::metadata_typed()` parses the file's `metadata` block into a `Metadata`
+struct — everything a model browser needs to show, none of it used by the forward
+pass. Every field is `Option`, since any of them may be absent.
 
-`Metadata::includes_cab()` answers the question that actually changes your signal
-chain: does this capture already have a speaker cabinet in it?
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | `Option<String>` | The author's name for the model, often better than the filename |
+| `modeled_by` | `Option<String>` | Who captured it |
+| `gear_make` | `Option<String>` | e.g. `"Marshall"` |
+| `gear_model` | `Option<String>` | e.g. `"JMP-50"` |
+| `gear_type` | `Option<String>` | What was captured, and how much of the chain: `amp`, `pedal`, `amp_cab`, `full-rig`, … |
+| `tone_type` | `Option<String>` | `clean`, `overdrive`, `crunch`, `hi_gain`, `fuzz`, … |
+| `trainer` | `Option<String>` | Which trainer produced the file, e.g. `"TONE3000"` |
+| `date` | `Option<Date>` | Export timestamp (`year`…`second`; ordered chronologically) |
+| `loudness` | `Option<f32>` | Output loudness in LUFS |
+| `input_level_dbu`, `output_level_dbu` | `Option<f32>` | Analog dBu at 0 dBFS — the calibration numbers for gain-staging |
+| `gain` | `Option<f32>` | The trainer's `0.0..=1.0` estimate of how much gain/compression the model has |
+| `training` | `Option<serde_json::Value>` | The trainer's raw training record, left untyped |
 
-```rust,no_run
-use nam_rs::NamModel;
+Call `metadata_typed()` once and keep the struct: the single-field shortcuts on
+`NamModel` (`loudness()`, `input_level_dbu()`, `output_level_dbu()`) each re-parse the
+raw JSON. All of it is load-time, never the audio thread. The unparsed block stays
+available as `NamModel::metadata` if you need a key we don't type, and parsing is
+per-field lenient — one malformed entry yields `None` for itself instead of discarding
+the whole block.
 
+`gear_type` and `tone_type` are `String`, not enums, because there is no single
+vocabulary: NAM's trainer and TONE3000 use overlapping-but-different sets, TONE3000
+has already deprecated values that exist in files on disk, and real captures write
+values in neither (`"vintage"`, `"T3K-Null"`). An enum would reject those files.
+
+For the one question that actually changes a signal chain — is a speaker cab already
+baked into this capture, so that adding an IR would be a second one? —
+`Metadata::includes_cab()` (also on `NamModel`) classifies `gear_type` across both
+vocabularies, ignoring case, whitespace, and `-` vs `_`:
+
+```rust
 let model = NamModel::from_file("model.nam")?;
+
 match model.includes_cab() {
-    Some(true) => println!("cab included — don't add an IR"),
-    Some(false) => println!("no cab — an IR belongs after this"),
-    None => println!("unknown — leave the signal chain alone"),
+    Some(true) => println!("cab is baked in — a second one would be an IR too many"),
+    Some(false) => println!("no cab in this capture"),
+    None => println!("unknown — don't touch the signal chain"),
 }
-# Ok::<(), nam_rs::Error>(())
 ```
 
-`gear_type` is a `String`, not an enum, because there is no single vocabulary: NAM's
-trainer and TONE3000 use overlapping-but-different sets, and TONE3000 has already
-deprecated values that exist in files on disk. `includes_cab()` normalizes across
-both (case, whitespace, and `-` vs `_`) and returns `None` rather than guessing at a
-value it doesn't recognize.
+It returns `None` rather than guessing at a value it doesn't recognize, and it only
+ever reports what the file claims: `gear_type` is author-supplied and captures do
+mislabel themselves, so treat the answer as a default to offer the user, not a fact to
+reroute audio on silently.
 
 ## Supported architectures
 

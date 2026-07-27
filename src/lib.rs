@@ -1,3 +1,4 @@
+#![deny(missing_docs)]
 //! # nam-rs
 //!
 //! Pure-Rust, real-time-safe inference for [Neural Amp Modeler] (NAM) `.nam` models.
@@ -43,11 +44,14 @@
 //! The calibration accessors ([`NamModel::loudness`] etc.) give you the numbers to do
 //! that gain-staging yourself.
 //!
-//! **Metadata.** [`NamModel::metadata_typed`] returns the file's descriptive
-//! [`Metadata`] — who captured it, what gear, what tone, when. None of it reaches the
-//! forward pass, but [`Metadata::includes_cab`] answers a question that changes your
-//! signal chain: whether the capture already contains a speaker cabinet, and so
-//! whether an impulse response after it would be a second one.
+//! **Metadata.** [`NamModel::metadata_typed`] parses the file's `metadata` block into
+//! a [`Metadata`] struct — name, who captured it, gear make/model/type, tone type,
+//! trainer, export date, loudness and calibration levels — everything a model browser
+//! shows and nothing the forward pass uses. See [`Metadata`] for the full field list;
+//! all fields are optional and parsed leniently, and the unparsed block remains on
+//! [`NamModel::metadata`]. One derived helper, [`Metadata::includes_cab`], answers the
+//! question that changes a signal chain: whether the capture already contains a
+//! speaker cabinet, and so whether an impulse response after it would be a second one.
 //!
 //! ## Design contract
 //!

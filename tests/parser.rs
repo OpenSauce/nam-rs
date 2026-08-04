@@ -422,13 +422,13 @@ fn wavenet_config_still_parses_through_enum() {
 }
 
 #[test]
-fn unknown_architecture_fails_to_parse() {
+fn unknown_architecture_returns_unsupported_architecture() {
     let json = MINIMAL_WAVENET.replace("\"WaveNet\"", "\"Transformer\"");
     let err = NamModel::from_json_str(&json).unwrap_err();
-    assert!(
-        format!("{err}").contains("Transformer"),
-        "error should name the bad architecture: {err}"
-    );
+    assert!(matches!(
+        err,
+        Error::UnsupportedArchitecture(architecture) if architecture == "Transformer"
+    ));
 }
 
 /// Builds a WaveNet config JSON with the given raw `activation` snippet.

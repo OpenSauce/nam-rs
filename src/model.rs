@@ -391,13 +391,24 @@ impl NamModel {
     ///
     /// Convenience over [`std::fs::read_to_string`] + [`Self::from_json_str`].
     /// Returns [`Error::Io`] if the file can't be read, or [`Error::Json`] if its
-    /// contents aren't valid `.nam` JSON.
+    /// contents aren't valid `.nam` JSON. An unknown architecture returns
+    /// [`Error::UnsupportedArchitecture`].
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
         Self::from_json_str(&std::fs::read_to_string(path)?)
     }
 
     /// Parse a `.nam` model from a JSON string already in memory.
+    ///
+    /// Returns [`Error::UnsupportedArchitecture`] when the file declares an
+    /// architecture this crate does not support.
     pub fn from_json_str(json: &str) -> Result<Self, Error> {
+        let value: serde_json::Value = serde_json::from_str(json)?;
+        if let Some(architecture) = value.get("architecture").and_then(|value| value.as_str()) {
+            if !matches!(architecture, "WaveNet" | "LSTM" | "SlimmableContainer") {
+                return Err(Error::UnsupportedArchitecture(architecture.to_owned()));
+            }
+        }
+
         Ok(serde_json::from_str(json)?)
     }
 

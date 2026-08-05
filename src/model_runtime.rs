@@ -352,7 +352,10 @@ mod tests {
         assert_eq!(lstm.loudness(), None);
         assert_eq!(lstm.input_level_dbu(), None);
         assert_eq!(lstm.output_level_dbu(), None);
-        assert_eq!(lstm.expected_sample_rate(), crate::model::DEFAULT_SAMPLE_RATE);
+        assert_eq!(
+            lstm.expected_sample_rate(),
+            crate::model::DEFAULT_SAMPLE_RATE
+        );
     }
 
     #[test]
@@ -401,7 +404,11 @@ mod tests {
         let mut model = container();
         for i in 0..3 {
             model.as_slimmable_mut().unwrap().select(i);
-            assert_eq!(model.loudness(), None, "submodel {i} leaked its own loudness");
+            assert_eq!(
+                model.loudness(),
+                None,
+                "submodel {i} leaked its own loudness"
+            );
             assert_eq!(
                 model.input_level_dbu(),
                 None,

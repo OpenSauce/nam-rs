@@ -84,6 +84,14 @@ pub struct WaveNet {
     sig_a_blk: Vec<f32>,
     sig_b_blk: Vec<f32>,
     cond_blk: Vec<f32>,
+    /// The loudness of the model
+    pub(crate) loudness: Option<f32>,
+    /// The input level of the model in dBu
+    pub(crate) input_level_dbu: Option<f32>,
+    /// The output level of the model in dBu
+    pub(crate) output_level_dbu: Option<f32>,
+    /// The expected sample rate
+    pub(crate) expected_sample_rate: f64,
 }
 
 impl WaveNet {
@@ -257,6 +265,10 @@ impl WaveNet {
             sig_a_blk: vec![0.0; sig_w * MAX_BLOCK],
             sig_b_blk: vec![0.0; sig_w * MAX_BLOCK],
             cond_blk: vec![0.0; MAX_BLOCK],
+            expected_sample_rate: model.expected_sample_rate(),
+            loudness: model.loudness(),
+            input_level_dbu: model.input_level_dbu(),
+            output_level_dbu: model.output_level_dbu(),
         })
     }
 

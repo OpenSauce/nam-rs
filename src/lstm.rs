@@ -23,6 +23,14 @@ pub struct Lstm {
     /// Carry buffers for the inter-layer hidden signal (ping-ponged), width `H`.
     buf_a: Vec<f32>,
     buf_b: Vec<f32>,
+    /// The loudness of the model
+    pub(crate) loudness: Option<f32>,
+    /// The input level of the model in dBu
+    pub(crate) input_level_dbu: Option<f32>,
+    /// The output level of the model in dBu
+    pub(crate) output_level_dbu: Option<f32>,
+    /// The expected sample rate of the model
+    pub(crate) expected_sample_rate: f64,
 }
 
 impl Lstm {
@@ -71,6 +79,10 @@ impl Lstm {
             head_b,
             buf_a: vec![0.0; h.max(1)],
             buf_b: vec![0.0; h.max(1)],
+            expected_sample_rate: model.expected_sample_rate(),
+            loudness: model.loudness(),
+            input_level_dbu: model.input_level_dbu(),
+            output_level_dbu: model.output_level_dbu(),
         })
     }
 

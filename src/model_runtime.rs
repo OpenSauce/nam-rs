@@ -36,6 +36,10 @@ pub struct Slimmable {
     submodels: Vec<Model>,
     max_values: Vec<f32>,
     active: usize,
+    expected_sample_rate: f64,
+    input_level_dbu: Option<f32>,
+    output_level_dbu: Option<f32>,
+    loudness: Option<f32>,
 }
 
 impl Slimmable {
@@ -93,6 +97,10 @@ impl Model {
                     submodels,
                     max_values,
                     active,
+                    expected_sample_rate: model.expected_sample_rate(),
+                    loudness: model.loudness(),
+                    input_level_dbu: model.input_level_dbu(),
+                    output_level_dbu: model.output_level_dbu(),
                 }))
             }
         }
@@ -138,6 +146,52 @@ impl Model {
             // `select` must not surface stale state from a previously-active submodel.
             // Iterating a `Vec` allocates nothing, so this stays real-time-safe.
             Model::Slimmable(s) => s.submodels.iter_mut().for_each(Model::reset),
+        }
+    }
+
+    /// The sample rate, in Hz, the model expects its input to be at — falling back
+    /// to [`crate::model::DEFAULT_SAMPLE_RATE`] when the file does not specify one.
+    ///
+    /// **You must feed the model audio at this rate.** `nam-rs` runs the forward pass
+    /// at whatever rate you hand it and does *not* resample. A model captured at one
+    /// rate fed audio at another produces silently wrong output: its dilations and
+    /// recurrence are defined in samples, not seconds. If your host runs at a
+    /// different rate, resample to this rate before [`crate::Model::process_buffer`]
+    /// and back afterwards — resampling is the caller's responsibility. Mirrors NAM
+    /// Core's `GetExpectedSampleRate()`.
+    pub fn expected_sample_rate(&self) -> f64 {
+        match self {
+            Model::WaveNet(w) => w.expected_sample_rate,
+            Model::Lstm(l) => l.expected_sample_rate,
+            Model::Slimmable(s) => s.expected_sample_rate,
+        }
+    }
+
+    /// Output loudness in dBFS RMS, if the file records it — see
+    /// [`crate::Metadata::loudness`], and note it is not LUFS.
+    pub fn loudness(&self) -> Option<f32> {
+        match self {
+            Model::WaveNet(w) => w.loudness,
+            Model::Lstm(l) => l.loudness,
+            Model::Slimmable(s) => s.loudness,
+        }
+    }
+
+    /// Input calibration level in dBu (analog level at 0 dBFS in), if present.
+    pub fn input_level_dbu(&self) -> Option<f32> {
+        match self {
+            Model::WaveNet(w) => w.input_level_dbu,
+            Model::Lstm(l) => l.input_level_dbu,
+            Model::Slimmable(s) => s.input_level_dbu,
+        }
+    }
+
+    /// Output calibration level in dBu (analog level at 0 dBFS out), if present.
+    pub fn output_level_dbu(&self) -> Option<f32> {
+        match self {
+            Model::WaveNet(w) => w.output_level_dbu,
+            Model::Lstm(l) => l.output_level_dbu,
+            Model::Slimmable(s) => s.output_level_dbu,
         }
     }
 
@@ -232,6 +286,30 @@ mod tests {
         "weights": [1.0,0.0, 0.0,0.0, 2.0,0.0, 0.0,0.0, 0.0,0.0,0.0,0.0, 0.0, 0.0, 3.0, 0.5]
     }"#;
 
+    const TINY_LSTM_WITH_METADATA: &str = r#"{
+        "version": "0.5.4", "architecture": "LSTM",
+        "sample_rate": 44100,
+        "metadata": {"loudness": -20.02, "input_level_dbu": 18.3, "output_level_dbu": 12.3},
+        "config": { "input_size": 1, "hidden_size": 1, "num_layers": 1 },
+        "weights": [1.0,0.0, 0.0,0.0, 2.0,0.0, 0.0,0.0, 0.0,0.0,0.0,0.0, 0.0, 0.0, 3.0, 0.5]
+    }"#;
+
+    const TINY_SLIMMABLE_WITH_OWN_METADATA: &str = r#"{
+        "version": "0.7.0", "architecture": "SlimmableContainer",
+        "sample_rate": 44100,
+        "metadata": {"loudness": -1.0, "input_level_dbu": 2.0, "output_level_dbu": 3.0},
+        "config": { "submodels": [
+            { "max_value": 1.0, "model": {
+                "version": "0.5.4", "architecture": "LSTM",
+                "sample_rate": 96000,
+                "metadata": {"loudness": -99.0, "input_level_dbu": 98.0, "output_level_dbu": 97.0},
+                "config": { "input_size": 1, "hidden_size": 1, "num_layers": 1 },
+                "weights": [1.0,0.0, 0.0,0.0, 2.0,0.0, 0.0,0.0, 0.0,0.0,0.0,0.0, 0.0, 0.0, 3.0, 0.5]
+            }}
+        ]},
+        "weights": []
+    }"#;
+
     #[test]
     fn from_nam_builds_wavenet() {
         let m = NamModel::from_json_str(TINY_WAVENET).unwrap();
@@ -261,6 +339,44 @@ mod tests {
         assert!((buf[0] - 1.1623).abs() < 1e-3, "got {}", buf[0]);
     }
 
+    #[test]
+    fn model_calibration_accessors_default_to_none_when_file_omits_metadata() {
+        // TINY_WAVENET / TINY_LSTM have no `metadata` block and no `sample_rate`.
+        let wn = Model::from_nam(&NamModel::from_json_str(TINY_WAVENET).unwrap()).unwrap();
+        assert_eq!(wn.loudness(), None);
+        assert_eq!(wn.input_level_dbu(), None);
+        assert_eq!(wn.output_level_dbu(), None);
+        assert_eq!(wn.expected_sample_rate(), crate::model::DEFAULT_SAMPLE_RATE);
+
+        let lstm = Model::from_nam(&NamModel::from_json_str(TINY_LSTM).unwrap()).unwrap();
+        assert_eq!(lstm.loudness(), None);
+        assert_eq!(lstm.input_level_dbu(), None);
+        assert_eq!(lstm.output_level_dbu(), None);
+        assert_eq!(
+            lstm.expected_sample_rate(),
+            crate::model::DEFAULT_SAMPLE_RATE
+        );
+    }
+
+    #[test]
+    fn model_calibration_accessors_match_nam_model() {
+        let m = NamModel::from_json_str(TINY_LSTM_WITH_METADATA).unwrap();
+        let model = Model::from_nam(&m).unwrap();
+
+        // Model must agree with the NamModel it was built from...
+        assert_eq!(model.expected_sample_rate(), m.expected_sample_rate());
+        assert_eq!(model.loudness(), m.loudness());
+        assert_eq!(model.input_level_dbu(), m.input_level_dbu());
+        assert_eq!(model.output_level_dbu(), m.output_level_dbu());
+
+        // ...and those values must actually be the non-default ones from the file,
+        // not coincidentally-matching defaults.
+        assert_eq!(model.expected_sample_rate(), 44100.0);
+        assert_eq!(model.loudness(), Some(-20.02));
+        assert_eq!(model.input_level_dbu(), Some(18.3));
+        assert_eq!(model.output_level_dbu(), Some(12.3));
+    }
+
     fn container() -> Model {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/slimmable_container.nam");
@@ -275,6 +391,53 @@ mod tests {
         let s = model.as_slimmable_mut().expect("is slimmable");
         assert_eq!(s.len(), 3);
         assert_eq!(s.active_index(), 2, "default = last/full submodel");
+    }
+
+    #[test]
+    fn slimmable_calibration_is_the_containers_own_not_the_active_submodels() {
+        // tests/fixtures/slimmable_container.nam has no top-level `metadata` block of
+        // its own, but its 3 submodels each carry a distinct, non-null `loudness`
+        // (-37.84, -20.02, -25.51). If `Model::loudness()` ever again delegated to the
+        // active submodel instead of the container's own metadata, this would return
+        // `Some(..)` and change as `select()` moves between submodels; it must stay
+        // `None` throughout regardless of which submodel is active.
+        let mut model = container();
+        for i in 0..3 {
+            model.as_slimmable_mut().unwrap().select(i);
+            assert_eq!(
+                model.loudness(),
+                None,
+                "submodel {i} leaked its own loudness"
+            );
+            assert_eq!(
+                model.input_level_dbu(),
+                None,
+                "submodel {i} leaked its own input_level_dbu"
+            );
+            assert_eq!(
+                model.output_level_dbu(),
+                None,
+                "submodel {i} leaked its own output_level_dbu"
+            );
+        }
+    }
+
+    #[test]
+    fn slimmable_calibration_reads_the_containers_own_metadata_not_the_submodels() {
+        let m = NamModel::from_json_str(TINY_SLIMMABLE_WITH_OWN_METADATA).unwrap();
+        let model = Model::from_nam(&m).unwrap();
+        assert_eq!(
+            model.expected_sample_rate(),
+            44100.0,
+            "must be the container's sample_rate, not the submodel's 96000"
+        );
+        assert_eq!(
+            model.loudness(),
+            Some(-1.0),
+            "must be the container's loudness, not the submodel's -99.0"
+        );
+        assert_eq!(model.input_level_dbu(), Some(2.0));
+        assert_eq!(model.output_level_dbu(), Some(3.0));
     }
 
     #[test]

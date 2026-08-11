@@ -3,73 +3,149 @@
 //!
 //! Pure-Rust, real-time-safe inference for [Neural Amp Modeler] (NAM) `.nam` models.
 //!
-//! This crate loads a `.nam` model file and runs its neural network forward pass —
-//! a whole buffer at a time (WaveNet uses a cache-friendly block kernel), or one
-//! sample at a time — with no heap allocation on the audio (hot) path. It is a
-//! from-scratch Rust port of NAM's inference, written against the reference
-//! implementations below and validated for **parity** against them (per-sample
-//! error within `1e-5`, the same tolerance NeuralAudio uses).
+//! This crate loads a `.nam` file and runs its neural-network forward pass — a whole
+//! buffer at a time (WaveNet uses a cache-friendly block kernel), or one sample at a
+//! time — with no heap allocation on the audio thread. It is a from-scratch Rust port
+//! of NAM's inference, written against the reference implementations under
+//! [Attribution](#attribution) and validated numerically against them.
 //!
-//! Three model shapes are supported through the architecture-agnostic [`Model`] enum,
-//! which dispatches on the `.nam`'s declared architecture so you never branch on it
-//! yourself: **WaveNet**, **LSTM**, and **SlimmableContainer** (NAM "A2"). A
-//! `SlimmableContainer` is a thin multiplexer over a set of complete standalone
-//! submodels (each WaveNet or LSTM); a width dial selects the active one as a
-//! CPU/quality trade-off. Drive it via [`Model::as_slimmable_mut`] →
-//! [`Slimmable::set_slim_size`] / [`Slimmable::select`]. Switching is real-time-safe
-//! (a single index write); each submodel keeps its own state, so switching mid-stream
-//! leaves a short warmup transient on the newly-selected submodel.
+//! ## Quickstart
 //!
-//! The A2 feature set is supported: FiLM, gating, bottleneck, grouped convs, the
-//! per-array head (incl. multi-tap conv heads), the optional post-stack head
-//! (`activation → Conv1d` chain run after the arrays, with `head_scale` scaling its
-//! input), and a `condition_dsp` (a nested model whose output replaces the
-//! conditioning fed to every array — including a multi-channel-output one, whose N rows
-//! become the N-wide conditioning fed to every array). The remaining restrictions —
-//! multi-channel input (`in_channels != 1`), a post-stack head with `out_channels != 1`,
-//! mixed gating modes within one array, and exotic
-//! activations — are **rejected** with [`Error::UnsupportedFeature`] (or
-//! [`Error::UnsupportedActivation`]) rather than silently mis-run.
+//! ```no_run
+//! use nam_rs::{Model, NamModel};
 //!
-//! **Sample rate.** A `.nam` is captured at a specific rate
-//! ([`NamModel::expected_sample_rate`], 48 kHz when the file does not say). `nam-rs`
-//! does *not* resample — you must feed the model audio at that rate, or resample in
-//! your host first. A mismatched rate produces silently wrong output, because the
-//! model's dilations and recurrence are defined in samples, not seconds.
+//! // Off the audio thread: parsing and construction allocate.
+//! let file = NamModel::from_file("twin_reverb.nam")?;
+//! let mut model = Model::from_nam(&file)?;
 //!
-//! **Processing boundary.** `nam-rs` runs only the model's forward pass (plus its
-//! `head_scale`). The reference NAM plugin additionally applies a DC blocker
-//! (high-pass) and, optionally, loudness normalization on the output — those are the
-//! host's responsibility, not the model's, so they live in your audio graph, not here.
-//! The calibration accessors ([`NamModel::loudness`] etc.) give you the numbers to do
-//! that gain-staging yourself.
+//! // Settle the state against silence so the first real block is clean.
+//! let mut warmup = vec![0.0_f32; model.receptive_field()];
+//! model.process_buffer(&mut warmup);
 //!
-//! **Metadata.** [`NamModel::metadata_typed`] parses the file's `metadata` block into
-//! a [`Metadata`] struct — name, who captured it, gear make/model/type, tone type,
-//! trainer, export date, loudness and calibration levels — everything a model browser
-//! shows and nothing the forward pass uses. See [`Metadata`] for the full field list;
-//! all fields are optional and parsed leniently, and the unparsed block remains on
-//! [`NamModel::metadata`]. One derived helper, [`Metadata::includes_cab`], answers the
-//! question that changes a signal chain: whether the capture already contains a
-//! speaker cabinet, and so whether an impulse response after it would be a second one.
+//! // On the audio thread: in place, allocation-free. State carries across calls,
+//! // so block-wise output matches one whole-buffer call.
+//! let mut block = vec![0.0_f32; 512];
+//! model.process_buffer(&mut block);
+//! # Ok::<(), nam_rs::Error>(())
+//! ```
 //!
 //! ## Design contract
 //!
-//! 1. **Parity with the reference.** The forward pass must produce output equal
-//!    (within float tolerance) to the canonical Python/C++ NAM implementations for
-//!    the same `.nam` file and input. This is enforced by `tests/parity.rs`.
-//! 2. **Real-time safety.** The runtime's `process_buffer` (on both [`WaveNet`] and
-//!    [`Lstm`], reached via [`Model`]) performs zero heap allocations, locks, or
-//!    system calls. All scratch buffers are pre-allocated at construction. This is
-//!    enforced by `tests/rt_safety.rs`.
+//! 1. **Parity.** The forward pass produces output within `1e-5` per sample of the
+//!    canonical Python and C++ implementations, for the same `.nam` file and input.
+//!    Enforced by `tests/parity.rs` against reference-generated fixtures.
+//! 2. **Real-time safety.** [`Model::process_buffer`] performs no heap allocation, no
+//!    locking and no system calls, on every architecture. All scratch buffers are
+//!    allocated in [`Model::from_nam`]. Enforced by `tests/rt_safety.rs`.
 //!
-//! ## Example
+//! ## Architectures
+//!
+//! [`Model`] dispatches on the architecture the file declares, so you never branch on
+//! it yourself:
+//!
+//! - **WaveNet** — a dilated-convolution stack.
+//! - **LSTM** — recurrent, evaluated one sample at a time.
+//! - **SlimmableContainer** — a multiplexer over complete standalone submodels, each
+//!   itself a WaveNet or an LSTM.
+//!
+//! A `SlimmableContainer` carries a width dial as a CPU/quality trade-off. Each
+//! submodel keeps its own state, so switching mid-stream leaves the newly-selected
+//! submodel to warm up from wherever it last left off. Switching is real-time-safe: it
+//! is a single index write, so it is safe to call from the audio thread.
+//!
+//! ```no_run
+//! # use nam_rs::{Model, NamModel};
+//! # let file = NamModel::from_file("slimmable.nam")?;
+//! let mut model = Model::from_nam(&file)?;
+//!
+//! if let Some(slim) = model.as_slimmable_mut() {
+//!     // Round down to the nearest breakpoint at or below half width.
+//!     slim.set_slim_size(0.5);
+//!     assert!(slim.active_index() < slim.len());
+//!
+//!     // Or address a submodel directly, cheapest first.
+//!     slim.select(0);
+//! }
+//! # Ok::<(), nam_rs::Error>(())
+//! ```
+//!
+//! ## A2 feature support
+//!
+//! "A2" is NAM's second-generation architecture family. An A2 file may be a single
+//! WaveNet using the newer feature set, or a `SlimmableContainer` holding several
+//! submodels; the file declares which.
+//!
+//! Supported:
+//!
+//! - FiLM conditioning
+//! - Gating
+//! - Bottleneck and grouped convolutions
+//! - Per-array heads, including multi-tap conv heads
+//! - The optional post-stack head
+//! - `condition_dsp` — a nested model whose output replaces the conditioning fed to
+//!   every array, multi-channel output included
+//!
+//! Rejected at load, with [`Error::UnsupportedFeature`] or
+//! [`Error::UnsupportedActivation`]:
+//!
+//! - Multi-channel input (`in_channels != 1`)
+//! - A post-stack head with `out_channels != 1`
+//! - Mixed gating modes within one layer array
+//! - Activations outside the implemented set
+//!
+//! ## Warmup and state
+//!
+//! A WaveNet's first [`Model::receptive_field`] samples are a startup transient, while
+//! the dilated stack fills against zero history. This crate does not settle that for
+//! you at load time — NAM Core does, inside its factory — so feed the model that many
+//! silent samples first if you need the first real block to be clean, as the
+//! [Quickstart](#quickstart) does.
+//!
+//! LSTM models begin from the initial hidden and cell state stored in the file, which
+//! the trainer exports already settled against silence. They have no transient, and
+//! [`Model::receptive_field`] is `0` for them.
+//!
+//! [`Model::reset`] returns a model to that same starting state.
+//!
+//! ## Sample rate
+//!
+//! A `.nam` is captured at a specific rate ([`Model::expected_sample_rate`], 48 kHz
+//! when the file does not say). `nam-rs` does *not* resample — feed the model audio at
+//! that rate, or resample in your host first. A mismatched rate produces silently
+//! wrong output, because the model's dilations and recurrence are defined in samples,
+//! not in seconds.
+//!
+//! ## Processing boundary
+//!
+//! `nam-rs` runs the model's forward pass and nothing else. The reference NAM plugin
+//! additionally applies a DC blocker (high-pass) and, optionally, loudness
+//! normalization on the output; those belong to your audio graph rather than to the
+//! model. [`Model::loudness`], [`Model::input_level_dbu`] and
+//! [`Model::output_level_dbu`] give you the calibration numbers to do that
+//! gain-staging yourself.
+//!
+//! ## Metadata
+//!
+//! [`NamModel::metadata_typed`] parses the file's `metadata` block into a [`Metadata`]
+//! struct — name, who captured it, gear make/model/type, tone type, trainer, export
+//! date, loudness and calibration levels. It is descriptive only: everything a model
+//! browser shows, and nothing the forward pass uses. Every field is optional and
+//! parsed leniently, so one malformed entry never costs you the others, and the
+//! unparsed block remains on [`NamModel::metadata`].
+//!
+//! One derived helper, [`Metadata::includes_cab`], answers the question that changes a
+//! signal chain: whether the capture already contains a speaker cabinet, and so
+//! whether an impulse response after it would be a second one.
+//!
+//! ## Loading without a file
+//!
+//! [`NamModel::from_json_str`] parses a model you already hold in memory — one just
+//! downloaded, or embedded in your binary — with no filesystem access:
 //!
 //! ```
 //! use nam_rs::{NamModel, Model};
 //!
-//! // From disk you'd use `NamModel::from_file("model.nam")?`.
-//! // Here we use a tiny in-line model for illustration.
+//! // A minimal single-layer WaveNet, inline for illustration.
 //! let json = r#"{
 //!     "version": "0.5.4", "architecture": "WaveNet",
 //!     "config": {
@@ -83,12 +159,11 @@
 //!     "weights": [1.0, 2.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0]
 //! }"#;
 //!
-//! let model = NamModel::from_json_str(json)?;
-//! let mut amp = Model::from_nam(&model)?;   // picks the architecture from the file
+//! let file = NamModel::from_json_str(json)?;
+//! let mut model = Model::from_nam(&file)?;
 //!
-//! // On the audio thread: process in place, no allocation.
 //! let mut buffer = [0.1_f32, 0.2, 0.3, 0.4];
-//! amp.process_buffer(&mut buffer);
+//! model.process_buffer(&mut buffer);
 //! # Ok::<(), nam_rs::Error>(())
 //! ```
 //!
@@ -124,3 +199,9 @@ pub use model::{
 };
 pub use model_runtime::{Model, Slimmable};
 pub use wavenet::WaveNet;
+
+/// Compiles the code blocks in `README.md` as doctests so the README cannot drift
+/// out of sync with the API. `cfg(doctest)` keeps it out of the rendered docs.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

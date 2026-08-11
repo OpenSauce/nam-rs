@@ -7,24 +7,10 @@
 
 Pure-Rust, real-time-safe inference for [Neural Amp Modeler](https://www.neuralampmodeler.com/) (NAM) `.nam` models.
 
-`nam-rs` loads a `.nam` model file and runs its neural-network forward pass — a whole
-buffer at a time (WaveNet uses a cache-friendly block kernel) or one sample at a time —
-with **no heap allocation on the audio thread**, suitable for use inside a JACK
-callback, a VST3/CLAP `process()`, or any real-time audio graph.
-
-**WaveNet**, **LSTM**, and **SlimmableContainer** (NAM "A2") models all load through
-one entry point, `Model::from_nam`, which dispatches on the file's declared
-architecture.
-
-## Design contract
-
-1. **Parity with the reference.** Output must match the canonical Python/C++ NAM
-   implementations within `1e-5` per sample for the same model and input. Enforced by
-   `tests/parity.rs` against reference-generated fixtures.
-2. **Real-time safety.** `process_buffer` (every architecture, reached via `Model`)
-   performs zero heap allocation, locks, or syscalls; all scratch buffers are
-   pre-allocated at construction. Enforced by `tests/rt_safety.rs` via
-   `assert_no_alloc`.
+Loads a `.nam` file and runs its neural-network forward pass with **no heap allocation
+on the audio thread** — suitable for a JACK callback, a VST3/CLAP `process()`, or any
+real-time audio graph. Output matches the reference Python and C++ implementations
+within `1e-5` per sample.
 
 ## Install
 
@@ -36,132 +22,74 @@ MSRV: Rust 1.71.
 
 ## Usage
 
-```rust
+```rust,no_run
 use nam_rs::{Model, NamModel};
 
-// Off the audio thread: load + allocate. `Model::from_nam` dispatches on the
-// model's architecture, so the same code runs WaveNet and LSTM `.nam` files.
-let model = NamModel::from_file("twin_reverb.nam")?;
-let mut amp = Model::from_nam(&model)?;
+fn main() -> Result<(), nam_rs::Error> {
+    // Off the audio thread: parsing and construction allocate.
+    let file = NamModel::from_file("twin_reverb.nam")?;
+    let mut model = Model::from_nam(&file)?;
 
-// On the audio thread: in-place, allocation-free. Call once per audio block;
-// state carries across calls, so block-wise output matches one whole-buffer call.
-let mut audio_buffer = vec![0.0_f32; 512]; // your host's block, filled with input
-amp.process_buffer(&mut audio_buffer);
-```
+    // Settle the model against silence so the first real block is clean.
+    // `receptive_field()` is 0 for LSTM, so this is a no-op there.
+    let mut warmup = vec![0.0_f32; model.receptive_field()];
+    model.process_buffer(&mut warmup);
 
-To smoke-test a model file without writing any code:
-
-```bash
-cargo run --release --example run_model -- path/to/model.nam
-```
-
-(`examples/streaming.rs` shows the block-wise hot-path loop in full.)
-
-For WaveNet models, the first `Model::receptive_field()` output samples are a startup
-transient (the dilated stack filling against zero-history) — the model's inherent
-latency, the same convention NAM Core / NeuralAudio use. LSTM models have no such
-warmup. Call `Model::reset` to return to silence.
-
-**Sample rate.** A `.nam` expects audio at the rate it was captured
-(`NamModel::expected_sample_rate()`, 48 kHz if the file omits it). `nam-rs` does not
-resample: feed the model audio at that rate, or resample in your host first. A
-mismatched rate produces silently wrong output, since the model's dilations and
-recurrence are defined in samples, not seconds.
-
-**Processing boundary.** `nam-rs` runs only the model's forward pass. The reference
-NAM plugin additionally applies a DC blocker (high-pass) and, optionally, loudness
-normalization on the output — those belong to the host's audio graph, not the model.
-The calibration accessors (`NamModel::loudness()` etc.) give you the numbers for that
-gain-staging.
-
-## Metadata
-
-`NamModel::metadata_typed()` parses the file's `metadata` block into a `Metadata`
-struct — everything a model browser needs to show, none of it used by the forward
-pass. Every field is `Option`, since any of them may be absent.
-
-| Field | Type | Meaning |
-|---|---|---|
-| `name` | `Option<String>` | The author's name for the model, often better than the filename |
-| `modeled_by` | `Option<String>` | Who captured it |
-| `gear_make` | `Option<String>` | e.g. `"Marshall"` |
-| `gear_model` | `Option<String>` | e.g. `"JMP-50"` |
-| `gear_type` | `Option<String>` | What was captured, and how much of the chain: `amp`, `pedal`, `amp_cab`, `full-rig`, … |
-| `tone_type` | `Option<String>` | `clean`, `overdrive`, `crunch`, `hi_gain`, `fuzz`, … |
-| `trainer` | `Option<String>` | Which trainer produced the file, e.g. `"TONE3000"` |
-| `date` | `Option<Date>` | Export timestamp (`year`…`second`; ordered chronologically) |
-| `loudness` | `Option<f32>` | How loud the model is against NAM's standardized input, in dBFS RMS — not LUFS, and not perceptual |
-| `input_level_dbu`, `output_level_dbu` | `Option<f32>` | Analog dBu at 0 dBFS — the calibration numbers for gain-staging |
-| `gain` | `Option<f32>` | The trainer's `0.0..=1.0` estimate of how much gain/compression the model has |
-| `training` | `Option<serde_json::Value>` | The trainer's raw training record, left untyped |
-
-Call `metadata_typed()` once and keep the struct: the single-field shortcuts on
-`NamModel` (`loudness()`, `input_level_dbu()`, `output_level_dbu()`) each re-parse the
-raw JSON. All of it is load-time, never the audio thread. The unparsed block stays
-available as `NamModel::metadata` if you need a key we don't type, and parsing is
-per-field lenient — one malformed entry yields `None` for itself instead of discarding
-the whole block.
-
-`gear_type` and `tone_type` are `String`, not enums, because there is no single
-vocabulary: NAM's trainer and TONE3000 use overlapping-but-different sets, TONE3000
-has already deprecated values that exist in files on disk, and real captures write
-values in neither (`"vintage"`, `"T3K-Null"`). An enum would reject those files.
-
-For the one question that actually changes a signal chain — is a speaker cab already
-baked into this capture, so that adding an IR would be a second one? —
-`Metadata::includes_cab()` (also on `NamModel`) classifies `gear_type` across both
-vocabularies, ignoring case, surrounding whitespace, and `-` vs `_`:
-
-```rust
-let model = NamModel::from_file("model.nam")?;
-
-match model.includes_cab() {
-    Some(true) => println!("file says the cab is baked in — a second one would be an IR too many"),
-    Some(false) => println!("file claims no cab — but `amp` is also the do-nothing default"),
-    None => println!("unknown — don't touch the signal chain"),
+    // On the audio thread: in place, allocation-free. State carries across
+    // calls, so block-wise output matches one whole-buffer call.
+    let mut block = vec![0.0_f32; 512];
+    model.process_buffer(&mut block);
+    Ok(())
 }
 ```
 
-It returns `None` rather than guessing at a value it doesn't recognize, and it only
-ever reports what the file claims: `gear_type` is author-supplied and captures do
-mislabel themselves, so treat the answer as a default to offer the user, not a fact to
-reroute audio on silently. The two answers are not equally strong — `Some(true)`
-required someone to actively pick a cab-ish value, while `Some(false)` is mostly
-`"amp"`, which is what you get by leaving the field alone. One of the three real
-captures in this repo's test corpus is a full rig tagged `gear_type: "amp"`.
+See [`examples/`](examples/) — `run_model.rs` checks that a file loads and produces
+sane output, `streaming.rs` is the full block-wise host loop.
+
+## What you need to know
+
+**Sample rate.** A `.nam` expects audio at the rate it was captured
+(`Model::expected_sample_rate()`, 48 kHz if the file omits it). `nam-rs` does not
+resample — feed it audio at that rate, or resample in your host first. A mismatch
+produces silently wrong output, because dilations and recurrence are defined in
+samples, not seconds.
+
+**Warmup.** A WaveNet model's first `Model::receptive_field()` samples are a startup
+transient as the dilated stack fills against zero history — hence the settling step in
+the example above. LSTM models load an already-settled state and need none.
+`Model::reset()` returns to that starting state.
+
+**Levels.** `Model::loudness()`, `input_level_dbu()` and `output_level_dbu()` give the
+calibration numbers for gain-staging. `nam-rs` runs the forward pass only: the DC
+blocker and optional loudness normalization that the reference NAM plugin applies
+belong to your audio graph, not to the model.
 
 ## Supported architectures
 
-- **WaveNet** (A1 and A2 single models) — dilated-conv forward pass, parity-tested.
-- **LSTM** — recurrent forward pass, parity-tested.
-- **SlimmableContainer** (NAM "A2") — a set of complete standalone submodels (any mix
-  of WaveNet/LSTM) with a runtime width dial as a CPU/quality trade-off. Select via
-  `as_slimmable_mut()` → `set_slim_size` or `select`; switching is real-time-safe.
-  See the [crate docs](https://docs.rs/nam-rs) for the selection semantics.
+- **WaveNet** (A1 and A2 single models) — dilated-conv forward pass.
+- **LSTM** — recurrent forward pass.
+- **SlimmableContainer** (A2) — a set of complete standalone submodels with a
+  real-time-safe width dial as a CPU/quality trade-off.
 
-The A2 feature set is covered: FiLM, gating, bottleneck, grouped convs, multi-tap conv
-heads, the optional post-stack head, and `condition_dsp` (a nested model that generates
-the conditioning signal, multi-channel included). A few restrictions remain —
-multi-channel *input*, a post-stack head with more than one output channel, mixed
-gating modes within one array, and unrecognized activations — and these are rejected
-with a descriptive error at load time rather than silently mis-run.
+The A2 feature set is covered, with a few exceptions — see the
+[crate docs](https://docs.rs/nam-rs) for the full list, the selection semantics, and
+the `metadata` block a model browser needs.
 
 ## Performance
 
-Rough numbers from the included Criterion bench (`cargo bench`), standard-size
-fixture models, one x86-64 desktop core, release + LTO:
+From `cargo bench`, standard-size fixture models, one x86-64 desktop core, release +
+LTO:
 
-- Standard WaveNet capture: ≈1.9 µs/sample via `process_buffer` (≈11× real-time at
-  48 kHz). The block path is ~3.5× faster than per-sample, so prefer whole blocks.
-- Standard LSTM capture: ≈1.2 µs/sample (≈17× real-time).
+- WaveNet ≈1.9 µs/sample via `process_buffer` (≈11× real-time at 48 kHz)
+- LSTM ≈1.2 µs/sample (≈17× real-time)
 
-Numbers vary with CPU and model size — run `cargo bench` on your own target.
+The block path is ~3.5× faster than per-sample, so prefer whole blocks. Numbers vary
+with CPU and model size — run `cargo bench` on your own target.
 
 ## Development
 
 ```bash
-cargo test                                  # parser, parity, and RT-safety tests
+cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```

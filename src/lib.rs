@@ -14,26 +14,27 @@
 //! ```no_run
 //! use nam_rs::{Model, NamModel};
 //!
-//! // Off the audio thread: parsing and construction allocate.
+//! // Off the audio thread: parsing, construction and buffers all allocate here.
 //! let file = NamModel::from_file("twin_reverb.nam")?;
 //! let mut model = Model::from_nam(&file)?;
+//! let mut block = vec![0.0_f32; 512];
 //!
 //! // Settle the state against silence so the first real block is clean.
 //! let mut warmup = vec![0.0_f32; model.receptive_field()];
 //! model.process_buffer(&mut warmup);
 //!
-//! // On the audio thread: in place, allocation-free. State carries across calls,
-//! // so block-wise output matches one whole-buffer call.
-//! let mut block = vec![0.0_f32; 512];
+//! // On the audio thread, once per block: in place, no allocation. State carries
+//! // across calls, so block-wise output matches one whole-buffer call.
 //! model.process_buffer(&mut block);
 //! # Ok::<(), nam_rs::Error>(())
 //! ```
 //!
 //! ## Design contract
 //!
-//! 1. **Parity.** The forward pass produces output within `1e-5` per sample of the
-//!    canonical Python and C++ implementations, for the same `.nam` file and input.
-//!    Enforced by `tests/parity.rs` against reference-generated fixtures.
+//! 1. **Parity.** Once past the model's warmup, the forward pass produces output
+//!    within `1e-5` per sample of the canonical Python and C++ implementations, for
+//!    the same `.nam` file and input. Enforced by `tests/parity.rs` against
+//!    reference-generated fixtures.
 //! 2. **Real-time safety.** [`Model::process_buffer`] performs no heap allocation, no
 //!    locking and no system calls, on every architecture. All scratch buffers are
 //!    allocated in [`Model::from_nam`]. Enforced by `tests/rt_safety.rs`.
@@ -46,12 +47,12 @@
 //! - **WaveNet** — a dilated-convolution stack.
 //! - **LSTM** — recurrent, evaluated one sample at a time.
 //! - **SlimmableContainer** — a multiplexer over complete standalone submodels, each
-//!   itself a WaveNet or an LSTM.
+//!   itself a full model.
 //!
 //! A `SlimmableContainer` carries a width dial as a CPU/quality trade-off. Each
 //! submodel keeps its own state, so switching mid-stream leaves the newly-selected
-//! submodel to warm up from wherever it last left off. Switching is real-time-safe: it
-//! is a single index write, so it is safe to call from the audio thread.
+//! submodel to warm up from wherever it last left off. Switching allocates nothing and
+//! takes no locks, so it is safe to call from the audio thread.
 //!
 //! ```no_run
 //! # use nam_rs::{Model, NamModel};
@@ -59,11 +60,12 @@
 //! let mut model = Model::from_nam(&file)?;
 //!
 //! if let Some(slim) = model.as_slimmable_mut() {
-//!     // Round down to the nearest breakpoint at or below half width.
+//!     // Activates the first submodel whose `max_value` exceeds 0.5 — the
+//!     // smallest one that covers the requested width, not the largest below it.
 //!     slim.set_slim_size(0.5);
 //!     assert!(slim.active_index() < slim.len());
 //!
-//!     // Or address a submodel directly, cheapest first.
+//!     // Or address a submodel by index; out of range clamps to the last one.
 //!     slim.select(0);
 //! }
 //! # Ok::<(), nam_rs::Error>(())
@@ -93,6 +95,11 @@
 //! - Mixed gating modes within one layer array
 //! - Activations outside the implemented set
 //!
+//! Structurally inconsistent files are rejected at load too, rather than surfacing
+//! later: a conditioning width that disagrees with the `condition_dsp` output, grouped
+//! convolutions whose channel counts are not divisible by the group count, a container
+//! with no submodels, and similar.
+//!
 //! ## Warmup and state
 //!
 //! A WaveNet's first [`Model::receptive_field`] samples are a startup transient, while
@@ -105,7 +112,9 @@
 //! the trainer exports already settled against silence. They have no transient, and
 //! [`Model::receptive_field`] is `0` for them.
 //!
-//! [`Model::reset`] returns a model to that same starting state.
+//! [`Model::reset`] clears a model's state back to that starting point. For a
+//! `SlimmableContainer` it resets every submodel's state but leaves the active
+//! selection where it is.
 //!
 //! ## Sample rate
 //!

@@ -13,9 +13,8 @@ _Avoid_: Model file, profile, capture file
 
 **Engine**:
 The loaded, stateful thing that turns input samples into output samples. Constructed from a
-parsed file, allocates once, then runs on the audio thread. Currently the type is named
-`Model`; it is renamed to `Engine` in 0.5.0, because "model" already names the file and
-because NAM Core calls its equivalent `DSP` rather than a model.
+parsed file, allocates once, then runs on the audio thread. The type is currently named
+`Model`; a rename to `Engine` is agreed, since "model" already names the file.
 _Avoid_: Runtime (collides with async runtimes), inference object
 
 **Architecture**:
@@ -53,8 +52,8 @@ values are never hand-authored.
 ## Signal
 
 **Receptive field**:
-How many past samples the output depends on. WaveNet's is set by its dilations; an LSTM's
-is effectively none.
+How many past samples the output depends on. A WaveNet's follows from its dilations and
+kernel sizes; an LSTM's is `0`.
 
 **Warmup**:
 The startup transient while an engine's state fills from nothing. A property of the engine's
@@ -62,7 +61,7 @@ history, not of the audio.
 
 **Prewarm**:
 Deliberately settling an engine against silence before real audio, so the first block is
-clean. NAM Core does this when it loads a model; this crate leaves it to the caller.
+clean. Distinct from Warmup, which is the transient that prewarming removes.
 
 **Conditioning**:
 The side-chain signal fed to a WaveNet's layer arrays alongside the audio. Usually the input
@@ -75,7 +74,7 @@ _Avoid_: Chunk, frame, window
 
 **Real-time safe**:
 Performs no heap allocation, no locking, and no system calls. A claim about the audio
-thread, enforced by tests, not a claim about speed.
+thread, not a claim about speed.
 
 ## Descriptive metadata
 
@@ -85,9 +84,8 @@ forward pass. Every field is optional and authored by a human, so treat it as a 
 than a fact.
 
 **Loudness**:
-How loud a model is against NAM's standardized input, as RMS dBFS. **Not LUFS** — the
-trainer applies no K-weighting and no gating, and neither NAM's Python package nor NAM Core
-mentions LUFS anywhere.
+How loud a model is against NAM's standardized input, as RMS dBFS. **Not LUFS**: the
+trainer applies no K-weighting and no gating.
 _Avoid_: LUFS, perceived loudness
 
 **Calibration levels**:

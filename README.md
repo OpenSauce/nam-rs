@@ -10,7 +10,7 @@ Pure-Rust, real-time-safe inference for [Neural Amp Modeler](https://www.neurala
 Loads a `.nam` file and runs its neural-network forward pass with **no heap allocation
 on the audio thread** — suitable for a JACK callback, a VST3/CLAP `process()`, or any
 real-time audio graph. Output matches the reference Python and C++ implementations
-within `1e-5` per sample.
+within `1e-5` per sample, once past the model's warmup.
 
 ## Install
 
@@ -26,18 +26,18 @@ MSRV: Rust 1.71.
 use nam_rs::{Model, NamModel};
 
 fn main() -> Result<(), nam_rs::Error> {
-    // Off the audio thread: parsing and construction allocate.
+    // Off the audio thread: parsing, construction and buffers all allocate here.
     let file = NamModel::from_file("twin_reverb.nam")?;
     let mut model = Model::from_nam(&file)?;
+    let mut block = vec![0.0_f32; 512];
 
     // Settle the model against silence so the first real block is clean.
     // `receptive_field()` is 0 for LSTM, so this is a no-op there.
     let mut warmup = vec![0.0_f32; model.receptive_field()];
     model.process_buffer(&mut warmup);
 
-    // On the audio thread: in place, allocation-free. State carries across
-    // calls, so block-wise output matches one whole-buffer call.
-    let mut block = vec![0.0_f32; 512];
+    // On the audio thread, once per block: in place, no allocation. State
+    // carries across calls, so block-wise output matches one whole-buffer call.
     model.process_buffer(&mut block);
     Ok(())
 }
@@ -57,7 +57,7 @@ samples, not seconds.
 **Warmup.** A WaveNet model's first `Model::receptive_field()` samples are a startup
 transient as the dilated stack fills against zero history — hence the settling step in
 the example above. LSTM models load an already-settled state and need none.
-`Model::reset()` returns to that starting state.
+`Model::reset()` clears a model's state back to that starting point.
 
 **Levels.** `Model::loudness()`, `input_level_dbu()` and `output_level_dbu()` give the
 calibration numbers for gain-staging. `nam-rs` runs the forward pass only: the DC
@@ -72,19 +72,20 @@ belong to your audio graph, not to the model.
   real-time-safe width dial as a CPU/quality trade-off.
 
 The A2 feature set is covered, with a few exceptions — see the
-[crate docs](https://docs.rs/nam-rs) for the full list, the selection semantics, and
-the `metadata` block a model browser needs.
+[crate docs](https://docs.rs/nam-rs) for what is and isn't supported, the selection
+semantics, and the `metadata` block a model browser needs.
 
 ## Performance
 
 From `cargo bench`, standard-size fixture models, one x86-64 desktop core, release +
 LTO:
 
-- WaveNet ≈1.9 µs/sample via `process_buffer` (≈11× real-time at 48 kHz)
-- LSTM ≈1.2 µs/sample (≈17× real-time)
+- WaveNet ≈1.9 µs/sample via `process_buffer` (≈11× real-time at 48 kHz) — around
+  3.5× faster than the per-sample path, so prefer whole blocks
+- LSTM ≈1.2 µs/sample (≈17× real-time). It is recurrent, so the block path is no
+  faster; `process_buffer` is a loop over `process_sample`
 
-The block path is ~3.5× faster than per-sample, so prefer whole blocks. Numbers vary
-with CPU and model size — run `cargo bench` on your own target.
+Numbers vary with CPU and model size — run `cargo bench` on your own target.
 
 ## Development
 

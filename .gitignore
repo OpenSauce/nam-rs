@@ -23,9 +23,10 @@ __pycache__/
 # Example nam files for testing (only the .nam captures; README stays tracked).
 tests/examples/*.nam
 
-# Working/planning docs are local-only. Real project docs (README files) stay tracked.
+# Working/planning docs are local-only. Real project docs stay tracked.
 *.md
 !README.md
+!CONTEXT.md
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

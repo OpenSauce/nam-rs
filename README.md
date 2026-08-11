@@ -32,7 +32,7 @@ architecture.
 cargo add nam-rs
 ```
 
-MSRV: Rust 1.74. No C/C++ toolchain or native dependencies needed.
+MSRV: Rust 1.71. No C/C++ toolchain or native dependencies needed.
 
 ## Usage
 

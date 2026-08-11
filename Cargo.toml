@@ -2,7 +2,7 @@
 name = "nam-rs"
 version = "0.4.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.71"
 license = "MIT"
 description = "Pure-Rust, real-time-safe inference for Neural Amp Modeler (NAM) .nam models"
 repository = "https://github.com/OpenSauce/nam-rs"

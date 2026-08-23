@@ -43,6 +43,16 @@ impl Lstm {
             }
         };
 
+        // process_sample only feeds a mono sample (`[x]`); multi-dim / "catnet"
+        // inputs would panic on the audio thread. Reject at construction, same
+        // as WaveNet rejects `in_channels != 1`.
+        if cfg.input_size != 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "lstm input_size != 1 (got {})",
+                cfg.input_size
+            )));
+        }
+
         let expected = expected_weight_count(cfg)?;
         if expected != model.weights.len() {
             return Err(Error::WeightCountMismatch {
@@ -201,7 +211,8 @@ mod tests {
     /// what `Lstm::new` consumes, across (input_size, hidden_size, num_layers) shapes.
     #[test]
     fn weight_count_matches_consumption_across_shapes() {
-        for (input_size, hidden_size, num_layers) in [(1, 1, 1), (1, 8, 1), (1, 4, 2), (2, 3, 3)] {
+        // Only mono input_size=1 is constructible; multi-dim is rejected separately.
+        for (input_size, hidden_size, num_layers) in [(1, 1, 1), (1, 8, 1), (1, 4, 2)] {
             let cfg = LstmConfig {
                 input_size,
                 hidden_size,
@@ -225,6 +236,37 @@ mod tests {
                 Lstm::new(&mk_model(n + 1)),
                 Err(crate::Error::WeightCountMismatch { .. })
             ));
+        }
+        // Formula still defined for input_size>1 (weight layout), but construction refuses.
+        let cfg = LstmConfig {
+            input_size: 2,
+            hidden_size: 3,
+            num_layers: 3,
+        };
+        assert!(expected_weight_count(&cfg).is_ok());
+    }
+
+    #[test]
+    fn input_size_gt_one_is_unsupported_not_panic() {
+        let cfg = LstmConfig {
+            input_size: 2,
+            hidden_size: 1,
+            num_layers: 1,
+        };
+        let n = expected_weight_count(&cfg).unwrap();
+        let model = NamModel {
+            version: "0".into(),
+            architecture: "LSTM".into(),
+            config: ModelConfig::Lstm(cfg),
+            weights: vec![0.0; n],
+            sample_rate: None,
+            metadata: None,
+        };
+        match Lstm::new(&model) {
+            Err(crate::Error::UnsupportedFeature(msg)) => {
+                assert!(msg.contains("input_size"), "msg={msg}");
+            }
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
         }
     }
 

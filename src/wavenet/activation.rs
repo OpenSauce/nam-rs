@@ -13,6 +13,10 @@ pub(super) enum Activation {
     Sigmoid,
     /// LeakyReLU with the given negative slope (`x > 0 ? x : slope*x`).
     LeakyRelu(f32),
+    Hardtanh,
+    Softsign,
+    SiLU, // aka swish
+    Hardswish,
 }
 
 impl Activation {
@@ -27,6 +31,10 @@ impl Activation {
                 "ReLU" => Ok(Self::Relu),
                 "Sigmoid" => Ok(Self::Sigmoid),
                 "LeakyReLU" => Ok(Self::LeakyRelu(negative_slope.unwrap_or(0.01))),
+                "Hardtanh" => Ok(Self::Hardtanh),
+                "Softsign" => Ok(Self::Softsign),
+                "SiLU" => Ok(Self::SiLU),
+                "Hardswish" => Ok(Self::Hardswish),
                 other => Err(Error::UnsupportedActivation(other.to_string())),
             },
             ActivationSpec::Unsupported(v) => {
@@ -48,6 +56,10 @@ impl Activation {
                     slope * x
                 }
             }
+            Self::Hardtanh => hard_tanh(x),
+            Self::Softsign => softsign(x),
+            Self::SiLU => swish(x),
+            Self::Hardswish => hardswish(x),
         }
     }
 }
@@ -55,6 +67,39 @@ impl Activation {
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+#[inline]
+fn hard_tanh(x: f32) -> f32 {
+    let t = if x < -1.0 { -1.0 } else { x };
+    if t > 1.0 {
+        1.0
+    } else {
+        t
+    }
+}
+
+#[inline]
+fn softsign(x: f32) -> f32 {
+    x / (1.0 + x.abs())
+}
+
+#[inline]
+fn swish(x: f32) -> f32 {
+    x * sigmoid(x)
+}
+
+#[inline]
+fn hardswish(x: f32) -> f32 {
+    let t = x + 3.0;
+    let clamped = if t < 0.0 {
+        0.0
+    } else if t > 6.0 {
+        6.0
+    } else {
+        t
+    };
+    x * clamped * (1.0 / 6.0)
 }
 
 #[cfg(test)]

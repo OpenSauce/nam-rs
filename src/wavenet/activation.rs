@@ -52,8 +52,26 @@ impl Activation {
     }
 
     /// [`Self::apply`] over a slice. The match is outside the loop, so the
-    /// loop vectorizes.
+    /// loop vectorizes; on an x86-64 CPU with AVX2 it runs the AVX2 build
+    /// (see `avx2_available`), which gives the same bits.
     pub(super) fn apply_slice(self, xs: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if super::avx2_available() {
+            // SAFETY: the CPU reports AVX2.
+            unsafe { self.apply_slice_avx2(xs) };
+            return;
+        }
+        self.apply_slice_with(xs);
+    }
+
+    /// [`Self::apply_slice`] compiled with AVX2 enabled.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn apply_slice_avx2(self, xs: &mut [f32]) {
         self.apply_slice_with(xs);
     }
 
@@ -224,6 +242,27 @@ mod tests {
         // Small inputs keep their relative precision.
         for x in [1e-7_f32, 1e-5, 1e-3] {
             assert!((tanh(x) / x - 1.0).abs() < 1e-5, "relative at {x}");
+        }
+    }
+
+    /// The AVX2 build gives the portable bits, including for the exp-based
+    /// functions and inputs past their clamps.
+    #[test]
+    fn apply_slice_builds_agree_bit_for_bit() {
+        let xs: Vec<f32> = (-4000..=4000).map(|i| i as f32 * 0.01).collect();
+        for act in [
+            Activation::Tanh,
+            Activation::Relu,
+            Activation::Sigmoid,
+            Activation::LeakyRelu(0.1),
+        ] {
+            let mut portable = xs.clone();
+            act.apply_slice_with(&mut portable);
+            let mut dispatched = xs.clone();
+            act.apply_slice(&mut dispatched);
+            for (i, (a, b)) in portable.iter().zip(&dispatched).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{act:?} at {}", xs[i]);
+            }
         }
     }
 

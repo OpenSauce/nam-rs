@@ -24,6 +24,8 @@ use crate::reader::Reader;
 
 mod activation;
 pub(crate) use activation::{sigmoid, tanh};
+#[cfg(target_arch = "x86_64")]
+pub(crate) use conv::avx2_available;
 mod array;
 mod conv;
 mod film;

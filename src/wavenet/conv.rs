@@ -53,20 +53,38 @@ pub(super) struct Conv1d {
     stride: usize,
     /// The column the next input goes to. Always `>= hist_len`.
     w: usize,
+    /// Run the AVX2 build of the block kernel. Set from [`avx2_available`]
+    /// when the conv is built; tests clear it to compare the two builds. The
+    /// kernel checks the CPU again before it trusts it.
+    #[cfg(target_arch = "x86_64")]
+    avx2: bool,
 }
 
 /// Output channels one tile of the block kernel computes at once.
 const TILE_OUT: usize = 4;
 /// Time steps one tile of the block kernel computes at once: two SSE
-/// registers per output. On aarch64, NEON has 32 vector registers where SSE
-/// has 16, so the portable tile there is four registers per output: each
-/// weight loaded and each step of index arithmetic serves twice the time
-/// steps. The summation order does not depend on the width, so every width
-/// gives the same bits.
+/// registers per output in the portable build, two AVX registers in the AVX2
+/// build. On aarch64, NEON has 32 vector registers where SSE has 16, so the
+/// portable tile there is four registers per output: each weight loaded and
+/// each step of index arithmetic serves twice the time steps. The summation
+/// order does not depend on the width, so every width gives the same bits.
 #[cfg(not(target_arch = "aarch64"))]
 const TILE_T: usize = 8;
 #[cfg(target_arch = "aarch64")]
 const TILE_T: usize = 16;
+#[cfg(target_arch = "x86_64")]
+const TILE_T_AVX2: usize = 16;
+
+/// Whether this CPU has AVX2, checked at run time so one binary runs on
+/// every x86-64 CPU. The AVX2 builds of the hot loops enable AVX2 only, not
+/// FMA: a fused multiply-add rounds once where the portable code rounds twice,
+/// so FMA would change the output. Without it both builds do the same
+/// operations in the same order and agree bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn avx2_available() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
 
 impl Conv1d {
     /// Dense (ungrouped) convolution — `groups = 1`.
@@ -130,6 +148,8 @@ impl Conv1d {
             hist: vec![0.0; in_ch * stride],
             stride,
             w: hist_len,
+            #[cfg(target_arch = "x86_64")]
+            avx2: avx2_available(),
         }
     }
 
@@ -237,7 +257,24 @@ impl Conv1d {
     /// Every output of a block whose first column sits at `w` in rows of
     /// length `s` of `src`.
     fn tiles(&self, src: &[f32], s: usize, w: usize, block_out: &mut [f32], n: usize) {
+        #[cfg(target_arch = "x86_64")]
+        if self.avx2 && avx2_available() {
+            // SAFETY: the CPU reports AVX2.
+            unsafe { self.tiles_avx2(src, s, w, block_out, n) };
+            return;
+        }
         self.tiles_with::<TILE_T>(src, s, w, block_out, n);
+    }
+
+    /// [`Self::tiles`] compiled with AVX2 enabled.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn tiles_avx2(&self, src: &[f32], s: usize, w: usize, block_out: &mut [f32], n: usize) {
+        self.tiles_with::<TILE_T_AVX2>(src, s, w, block_out, n);
     }
 
     #[inline(always)]
@@ -611,9 +648,72 @@ mod tests {
         }
     }
 
+    /// The AVX2 build of the block kernel gives the portable bits: dense and
+    /// grouped convs, kernels up to 15, a 1x1 conv, and blocks that end in a
+    /// partial tile. Skipped on a CPU without AVX2, where only one build runs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_and_portable_kernels_agree_bit_for_bit() {
+        if !avx2_available() {
+            return;
+        }
+        // (in_ch, out_ch, kernel, dilation, groups)
+        let cases = [
+            (8_usize, 8_usize, 6_usize, 239_usize, 1_usize),
+            (16, 8, 3, 512, 1),
+            (8, 8, 15, 13, 1),
+            (8, 1, 16, 1, 1),
+            (6, 4, 2, 3, 2),
+            (4, 4, 3, 7, 4),
+            (5, 7, 1, 1, 1),
+        ];
+        for (in_ch, out_ch, kernel, dilation, groups) in cases {
+            let wlen = out_ch * in_ch * kernel / groups;
+            let w: Vec<f32> = (0..wlen)
+                .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.07)
+                .collect();
+            let bias: Vec<f32> = (0..out_ch).map(|o| o as f32 * 0.1 - 0.3).collect();
+            let mut portable = Conv1d::new_grouped(
+                in_ch,
+                out_ch,
+                kernel,
+                dilation,
+                groups,
+                w.clone(),
+                Some(bias.clone()),
+            );
+            portable.avx2 = false;
+            let mut avx2 =
+                Conv1d::new_grouped(in_ch, out_ch, kernel, dilation, groups, w, Some(bias));
+            avx2.avx2 = true;
+            let mut t0 = 0;
+            for &len in [MAX_BLOCK, 37, 1, 255, MAX_BLOCK, 3, 128]
+                .iter()
+                .cycle()
+                .take(14)
+            {
+                let bin: Vec<f32> = (0..in_ch * len)
+                    .map(|i| ((t0 * in_ch + i) as f32 * 0.011).sin())
+                    .collect();
+                let mut a = vec![0.0; out_ch * len];
+                let mut b = vec![0.0; out_ch * len];
+                portable.process_block(&bin, &mut a, len);
+                avx2.process_block(&bin, &mut b, len);
+                for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "{in_ch}x{out_ch} k{kernel} d{dilation} g{groups} len{len} idx{i}"
+                    );
+                }
+                t0 += len;
+            }
+        }
+    }
+
     /// Every tile width gives the same bits, so the width a build picks (8,
-    /// or 16 on aarch64) is a speed choice only. Checked directly on the
-    /// kernel, on every architecture.
+    /// or 16 on aarch64 and in the AVX2 build) is a speed choice only.
+    /// Checked directly on the kernel, on every architecture.
     #[test]
     fn tile_width_does_not_change_the_bits() {
         // (in_ch, out_ch, kernel, dilation, groups)

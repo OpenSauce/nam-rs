@@ -1,4 +1,4 @@
-//! Causal, dilated 1-D convolution with a pre-allocated ring buffer.
+//! Causal, dilated 1-D convolution with a pre-allocated history.
 //!
 //! This is the one stateful primitive in the WaveNet forward pass. Weight layout
 //! matches NAM's `export_weights` (PyTorch `Conv1d`): `[out_ch][in_ch][kernel]`
@@ -8,20 +8,27 @@
 //! matrix multiply; the same type is reused for the rechannel / input-mixer /
 //! 1x1 / head-rechannel layers.
 //!
-//! Two equivalent entry points share one streaming history (the ring): the
-//! per-sample [`Conv1d::process_sample`], and the block [`Conv1d::process_block`],
-//! which stages `[history ++ block]` into a contiguous planar scratch so the hot
-//! loop runs sample-inner over a stationary weight row (cache-friendly, and the
-//! compiler can autovectorize it). The block path is the lever behind
-//! `WaveNet::process_buffer`.
+//! Two equivalent entry points share one streaming history: the per-sample
+//! [`Conv1d::process_sample`], and the block [`Conv1d::process_block`]. The
+//! history is planar and linear, so the block path appends the block and reads
+//! every tap straight out of it. Each output sums its bias and then its
+//! products in the per-sample order, so the two paths agree bit for bit. A
+//! 1x1 convolution has no history and reads the block in place.
 
 /// Largest block the planar kernel processes in one call; `process_buffer` chunks
 /// longer inputs to this. Scratch is sized to it up front (off the audio thread).
 pub(super) const MAX_BLOCK: usize = 1024;
 
-/// A dilated causal convolution that processes one sample at a time, keeping the
-/// receptive-field history in a pre-allocated ring buffer (no allocation on the
-/// audio thread).
+/// A dilated causal convolution with a pre-allocated planar history (no
+/// allocation on the audio thread).
+///
+/// The history is one linear row per input channel, `[in_ch][stride]`. The
+/// newest `hist_len` columns sit just before the write cursor `w`; a block is
+/// written at `w` and the taps read straight out of the row. When a block would
+/// run past the end of the row, the last `hist_len` columns are moved to the
+/// front first, so that copy happens once per `stride - hist_len` samples
+/// instead of every block. This is the scheme of NAM Core's `RingBuffer`
+/// ("rewind").
 #[derive(Debug, Clone)]
 pub(super) struct Conv1d {
     in_ch: usize,
@@ -35,16 +42,14 @@ pub(super) struct Conv1d {
     /// `[out_ch][in_ch][kernel]`, row-major.
     weights: Vec<f32>,
     bias: Option<Vec<f32>>,
-    /// Ring of the most recent `ring_len` input columns, `in_ch` values each.
-    ring: Vec<f32>,
-    ring_len: usize,
-    /// Index of the column written most recently.
-    pos: usize,
-    /// Planar `[in_ch][hist_len + MAX_BLOCK]` staging for the block path, where
-    /// `hist_len = ring_len - 1`. Pre-allocated; the inner loop reads it contiguously
-    /// over time. `staged_stride` is the per-channel row length.
-    staged: Vec<f32>,
-    staged_stride: usize,
+    /// `(kernel - 1) * dilation`: how many past columns a tap can reach.
+    hist_len: usize,
+    /// Planar `[in_ch][stride]` history and block staging. Empty for a 1x1
+    /// convolution, which keeps no history.
+    hist: Vec<f32>,
+    stride: usize,
+    /// The column the next input goes to. Always `>= hist_len`.
+    w: usize,
 }
 
 impl Conv1d {
@@ -84,8 +89,18 @@ impl Conv1d {
         if let Some(b) = &bias {
             assert_eq!(b.len(), out_ch, "conv bias count");
         }
-        let ring_len = (kernel - 1) * dilation + 1;
-        let staged_stride = (ring_len - 1) + MAX_BLOCK;
+        let hist_len = (kernel - 1)
+            .checked_mul(dilation)
+            .expect("conv history overflows usize");
+        // At least a full block past the history, and at least the history
+        // again, so the move to the front copies no more than it frees.
+        let stride = if hist_len == 0 {
+            0
+        } else {
+            hist_len
+                .checked_add(hist_len.max(MAX_BLOCK))
+                .expect("conv history overflows usize")
+        };
         Self {
             in_ch,
             out_ch,
@@ -95,11 +110,10 @@ impl Conv1d {
             in_per_group: in_ch / groups,
             weights,
             bias,
-            ring: vec![0.0; in_ch * ring_len],
-            ring_len,
-            pos: ring_len - 1,
-            staged: vec![0.0; in_ch * staged_stride],
-            staged_stride,
+            hist_len,
+            hist: vec![0.0; in_ch * stride],
+            stride,
+            w: hist_len,
         }
     }
 
@@ -117,17 +131,42 @@ impl Conv1d {
         self.kernel
     }
 
+    /// Make room for `n` new columns at the write cursor.
+    #[inline]
+    fn make_room(&mut self, n: usize) {
+        if self.hist_len == 0 || self.w + n <= self.stride {
+            return;
+        }
+        let (h, s, w) = (self.hist_len, self.stride, self.w);
+        for j in 0..self.in_ch {
+            let row = j * s;
+            self.hist.copy_within(row + w - h..row + w, row);
+        }
+        self.w = h;
+    }
+
     /// Push one input column (`in_ch` values) and write the convolution result
     /// (`out_ch` values) into `out`.
     pub(super) fn process_sample(&mut self, input: &[f32], out: &mut [f32]) {
         debug_assert_eq!(input.len(), self.in_ch);
         debug_assert_eq!(out.len(), self.out_ch);
 
-        // Advance and store the newest column.
-        self.pos = (self.pos + 1) % self.ring_len;
-        let base = self.pos * self.in_ch;
-        self.ring[base..base + self.in_ch].copy_from_slice(input);
+        if self.hist_len == 0 {
+            self.sample_from(input, 1, 0, out);
+            return;
+        }
+        self.make_room(1);
+        let (s, w) = (self.stride, self.w);
+        for (j, &x) in input.iter().enumerate() {
+            self.hist[j * s + w] = x;
+        }
+        self.sample_from(&self.hist, s, w, out);
+        self.w += 1;
+    }
 
+    /// One output column from the column at `w` in rows of length `s` of `src`.
+    #[inline]
+    fn sample_from(&self, src: &[f32], s: usize, w: usize, out: &mut [f32]) {
         let opg = self.out_per_group;
         let ipg = self.in_per_group;
         for o in 0..self.out_ch {
@@ -139,12 +178,10 @@ impl Conv1d {
             let wo = o * ipg * self.kernel;
             for k in 0..self.kernel {
                 let back = (self.kernel - 1 - k) * self.dilation;
-                let col = (self.pos + self.ring_len - back) % self.ring_len;
-                let rbase = col * self.in_ch;
                 for jl in 0..ipg {
                     // jl is the local (in-group) input index; jl*kernel+k walks taps.
-                    acc +=
-                        self.weights[wo + jl * self.kernel + k] * self.ring[rbase + in_base + jl];
+                    acc += self.weights[wo + jl * self.kernel + k]
+                        * src[(in_base + jl) * s + w - back];
                 }
             }
             out[o] = acc;
@@ -155,7 +192,8 @@ impl Conv1d {
     /// `in_ch * n` laid out `[channel * n + t]`, and `block_out` is `out_ch * n` the
     /// same way. Bit-for-bit equivalent to `n` calls of [`Self::process_sample`] and
     /// leaves the streaming history in the identical state, so the two entry points
-    /// are freely interchangeable across calls.
+    /// are freely interchangeable across calls: every output sums its bias and then
+    /// its products in the same order as the per-sample path.
     ///
     /// `n` must be `<= MAX_BLOCK`; callers chunk longer runs. Allocation-free.
     pub(super) fn process_block(&mut self, block_in: &[f32], block_out: &mut [f32], n: usize) {
@@ -166,23 +204,25 @@ impl Conv1d {
             return;
         }
 
-        let hist_len = self.ring_len - 1;
-        let s = self.staged_stride;
-
-        // Stage the history tail (chronological: oldest at time 0, newest at
-        // hist_len-1) followed by this block, one contiguous row per input channel.
-        for j in 0..self.in_ch {
-            let row = j * s;
-            for h in 0..hist_len {
-                let col = (self.pos + self.ring_len - (hist_len - 1) + h) % self.ring_len;
-                self.staged[row + h] = self.ring[col * self.in_ch + j];
-            }
-            let src = &block_in[j * n..j * n + n];
-            self.staged[row + hist_len..row + hist_len + n].copy_from_slice(src);
+        if self.hist_len == 0 {
+            self.block_from(block_in, n, 0, block_out, n);
+            return;
         }
+        self.make_room(n);
+        let (s, w) = (self.stride, self.w);
+        for j in 0..self.in_ch {
+            self.hist[j * s + w..j * s + w + n].copy_from_slice(&block_in[j * n..j * n + n]);
+        }
+        self.block_from(&self.hist, s, w, block_out, n);
+        self.w += n;
+    }
 
-        // Compute. Weight-stationary: for each (out channel, tap, in channel) the
-        // inner loop streams contiguously over time in both `staged` and `block_out`.
+    /// Every output of a block whose first column sits at `w` in rows of
+    /// length `s` of `src`.
+    fn block_from(&self, src: &[f32], s: usize, w: usize, block_out: &mut [f32], n: usize) {
+        // Weight-stationary: for each (out channel, tap, in channel) the
+        // inner loop streams contiguously over time in both `src` and
+        // `block_out`.
         for o in 0..self.out_ch {
             let b = self.bias.as_ref().map_or(0.0, |bias| bias[o]);
             block_out[o * n..o * n + n].fill(b);
@@ -197,32 +237,22 @@ impl Conv1d {
             for k in 0..self.kernel {
                 let back = (self.kernel - 1 - k) * self.dilation;
                 for jl in 0..ipg {
-                    let w = self.weights[wo + jl * self.kernel + k];
-                    // staged time for output t is `hist_len + t`; tap k reads `- back`.
-                    let base = (in_base + jl) * s + hist_len - back;
-                    let src = &self.staged[base..base + n];
+                    let wt = self.weights[wo + jl * self.kernel + k];
+                    // staged time for output t is `w + t`; tap k reads `- back`.
+                    let base = (in_base + jl) * s + w - back;
+                    let src = &src[base..base + n];
                     for t in 0..n {
-                        out[t] += w * src[t];
+                        out[t] += wt * src[t];
                     }
                 }
-            }
-        }
-
-        // Advance the ring by pushing every block column (state update only, so a
-        // later `process_sample`/`process_block` continues seamlessly).
-        for t in 0..n {
-            self.pos = (self.pos + 1) % self.ring_len;
-            let base = self.pos * self.in_ch;
-            for j in 0..self.in_ch {
-                self.ring[base + j] = block_in[j * n + t];
             }
         }
     }
 
     /// Clear the history to silence.
     pub(super) fn reset(&mut self) {
-        self.ring.iter_mut().for_each(|x| *x = 0.0);
-        self.pos = self.ring_len - 1;
+        self.hist.iter_mut().for_each(|x| *x = 0.0);
+        self.w = self.hist_len;
     }
 }
 
@@ -403,6 +433,75 @@ mod tests {
                 }
                 t0 += len;
             }
+        }
+    }
+
+    /// A history long enough to be moved to the front of its rows many times,
+    /// fed in blocks of every size up to `MAX_BLOCK` and single samples, against
+    /// a naive oracle that sums in the per-sample order, so bit for bit.
+    #[test]
+    fn history_survives_moving_to_the_front() {
+        let (in_ch, out_ch, kernel, dilation) = (3_usize, 5_usize, 3_usize, 300_usize);
+        let w: Vec<f32> = (0..out_ch * in_ch * kernel)
+            .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.1)
+            .collect();
+        let bias: Vec<f32> = (0..out_ch).map(|o| o as f32 * 0.25).collect();
+        let total = 9_000_usize;
+        let x = |t: usize, j: usize| ((t * in_ch + j) as f32 * 0.013).sin();
+        let want = |t: usize, o: usize| {
+            let mut acc = bias[o];
+            for k in 0..kernel {
+                let back = (kernel - 1 - k) * dilation;
+                for j in 0..in_ch {
+                    let v = if t >= back { x(t - back, j) } else { 0.0 };
+                    acc += w[(o * in_ch + j) * kernel + k] * v;
+                }
+            }
+            acc
+        };
+
+        let mut conv = Conv1d::new(
+            in_ch,
+            out_ch,
+            kernel,
+            dilation,
+            w.clone(),
+            Some(bias.clone()),
+        );
+        let chunks = [MAX_BLOCK, 1, 700, MAX_BLOCK, 3, 64, MAX_BLOCK, 1, 511];
+        let mut t0 = 0;
+        for &len in chunks.iter().cycle() {
+            if t0 >= total {
+                break;
+            }
+            let len = len.min(total - t0);
+            if len == 1 {
+                let input: Vec<f32> = (0..in_ch).map(|j| x(t0, j)).collect();
+                let mut out = vec![0.0; out_ch];
+                conv.process_sample(&input, &mut out);
+                for (o, &got) in out.iter().enumerate() {
+                    let exp = want(t0, o);
+                    assert_eq!(got.to_bits(), exp.to_bits(), "t{t0} o{o}: {got} vs {exp}");
+                }
+            } else {
+                let bin: Vec<f32> = (0..in_ch)
+                    .flat_map(|j| (t0..t0 + len).map(move |t| x(t, j)))
+                    .collect();
+                let mut bout = vec![0.0; out_ch * len];
+                conv.process_block(&bin, &mut bout, len);
+                for lt in 0..len {
+                    for o in 0..out_ch {
+                        let (got, exp) = (bout[o * len + lt], want(t0 + lt, o));
+                        assert_eq!(
+                            got.to_bits(),
+                            exp.to_bits(),
+                            "t{} o{o}: {got} vs {exp}",
+                            t0 + lt
+                        );
+                    }
+                }
+            }
+            t0 += len;
         }
     }
 

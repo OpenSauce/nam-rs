@@ -77,15 +77,26 @@ semantics, and the `metadata` block a model browser needs.
 
 ## Performance
 
-From `cargo bench`, standard-size fixture models, one x86-64 desktop core, release +
-LTO:
+From `cargo bench`, standard-size fixture models, one core of an AMD Ryzen 7 5800X
+(x86-64 with AVX2), release + LTO:
 
-- WaveNet ≈1.9 µs/sample via `process_buffer` (≈11× real-time at 48 kHz) — around
-  3.5× faster than the per-sample path, so prefer whole blocks
-- LSTM ≈1.2 µs/sample (≈17× real-time). It is recurrent, so the block path is no
+- WaveNet ≈0.9 µs/sample via `process_buffer` (≈23× real-time at 48 kHz) — around
+  16× faster than the per-sample path, so prefer whole blocks
+- LSTM ≈0.8 µs/sample (≈26× real-time). It is recurrent, so the block path is no
   faster; `process_buffer` is a loop over `process_sample`
 
 Numbers vary with CPU and model size — run `cargo bench` on your own target.
+
+The block conv keeps one linear history row per input channel and computes four
+output channels by eight time steps at a time in registers, sixteen with AVX2 or on
+aarch64, so every tap is read straight out of the history. On an x86-64 CPU with
+AVX2 the conv tiles, the activations and the gating dispatch at run time to a build
+compiled for AVX2; every tile width and both builds produce the same bits. The LSTM
+stores its gate matrix transposed, so one input column updates all gates from a
+contiguous row.
+
+Only the vectorized `tanh` and `sigmoid` change the result: by at most ~1.2e-5 on a
+standard WaveNet driven near 0 dBFS. The parity fixtures still pass at their `1e-5`.
 
 ## Development
 

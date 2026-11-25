@@ -23,6 +23,7 @@ use crate::model::{GatingMode, LayerArrayConfig, NamModel, WaveNetConfig};
 use crate::reader::Reader;
 
 mod activation;
+pub(crate) use activation::{sigmoid, tanh};
 mod array;
 mod conv;
 mod film;

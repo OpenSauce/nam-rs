@@ -4,17 +4,15 @@
 //! order, row-major, gate order **i, f, g, o** (PyTorch). The exporter pre-sums
 //! `bias_ih + bias_hh`, so there is a single bias vector of length `4H`.
 
-#[inline]
-fn sigmoid(z: f32) -> f32 {
-    1.0 / (1.0 + (-z).exp())
-}
+use crate::wavenet::{sigmoid, tanh};
 
 #[derive(Debug)]
 pub(crate) struct LstmCell {
     hidden_size: usize,
     input_size: usize,
-    /// (4H) × (input_size + H), row-major.
-    w: Vec<f32>,
+    /// `W` transposed: (input_size + H) × (4H), so one input column updates
+    /// every gate with a contiguous, vectorizable row.
+    wt: Vec<f32>,
     /// 4H.
     b: Vec<f32>,
     /// Exported initial hidden/cell (length H each); `reset()` restores to these.
@@ -40,10 +38,17 @@ impl LstmCell {
         debug_assert_eq!(b.len(), 4 * hidden_size);
         debug_assert_eq!(h0.len(), hidden_size);
         debug_assert_eq!(c0.len(), hidden_size);
+        let row = input_size + hidden_size;
+        let mut wt = vec![0.0; w.len()];
+        for g in 0..4 * hidden_size {
+            for k in 0..row {
+                wt[k * 4 * hidden_size + g] = w[g * row + k];
+            }
+        }
         Self {
             hidden_size,
             input_size,
-            w,
+            wt,
             b,
             h: h0.clone(),
             c: c0.clone(),
@@ -64,25 +69,25 @@ impl LstmCell {
         self.xh[..self.input_size].copy_from_slice(x);
         self.xh[self.input_size..].copy_from_slice(&self.h);
 
-        // gates = W · xh + b
-        for g in 0..4 * h {
-            let base = g * row;
-            let mut acc = self.b[g];
-            for k in 0..row {
-                acc += self.w[base + k] * self.xh[k];
+        // gates = W · xh + b. Column by column, so each gate still sums its
+        // bias and then its products in order k = 0, 1, ...
+        let gates = &mut self.gates[..4 * h];
+        gates.copy_from_slice(&self.b);
+        for (k, &x) in self.xh[..row].iter().enumerate() {
+            let col = &self.wt[k * 4 * h..(k + 1) * 4 * h];
+            for (g, &w) in gates.iter_mut().zip(col) {
+                *g += w * x;
             }
-            self.gates[g] = acc;
         }
 
         // cell update, gate order i,f,g,o
+        let (ifg, o) = gates.split_at(3 * h);
+        let (i_f, g_) = ifg.split_at(2 * h);
+        let (i, f) = i_f.split_at(h);
         for j in 0..h {
-            let i = sigmoid(self.gates[j]);
-            let f = sigmoid(self.gates[h + j]);
-            let g_ = self.gates[2 * h + j].tanh();
-            let o = sigmoid(self.gates[3 * h + j]);
-            let c = f * self.c[j] + i * g_;
+            let c = sigmoid(f[j]) * self.c[j] + sigmoid(i[j]) * tanh(g_[j]);
             self.c[j] = c;
-            self.h[j] = o * c.tanh();
+            self.h[j] = sigmoid(o[j]) * tanh(c);
         }
         &self.h
     }

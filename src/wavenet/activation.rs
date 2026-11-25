@@ -75,6 +75,37 @@ impl Activation {
         self.apply_slice_with(xs);
     }
 
+    /// Calls `f(i, self.apply(xs[i]))` for every `i`. The match is outside
+    /// the loop, so each arm is its own loop and vectorizes.
+    #[inline(always)]
+    pub(super) fn for_each_applied(self, xs: &[f32], mut f: impl FnMut(usize, f32)) {
+        match self {
+            Self::Tanh => xs.iter().enumerate().for_each(|(i, &x)| f(i, tanh(x))),
+            Self::Relu => xs.iter().enumerate().for_each(|(i, &x)| f(i, x.max(0.0))),
+            Self::Sigmoid => xs.iter().enumerate().for_each(|(i, &x)| f(i, sigmoid(x))),
+            Self::LeakyRelu(slope) => xs
+                .iter()
+                .enumerate()
+                .for_each(|(i, &x)| f(i, if x > 0.0 { x } else { slope * x })),
+        }
+    }
+
+    /// Applies the activation from `xs` into `out`. Separate source and
+    /// destination, so a caller need not copy first; the match is outside
+    /// the loop, so it vectorizes.
+    #[inline(always)]
+    pub(super) fn apply_slice_into(self, xs: &[f32], out: &mut [f32]) {
+        match self {
+            Self::Tanh => out.iter_mut().zip(xs).for_each(|(o, &x)| *o = tanh(x)),
+            Self::Relu => out.iter_mut().zip(xs).for_each(|(o, &x)| *o = x.max(0.0)),
+            Self::Sigmoid => out.iter_mut().zip(xs).for_each(|(o, &x)| *o = sigmoid(x)),
+            Self::LeakyRelu(slope) => out
+                .iter_mut()
+                .zip(xs)
+                .for_each(|(o, &x)| *o = if x > 0.0 { x } else { slope * x }),
+        }
+    }
+
     /// The body of [`Self::apply_slice`], inlined into each build.
     #[inline(always)]
     pub(super) fn apply_slice_with(self, xs: &mut [f32]) {
@@ -277,6 +308,23 @@ mod tests {
         ] {
             let mut got = xs.clone();
             act.apply_slice(&mut got);
+            for (&x, &g) in xs.iter().zip(&got) {
+                assert_eq!(g, act.apply(x), "{act:?} at {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_slice_into_matches_apply() {
+        let xs: Vec<f32> = (-40..=40).map(|i| i as f32 * 0.25).collect();
+        for act in [
+            Activation::Tanh,
+            Activation::Relu,
+            Activation::Sigmoid,
+            Activation::LeakyRelu(0.1),
+        ] {
+            let mut got = vec![0.0; xs.len()];
+            act.apply_slice_into(&xs, &mut got);
             for (&x, &g) in xs.iter().zip(&got) {
                 assert_eq!(g, act.apply(x), "{act:?} at {x}");
             }

@@ -100,9 +100,7 @@ impl PostStackHead {
             let in_ch = conv.in_ch();
             let out_ch = conv.out_ch();
             if i == 0 {
-                for v in work[..in_ch * n].iter_mut() {
-                    *v = act.apply(*v);
-                }
+                act.apply_slice(&mut work[..in_ch * n]);
                 conv.process_block(&work[..in_ch * n], &mut self.scratch_a[..out_ch * n], n);
             } else {
                 // Conv (i-1)'s output is in scratch_a when i is odd, scratch_b when
@@ -114,9 +112,7 @@ impl PostStackHead {
                     let (a, b) = (&mut self.scratch_b, &mut self.scratch_a);
                     (a.as_mut_slice(), b.as_mut_slice())
                 };
-                for v in src[..in_ch * n].iter_mut() {
-                    *v = act.apply(*v);
-                }
+                act.apply_slice(&mut src[..in_ch * n]);
                 conv.process_block(&src[..in_ch * n], &mut dst[..out_ch * n], n);
             }
         }

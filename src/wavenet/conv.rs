@@ -1,4 +1,4 @@
-//! Causal, dilated 1-D convolution with a pre-allocated ring buffer.
+//! Causal, dilated 1-D convolution with a pre-allocated history.
 //!
 //! This is the one stateful primitive in the WaveNet forward pass. Weight layout
 //! matches NAM's `export_weights` (PyTorch `Conv1d`): `[out_ch][in_ch][kernel]`
@@ -8,20 +8,30 @@
 //! matrix multiply; the same type is reused for the rechannel / input-mixer /
 //! 1x1 / head-rechannel layers.
 //!
-//! Two equivalent entry points share one streaming history (the ring): the
-//! per-sample [`Conv1d::process_sample`], and the block [`Conv1d::process_block`],
-//! which stages `[history ++ block]` into a contiguous planar scratch so the hot
-//! loop runs sample-inner over a stationary weight row (cache-friendly, and the
-//! compiler can autovectorize it). The block path is the lever behind
-//! `WaveNet::process_buffer`.
+//! Two equivalent entry points share one streaming history: the per-sample
+//! [`Conv1d::process_sample`], and the block [`Conv1d::process_block`]. The
+//! history is planar and linear, so the block path appends the block and reads
+//! every tap straight out of it. Its kernel computes a tile of output channels
+//! by time steps at once and keeps the partial sums in registers across all
+//! taps and input channels; each output still sums its bias and then its
+//! products in the per-sample order, so the two paths agree bit for bit. A
+//! 1x1 convolution has no history and reads the block in place. The block
+//! path is the lever behind `WaveNet::process_buffer`.
 
 /// Largest block the planar kernel processes in one call; `process_buffer` chunks
 /// longer inputs to this. Scratch is sized to it up front (off the audio thread).
 pub(super) const MAX_BLOCK: usize = 1024;
 
-/// A dilated causal convolution that processes one sample at a time, keeping the
-/// receptive-field history in a pre-allocated ring buffer (no allocation on the
-/// audio thread).
+/// A dilated causal convolution with a pre-allocated planar history (no
+/// allocation on the audio thread).
+///
+/// The history is one linear row per input channel, `[in_ch][stride]`. The
+/// newest `hist_len` columns sit just before the write cursor `w`; a block is
+/// written at `w` and the taps read straight out of the row. When a block would
+/// run past the end of the row, the last `hist_len` columns are moved to the
+/// front first, so that copy happens once per `stride - hist_len` samples
+/// instead of every block. This is the scheme of NAM Core's `RingBuffer`
+/// ("rewind").
 #[derive(Debug, Clone)]
 pub(super) struct Conv1d {
     in_ch: usize,
@@ -35,16 +45,45 @@ pub(super) struct Conv1d {
     /// `[out_ch][in_ch][kernel]`, row-major.
     weights: Vec<f32>,
     bias: Option<Vec<f32>>,
-    /// Ring of the most recent `ring_len` input columns, `in_ch` values each.
-    ring: Vec<f32>,
-    ring_len: usize,
-    /// Index of the column written most recently.
-    pos: usize,
-    /// Planar `[in_ch][hist_len + MAX_BLOCK]` staging for the block path, where
-    /// `hist_len = ring_len - 1`. Pre-allocated; the inner loop reads it contiguously
-    /// over time. `staged_stride` is the per-channel row length.
-    staged: Vec<f32>,
-    staged_stride: usize,
+    /// `(kernel - 1) * dilation`: how many past columns a tap can reach.
+    hist_len: usize,
+    /// Planar `[in_ch][stride]` history and block staging. Empty for a 1x1
+    /// convolution, which keeps no history.
+    hist: Vec<f32>,
+    stride: usize,
+    /// The column the next input goes to. Always `>= hist_len`.
+    w: usize,
+    /// Run the AVX2 build of the block kernel. Set from [`avx2_available`]
+    /// when the conv is built; tests clear it to compare the two builds. The
+    /// kernel checks the CPU again before it trusts it.
+    #[cfg(target_arch = "x86_64")]
+    avx2: bool,
+}
+
+/// Output channels one tile of the block kernel computes at once.
+const TILE_OUT: usize = 4;
+/// Time steps one tile of the block kernel computes at once: two SSE
+/// registers per output in the portable build, two AVX registers in the AVX2
+/// build. On aarch64, NEON has 32 vector registers where SSE has 16, so the
+/// portable tile there is four registers per output: each weight loaded and
+/// each step of index arithmetic serves twice the time steps. The summation
+/// order does not depend on the width, so every width gives the same bits.
+#[cfg(not(target_arch = "aarch64"))]
+const TILE_T: usize = 8;
+#[cfg(target_arch = "aarch64")]
+const TILE_T: usize = 16;
+#[cfg(target_arch = "x86_64")]
+const TILE_T_AVX2: usize = 16;
+
+/// Whether this CPU has AVX2, checked at run time so one binary runs on
+/// every x86-64 CPU. The AVX2 builds of the hot loops enable AVX2 only, not
+/// FMA: a fused multiply-add rounds once where the portable code rounds twice,
+/// so FMA would change the output. Without it both builds do the same
+/// operations in the same order and agree bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn avx2_available() -> bool {
+    std::is_x86_feature_detected!("avx2")
 }
 
 impl Conv1d {
@@ -84,8 +123,18 @@ impl Conv1d {
         if let Some(b) = &bias {
             assert_eq!(b.len(), out_ch, "conv bias count");
         }
-        let ring_len = (kernel - 1) * dilation + 1;
-        let staged_stride = (ring_len - 1) + MAX_BLOCK;
+        let hist_len = (kernel - 1)
+            .checked_mul(dilation)
+            .expect("conv history overflows usize");
+        // At least a full block past the history, and at least the history
+        // again, so the move to the front copies no more than it frees.
+        let stride = if hist_len == 0 {
+            0
+        } else {
+            hist_len
+                .checked_add(hist_len.max(MAX_BLOCK))
+                .expect("conv history overflows usize")
+        };
         Self {
             in_ch,
             out_ch,
@@ -95,11 +144,12 @@ impl Conv1d {
             in_per_group: in_ch / groups,
             weights,
             bias,
-            ring: vec![0.0; in_ch * ring_len],
-            ring_len,
-            pos: ring_len - 1,
-            staged: vec![0.0; in_ch * staged_stride],
-            staged_stride,
+            hist_len,
+            hist: vec![0.0; in_ch * stride],
+            stride,
+            w: hist_len,
+            #[cfg(target_arch = "x86_64")]
+            avx2: avx2_available(),
         }
     }
 
@@ -117,17 +167,43 @@ impl Conv1d {
         self.kernel
     }
 
+    /// Make room for `n` new columns at the write cursor.
+    #[inline]
+    fn make_room(&mut self, n: usize) {
+        if self.hist_len == 0 || self.w + n <= self.stride {
+            return;
+        }
+        let (h, s, w) = (self.hist_len, self.stride, self.w);
+        for j in 0..self.in_ch {
+            let row = j * s;
+            self.hist.copy_within(row + w - h..row + w, row);
+        }
+        self.w = h;
+    }
+
     /// Push one input column (`in_ch` values) and write the convolution result
     /// (`out_ch` values) into `out`.
     pub(super) fn process_sample(&mut self, input: &[f32], out: &mut [f32]) {
         debug_assert_eq!(input.len(), self.in_ch);
         debug_assert_eq!(out.len(), self.out_ch);
 
-        // Advance and store the newest column.
-        self.pos = (self.pos + 1) % self.ring_len;
-        let base = self.pos * self.in_ch;
-        self.ring[base..base + self.in_ch].copy_from_slice(input);
+        if self.hist_len == 0 {
+            self.tile_sample(input, 1, 0, out);
+            return;
+        }
+        self.make_room(1);
+        let (s, w) = (self.stride, self.w);
+        for (j, &x) in input.iter().enumerate() {
+            self.hist[j * s + w] = x;
+        }
+        self.tile_sample(&self.hist, s, w, out);
+        self.w += 1;
+    }
 
+    /// One output column from the newest input column, which sits at `w` in
+    /// rows of length `s` of `src`.
+    #[inline]
+    fn tile_sample(&self, src: &[f32], s: usize, w: usize, out: &mut [f32]) {
         let opg = self.out_per_group;
         let ipg = self.in_per_group;
         for o in 0..self.out_ch {
@@ -139,12 +215,10 @@ impl Conv1d {
             let wo = o * ipg * self.kernel;
             for k in 0..self.kernel {
                 let back = (self.kernel - 1 - k) * self.dilation;
-                let col = (self.pos + self.ring_len - back) % self.ring_len;
-                let rbase = col * self.in_ch;
                 for jl in 0..ipg {
                     // jl is the local (in-group) input index; jl*kernel+k walks taps.
-                    acc +=
-                        self.weights[wo + jl * self.kernel + k] * self.ring[rbase + in_base + jl];
+                    acc += self.weights[wo + jl * self.kernel + k]
+                        * src[(in_base + jl) * s + w - back];
                 }
             }
             out[o] = acc;
@@ -155,7 +229,8 @@ impl Conv1d {
     /// `in_ch * n` laid out `[channel * n + t]`, and `block_out` is `out_ch * n` the
     /// same way. Bit-for-bit equivalent to `n` calls of [`Self::process_sample`] and
     /// leaves the streaming history in the identical state, so the two entry points
-    /// are freely interchangeable across calls.
+    /// are freely interchangeable across calls: every output sums its bias and then
+    /// its products in the same order as the per-sample path.
     ///
     /// `n` must be `<= MAX_BLOCK`; callers chunk longer runs. Allocation-free.
     pub(super) fn process_block(&mut self, block_in: &[f32], block_out: &mut [f32], n: usize) {
@@ -166,63 +241,161 @@ impl Conv1d {
             return;
         }
 
-        let hist_len = self.ring_len - 1;
-        let s = self.staged_stride;
-
-        // Stage the history tail (chronological: oldest at time 0, newest at
-        // hist_len-1) followed by this block, one contiguous row per input channel.
+        if self.hist_len == 0 {
+            self.tiles(block_in, n, 0, block_out, n);
+            return;
+        }
+        self.make_room(n);
+        let (s, w) = (self.stride, self.w);
         for j in 0..self.in_ch {
-            let row = j * s;
-            for h in 0..hist_len {
-                let col = (self.pos + self.ring_len - (hist_len - 1) + h) % self.ring_len;
-                self.staged[row + h] = self.ring[col * self.in_ch + j];
+            self.hist[j * s + w..j * s + w + n].copy_from_slice(&block_in[j * n..j * n + n]);
+        }
+        self.tiles(&self.hist, s, w, block_out, n);
+        self.w += n;
+    }
+
+    /// Every output of a block whose first column sits at `w` in rows of
+    /// length `s` of `src`.
+    fn tiles(&self, src: &[f32], s: usize, w: usize, block_out: &mut [f32], n: usize) {
+        #[cfg(target_arch = "x86_64")]
+        if self.avx2 && avx2_available() {
+            // SAFETY: the CPU reports AVX2.
+            unsafe { self.tiles_avx2(src, s, w, block_out, n) };
+            return;
+        }
+        self.tiles_with::<TILE_T>(src, s, w, block_out, n);
+    }
+
+    /// [`Self::tiles`] compiled with AVX2 enabled.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn tiles_avx2(&self, src: &[f32], s: usize, w: usize, block_out: &mut [f32], n: usize) {
+        self.tiles_with::<TILE_T_AVX2>(src, s, w, block_out, n);
+    }
+
+    #[inline(always)]
+    fn tiles_with<const T: usize>(
+        &self,
+        src: &[f32],
+        s: usize,
+        w: usize,
+        block_out: &mut [f32],
+        n: usize,
+    ) {
+        let opg = self.out_per_group;
+        let mut o = 0;
+        while o < self.out_ch {
+            // A tile never crosses a group, so all its outputs read the same inputs.
+            let group_end = (o / opg + 1) * opg;
+            if o + TILE_OUT <= group_end {
+                self.tile::<TILE_OUT, T>(o, src, s, w, block_out, n);
+                o += TILE_OUT;
+            } else {
+                self.tile::<1, T>(o, src, s, w, block_out, n);
+                o += 1;
             }
-            let src = &block_in[j * n..j * n + n];
-            self.staged[row + hist_len..row + hist_len + n].copy_from_slice(src);
+        }
+    }
+
+    /// Outputs `o..o + O` of the block at `w` in `src`, `T` time steps at a
+    /// time. The partial sums stay in registers across every tap and input
+    /// channel.
+    #[inline(always)]
+    fn tile<const O: usize, const T: usize>(
+        &self,
+        o: usize,
+        src: &[f32],
+        s: usize,
+        w: usize,
+        block_out: &mut [f32],
+        n: usize,
+    ) {
+        let ipg = self.in_per_group;
+        let kernel = self.kernel;
+        let in_base = (o / self.out_per_group) * ipg;
+        let row_len = ipg * kernel;
+        let weights = &self.weights[o * row_len..(o + O) * row_len];
+        let mut bias = [0.0; O];
+        if let Some(b) = &self.bias {
+            bias.copy_from_slice(&b[o..o + O]);
         }
 
-        // Compute. Weight-stationary: for each (out channel, tap, in channel) the
-        // inner loop streams contiguously over time in both `staged` and `block_out`.
-        for o in 0..self.out_ch {
-            let b = self.bias.as_ref().map_or(0.0, |bias| bias[o]);
-            block_out[o * n..o * n + n].fill(b);
+        // Full tiles first: the column is read straight from the row, with
+        // no branch and no copy, so the sums stay in registers. The rest of
+        // the block runs in steps of 4, then 1. Each output sums its bias
+        // and products in the same order at any width, so the same bits.
+        let full = n - n % T;
+        let mut t = 0;
+        while t < full {
+            self.tile_step::<O, T>(
+                o, in_base, row_len, weights, &bias, src, s, w, t, block_out, n,
+            );
+            t += T;
         }
-        let opg = self.out_per_group;
-        let ipg = self.in_per_group;
-        for o in 0..self.out_ch {
-            let g = o / opg;
-            let in_base = g * ipg;
-            let wo = o * ipg * self.kernel; // compact: rows are opg-by-ipg per group, contiguous in o
-            let out = &mut block_out[o * n..o * n + n];
-            for k in 0..self.kernel {
-                let back = (self.kernel - 1 - k) * self.dilation;
-                for jl in 0..ipg {
-                    let w = self.weights[wo + jl * self.kernel + k];
-                    // staged time for output t is `hist_len + t`; tap k reads `- back`.
-                    let base = (in_base + jl) * s + hist_len - back;
-                    let src = &self.staged[base..base + n];
-                    for t in 0..n {
-                        out[t] += w * src[t];
+        while t + 4 <= n {
+            self.tile_step::<O, 4>(
+                o, in_base, row_len, weights, &bias, src, s, w, t, block_out, n,
+            );
+            t += 4;
+        }
+        while t < n {
+            self.tile_step::<O, 1>(
+                o, in_base, row_len, weights, &bias, src, s, w, t, block_out, n,
+            );
+            t += 1;
+        }
+    }
+
+    /// One `O` by `T` tile starting at time step `t`; `t + T <= n`.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn tile_step<const O: usize, const T: usize>(
+        &self,
+        o: usize,
+        in_base: usize,
+        row_len: usize,
+        weights: &[f32],
+        bias: &[f32; O],
+        src: &[f32],
+        s: usize,
+        w: usize,
+        t: usize,
+        block_out: &mut [f32],
+        n: usize,
+    ) {
+        debug_assert!(t + T <= n, "a tile step runs past the block");
+        let kernel = self.kernel;
+        let mut acc = [[0.0_f32; T]; O];
+        for (a, &b) in acc.iter_mut().zip(bias) {
+            *a = [b; T];
+        }
+        for k in 0..kernel {
+            let back = (kernel - 1 - k) * self.dilation;
+            for jl in 0..self.in_per_group {
+                let at = (in_base + jl) * s + w + t - back;
+                let column: &[f32; T] = src[at..at + T].try_into().unwrap();
+                for (oo, a) in acc.iter_mut().enumerate() {
+                    let wt = weights[oo * row_len + jl * kernel + k];
+                    for (sum, &x) in a.iter_mut().zip(column) {
+                        *sum += wt * x;
                     }
                 }
             }
         }
-
-        // Advance the ring by pushing every block column (state update only, so a
-        // later `process_sample`/`process_block` continues seamlessly).
-        for t in 0..n {
-            self.pos = (self.pos + 1) % self.ring_len;
-            let base = self.pos * self.in_ch;
-            for j in 0..self.in_ch {
-                self.ring[base + j] = block_in[j * n + t];
-            }
+        for (oo, a) in acc.iter().enumerate() {
+            let row = (o + oo) * n + t;
+            block_out[row..row + T].copy_from_slice(a);
         }
     }
 
     /// Clear the history to silence.
     pub(super) fn reset(&mut self) {
-        self.ring.iter_mut().for_each(|x| *x = 0.0);
-        self.pos = self.ring_len - 1;
+        self.hist.iter_mut().for_each(|x| *x = 0.0);
+        self.w = self.hist_len;
     }
 }
 
@@ -402,6 +575,183 @@ mod tests {
                     }
                 }
                 t0 += len;
+            }
+        }
+    }
+
+    /// A history long enough to be moved to the front of its rows many times,
+    /// fed in blocks of every size up to `MAX_BLOCK` and single samples, against
+    /// a naive oracle that sums in the per-sample order, so bit for bit.
+    #[test]
+    fn history_survives_moving_to_the_front() {
+        let (in_ch, out_ch, kernel, dilation) = (3_usize, 5_usize, 3_usize, 300_usize);
+        let w: Vec<f32> = (0..out_ch * in_ch * kernel)
+            .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.1)
+            .collect();
+        let bias: Vec<f32> = (0..out_ch).map(|o| o as f32 * 0.25).collect();
+        let total = 9_000_usize;
+        let x = |t: usize, j: usize| ((t * in_ch + j) as f32 * 0.013).sin();
+        let want = |t: usize, o: usize| {
+            let mut acc = bias[o];
+            for k in 0..kernel {
+                let back = (kernel - 1 - k) * dilation;
+                for j in 0..in_ch {
+                    let v = if t >= back { x(t - back, j) } else { 0.0 };
+                    acc += w[(o * in_ch + j) * kernel + k] * v;
+                }
+            }
+            acc
+        };
+
+        let mut conv = Conv1d::new(
+            in_ch,
+            out_ch,
+            kernel,
+            dilation,
+            w.clone(),
+            Some(bias.clone()),
+        );
+        let chunks = [MAX_BLOCK, 1, 700, MAX_BLOCK, 3, 64, MAX_BLOCK, 1, 511];
+        let mut t0 = 0;
+        for &len in chunks.iter().cycle() {
+            if t0 >= total {
+                break;
+            }
+            let len = len.min(total - t0);
+            if len == 1 {
+                let input: Vec<f32> = (0..in_ch).map(|j| x(t0, j)).collect();
+                let mut out = vec![0.0; out_ch];
+                conv.process_sample(&input, &mut out);
+                for (o, &got) in out.iter().enumerate() {
+                    let exp = want(t0, o);
+                    assert_eq!(got.to_bits(), exp.to_bits(), "t{t0} o{o}: {got} vs {exp}");
+                }
+            } else {
+                let bin: Vec<f32> = (0..in_ch)
+                    .flat_map(|j| (t0..t0 + len).map(move |t| x(t, j)))
+                    .collect();
+                let mut bout = vec![0.0; out_ch * len];
+                conv.process_block(&bin, &mut bout, len);
+                for lt in 0..len {
+                    for o in 0..out_ch {
+                        let (got, exp) = (bout[o * len + lt], want(t0 + lt, o));
+                        assert_eq!(
+                            got.to_bits(),
+                            exp.to_bits(),
+                            "t{} o{o}: {got} vs {exp}",
+                            t0 + lt
+                        );
+                    }
+                }
+            }
+            t0 += len;
+        }
+    }
+
+    /// The AVX2 build of the block kernel gives the portable bits: dense and
+    /// grouped convs, kernels up to 15, a 1x1 conv, and blocks that end in a
+    /// partial tile. Skipped on a CPU without AVX2, where only one build runs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_and_portable_kernels_agree_bit_for_bit() {
+        if !avx2_available() {
+            return;
+        }
+        // (in_ch, out_ch, kernel, dilation, groups)
+        let cases = [
+            (8_usize, 8_usize, 6_usize, 239_usize, 1_usize),
+            (16, 8, 3, 512, 1),
+            (8, 8, 15, 13, 1),
+            (8, 1, 16, 1, 1),
+            (6, 4, 2, 3, 2),
+            (4, 4, 3, 7, 4),
+            (5, 7, 1, 1, 1),
+        ];
+        for (in_ch, out_ch, kernel, dilation, groups) in cases {
+            let wlen = out_ch * in_ch * kernel / groups;
+            let w: Vec<f32> = (0..wlen)
+                .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.07)
+                .collect();
+            let bias: Vec<f32> = (0..out_ch).map(|o| o as f32 * 0.1 - 0.3).collect();
+            let mut portable = Conv1d::new_grouped(
+                in_ch,
+                out_ch,
+                kernel,
+                dilation,
+                groups,
+                w.clone(),
+                Some(bias.clone()),
+            );
+            portable.avx2 = false;
+            let mut avx2 =
+                Conv1d::new_grouped(in_ch, out_ch, kernel, dilation, groups, w, Some(bias));
+            avx2.avx2 = true;
+            let mut t0 = 0;
+            for &len in [MAX_BLOCK, 37, 1, 255, MAX_BLOCK, 3, 128]
+                .iter()
+                .cycle()
+                .take(14)
+            {
+                let bin: Vec<f32> = (0..in_ch * len)
+                    .map(|i| ((t0 * in_ch + i) as f32 * 0.011).sin())
+                    .collect();
+                let mut a = vec![0.0; out_ch * len];
+                let mut b = vec![0.0; out_ch * len];
+                portable.process_block(&bin, &mut a, len);
+                avx2.process_block(&bin, &mut b, len);
+                for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "{in_ch}x{out_ch} k{kernel} d{dilation} g{groups} len{len} idx{i}"
+                    );
+                }
+                t0 += len;
+            }
+        }
+    }
+
+    /// Every tile width gives the same bits, so the width a build picks (8,
+    /// or 16 on aarch64 and in the AVX2 build) is a speed choice only.
+    /// Checked directly on the kernel, on every architecture.
+    #[test]
+    fn tile_width_does_not_change_the_bits() {
+        // (in_ch, out_ch, kernel, dilation, groups)
+        let cases = [
+            (8_usize, 8_usize, 6_usize, 239_usize, 1_usize),
+            (16, 8, 3, 512, 1),
+            (8, 1, 16, 1, 1),
+            (6, 4, 2, 3, 2),
+            (8, 8, 3, 5, 2), // grouped, full 4-output tiles in each group
+            (5, 7, 1, 1, 1),
+        ];
+        for (in_ch, out_ch, kernel, dilation, groups) in cases {
+            let wlen = out_ch * in_ch * kernel / groups;
+            let w: Vec<f32> = (0..wlen)
+                .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.07)
+                .collect();
+            let bias: Vec<f32> = (0..out_ch).map(|o| o as f32 * 0.1 - 0.3).collect();
+            let conv = Conv1d::new_grouped(in_ch, out_ch, kernel, dilation, groups, w, Some(bias));
+            for n in [1_usize, 7, 37, 128, MAX_BLOCK] {
+                // A history of `hist_len` columns, then the block.
+                let s = conv.hist_len + n;
+                let src: Vec<f32> = (0..in_ch * s)
+                    .map(|i| ((i * 7919 % 1009) as f32 / 1009.0 - 0.5) * 2.0)
+                    .collect();
+                let w0 = conv.hist_len;
+                let mut by4 = vec![0.0; out_ch * n];
+                let mut by8 = vec![0.0; out_ch * n];
+                let mut by16 = vec![0.0; out_ch * n];
+                conv.tiles_with::<4>(&src, s, w0, &mut by4, n);
+                conv.tiles_with::<8>(&src, s, w0, &mut by8, n);
+                conv.tiles_with::<16>(&src, s, w0, &mut by16, n);
+                for i in 0..out_ch * n {
+                    assert_eq!(
+                        (by4[i].to_bits(), by16[i].to_bits()),
+                        (by8[i].to_bits(), by8[i].to_bits()),
+                        "{in_ch}x{out_ch} k{kernel} d{dilation} g{groups} n{n} idx{i}"
+                    );
+                }
             }
         }
     }

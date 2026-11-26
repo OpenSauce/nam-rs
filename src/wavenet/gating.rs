@@ -89,35 +89,59 @@ impl Gating {
     /// Planar block twin of [`Self::process_sample`]. `z` is `input_rows()·n`,
     /// `out` is `bottleneck·n`, `[row][t]`, `n ≤ MAX_BLOCK`. Allocation-free.
     pub(super) fn process_block(&self, z: &[f32], out: &mut [f32], n: usize) {
+        #[cfg(target_arch = "x86_64")]
+        if super::avx2_available() {
+            // SAFETY: the CPU reports AVX2.
+            unsafe { self.process_block_avx2(z, out, n) };
+            return;
+        }
+        self.process_block_with(z, out, n);
+    }
+
+    /// [`Self::process_block`] compiled with AVX2 enabled; the same bits.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn process_block_avx2(&self, z: &[f32], out: &mut [f32], n: usize) {
+        self.process_block_with(z, out, n);
+    }
+
+    /// The body of [`Self::process_block`]. Each row runs in passes with its
+    /// activation chosen once, so every loop vectorizes; each sample still
+    /// sees the operations of [`Self::process_sample`], so the result is
+    /// bit-identical.
+    #[inline(always)]
+    fn process_block_with(&self, z: &[f32], out: &mut [f32], n: usize) {
         let bn = self.bottleneck;
         match self.mode {
             GatingMode::None => {
-                for c in 0..bn {
-                    let base = c * n;
-                    for t in 0..n {
-                        out[base + t] = self.primary.apply(z[base + t]);
-                    }
-                }
+                self.primary
+                    .apply_slice_into(&z[..bn * n], &mut out[..bn * n]);
             }
             GatingMode::Gated => {
                 for c in 0..bn {
-                    let (vrow, grow, orow) = (c * n, (c + bn) * n, c * n);
-                    for t in 0..n {
-                        let v = self.primary.apply(z[vrow + t]);
-                        let s = self.secondary.apply(z[grow + t]);
-                        out[orow + t] = v * s;
-                    }
+                    let (vrow, grow) = (c * n, (c + bn) * n);
+                    let row = &mut out[c * n..c * n + n];
+                    row.copy_from_slice(&z[vrow..vrow + n]);
+                    self.primary.apply_slice_with(row);
+                    self.secondary
+                        .for_each_applied(&z[grow..grow + n], |t, s| row[t] *= s);
                 }
             }
             GatingMode::Blended => {
                 for c in 0..bn {
-                    let (vrow, grow, orow) = (c * n, (c + bn) * n, c * n);
-                    for t in 0..n {
-                        let raw = z[vrow + t];
-                        let alpha = self.secondary.apply(z[grow + t]);
-                        let v = self.primary.apply(raw);
-                        out[orow + t] = alpha * v + (1.0 - alpha) * raw;
-                    }
+                    let (vrow, grow) = (c * n, (c + bn) * n);
+                    let raw = &z[vrow..vrow + n];
+                    let row = &mut out[c * n..c * n + n];
+                    row.copy_from_slice(raw);
+                    self.primary.apply_slice_with(row);
+                    self.secondary
+                        .for_each_applied(&z[grow..grow + n], |t, alpha| {
+                            row[t] = alpha * row[t] + (1.0 - alpha) * raw[t];
+                        });
                 }
             }
         }
@@ -291,6 +315,50 @@ mod tests {
                     (a - b).abs() < 1e-6,
                     "mode={mode:?} idx{i}: block {a}, per-sample {b}"
                 );
+            }
+        }
+    }
+
+    /// Every mode with every pair of activations, at a length with a tail:
+    /// the row passes give the per-sample bits, in the portable build and in
+    /// the one this CPU dispatches to.
+    #[test]
+    fn process_block_is_bit_identical_to_process_sample() {
+        let acts = [
+            Activation::Tanh,
+            Activation::Sigmoid,
+            Activation::Relu,
+            Activation::LeakyRelu(0.1),
+        ];
+        for mode in [GatingMode::None, GatingMode::Gated, GatingMode::Blended] {
+            for primary in acts {
+                for secondary in acts {
+                    let bn = 3usize;
+                    let g = Gating::new(mode, primary, secondary, bn);
+                    let in_rows = g.input_rows();
+                    let n = 37usize;
+                    let z: Vec<f32> = (0..in_rows * n)
+                        .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.17)
+                        .collect();
+                    let mut want = vec![0.0_f32; bn * n];
+                    for t in 0..n {
+                        let zc: Vec<f32> = (0..in_rows).map(|r| z[r * n + t]).collect();
+                        let mut oc = vec![0.0_f32; bn];
+                        g.process_sample(&zc, &mut oc);
+                        for c in 0..bn {
+                            want[c * n + t] = oc[c];
+                        }
+                    }
+                    let mut portable = vec![0.0_f32; bn * n];
+                    g.process_block_with(&z, &mut portable, n);
+                    let mut dispatched = vec![0.0_f32; bn * n];
+                    g.process_block(&z, &mut dispatched, n);
+                    for i in 0..bn * n {
+                        let label = format!("{mode:?} {primary:?}/{secondary:?} idx{i}");
+                        assert_eq!(portable[i].to_bits(), want[i].to_bits(), "{label}");
+                        assert_eq!(dispatched[i].to_bits(), want[i].to_bits(), "{label}");
+                    }
+                }
             }
         }
     }
